@@ -1601,6 +1601,18 @@ def selected_or_matching_med_id(data: Dict[str, Any], payload_name: str, selecte
     return None
 
 
+def normalized_med_name(value: Any) -> str:
+    return sanitize_text(value or "", max_chars=120).strip().lower()
+
+
+def should_create_new_med_entry(existing_med: Optional[Dict[str, Any]], form_name: str) -> bool:
+    if existing_med is None:
+        return True
+    next_name = normalized_med_name(form_name)
+    current_name = normalized_med_name(existing_med.get("name") or "")
+    return bool(next_name and current_name and next_name != current_name)
+
+
 def medication_history_rows(
     med: Dict[str, Any],
     *,
@@ -5135,9 +5147,10 @@ class MedSafeApp(MDApp):
 
     def on_new_med(self) -> None:
         self.selected_med_id = None
+        self.last_form_med_id = None
         self.reset_form_fields()
         self.set_status("Ready to add a new medication.")
-        self.refresh_dashboard()
+        self.refresh_ui()
 
     def on_save_med(self) -> None:
         name = sanitize_text(self.root.ids.med_name.text, max_chars=120)
@@ -5151,8 +5164,11 @@ class MedSafeApp(MDApp):
         notes = sanitize_text(self.root.ids.med_notes.text, max_chars=500)
 
         meds = list(self.data_cache.get("meds") or [])
-        med = self.current_selected_med()
-        if med is None:
+        selected_med = self.current_selected_med()
+        created_new = should_create_new_med_entry(selected_med, name)
+        created_from_name_change = selected_med is not None and created_new
+        med = selected_med
+        if created_new:
             med = {
                 "id": uuid.uuid4().hex[:12],
                 "name": name,
@@ -5181,8 +5197,18 @@ class MedSafeApp(MDApp):
         self.last_check_level = "Medium"
         self.last_check_display = "Schedule saved"
         self.last_check_message = f"{name} was saved to the encrypted schedule vault."
+        if created_new:
+            self.selected_med_id = None
+            self.last_form_med_id = None
+            self.reset_form_fields()
         self.refresh_ui()
-        self.set_status(f"Saved {name}.")
+        if created_new:
+            if created_from_name_change:
+                self.set_status(f"Saved {name} as a new medication. Ready to add another medication.")
+            else:
+                self.set_status(f"Saved {name}. Ready to add another medication.")
+        else:
+            self.set_status(f"Saved {name}.")
 
     def on_delete_med(self) -> None:
         med = self.current_selected_med()
@@ -7594,9 +7620,10 @@ class DesktopMedSafeApp:
 
     def on_new_med(self) -> None:
         self.selected_med_id = None
+        self.last_form_med_id = None
         self.reset_form_fields()
         self.set_status("Ready to add a new medication.")
-        self.refresh_dashboard()
+        self.refresh_ui()
 
     def on_save_med(self) -> None:
         name = sanitize_text(self.ids.med_name.text, max_chars=120)
@@ -7618,8 +7645,11 @@ class DesktopMedSafeApp:
             return
 
         meds = list(self.data_cache.get("meds") or [])
-        med = self.current_selected_med()
-        if med is None:
+        selected_med = self.current_selected_med()
+        created_new = should_create_new_med_entry(selected_med, name)
+        created_from_name_change = selected_med is not None and created_new
+        med = selected_med
+        if created_new:
             med = {
                 "id": uuid.uuid4().hex[:12],
                 "name": name,
@@ -7653,8 +7683,18 @@ class DesktopMedSafeApp:
         self.last_check_level = "Medium"
         self.last_check_display = "Schedule saved"
         self.last_check_message = f"{name} was saved to the encrypted schedule vault."
+        if created_new:
+            self.selected_med_id = None
+            self.last_form_med_id = None
+            self.reset_form_fields()
         self.refresh_ui()
-        self.set_status(f"Saved {name}.")
+        if created_new:
+            if created_from_name_change:
+                self.set_status(f"Saved {name} as a new medication. Ready to add another medication.")
+            else:
+                self.set_status(f"Saved {name}. Ready to add another medication.")
+        else:
+            self.set_status(f"Saved {name}.")
 
     def on_delete_med(self) -> None:
         med = self.current_selected_med()
