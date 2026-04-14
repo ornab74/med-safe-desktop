@@ -1,0 +1,8366 @@
+from __future__ import annotations
+
+import json
+import math
+import os
+import random
+import re
+import shutil
+import struct
+import sys
+import tempfile
+import threading
+import time
+import tkinter as tk
+import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import date, datetime, time as dt_time, timedelta
+import hashlib
+from pathlib import Path
+from threading import RLock
+from tkinter import filedialog, messagebox, simpledialog
+from types import SimpleNamespace
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+import httpx
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+
+try:
+    import psutil
+except Exception:
+    psutil = None
+
+try:
+    import pennylane as qml
+    from pennylane import numpy as pnp
+except Exception:
+    qml = None
+    pnp = None
+
+try:
+    import customtkinter as ctk
+except Exception as exc:
+    ctk = None
+    CUSTOMTKINTER_IMPORT_ERROR = exc
+else:
+    CUSTOMTKINTER_IMPORT_ERROR = None
+
+plyer_camera = None
+plyer_filechooser = None
+Permission = None
+request_permissions = None
+
+
+class _LegacyUIStub:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __getattr__(self, _name: str) -> Any:
+        def _stub(*_args: Any, **_kwargs: Any) -> Any:
+            return None
+
+        return _stub
+
+
+def ListProperty(value: Any) -> Any:
+    return value
+
+
+def NumericProperty(value: Any) -> Any:
+    return value
+
+
+def StringProperty(value: Any) -> Any:
+    return value
+
+
+def dp(value: Any) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def Color(*_args: Any, **_kwargs: Any) -> None:
+    return None
+
+
+def Line(*_args: Any, **_kwargs: Any) -> None:
+    return None
+
+
+def Rectangle(*_args: Any, **_kwargs: Any) -> None:
+    return None
+
+
+def RoundedRectangle(*_args: Any, **_kwargs: Any) -> None:
+    return None
+
+
+class Texture(_LegacyUIStub):
+    @classmethod
+    def create(cls, *args: Any, **kwargs: Any) -> "Texture":
+        _ = args, kwargs
+        return cls()
+
+    def blit_buffer(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+
+class Animation(_LegacyUIStub):
+    repeat = False
+
+    def __and__(self, _other: Any) -> "Animation":
+        return self
+
+    def __add__(self, _other: Any) -> "Animation":
+        return self
+
+    @staticmethod
+    def cancel_all(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+
+class Clock:
+    @staticmethod
+    def schedule_once(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    @staticmethod
+    def schedule_interval(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+
+class Widget(_LegacyUIStub):
+    pass
+
+
+class MDApp(_LegacyUIStub):
+    pass
+
+
+class MDFlatButton(_LegacyUIStub):
+    pass
+
+
+class MDRaisedButton(_LegacyUIStub):
+    pass
+
+
+class MDDialog(_LegacyUIStub):
+    def open(self) -> None:
+        return None
+
+    def dismiss(self) -> None:
+        return None
+
+
+class TwoLineListItem(_LegacyUIStub):
+    pass
+
+
+class Builder:
+    @staticmethod
+    def load_string(_value: str) -> Any:
+        return SimpleNamespace(ids={})
+
+
+MODEL_REPO = "https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/main/"
+MODEL_FILE = "gemma-4-E2B-it.litertlm"
+EXPECTED_HASH = "ab7838cdfc8f77e54d8ca45eadceb20452d9f01e4bfade03e5dce27911b27e42"
+NETWORK_TIMEOUT = httpx.Timeout(connect=15.0, read=120.0, write=120.0, pool=15.0)
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+INFERENCE_BACKEND_OPTIONS = ("Auto", "CPU", "GPU")
+FILE_ENCRYPTION_MAGIC = b"MSAFEF01"
+FILE_ENCRYPTION_CHUNK_SIZE = 4 * 1024 * 1024
+KEY_WRAP_MAGIC = b"MSKEY001"
+KEY_WRAP_SALT_LEN = 16
+KEY_WRAP_NONCE_LEN = 12
+NAMED_DOSE_PRESETS: Tuple[Tuple[str, int], ...] = (
+    ("Breakfast", 8 * 60),
+    ("Daytime", 10 * 60),
+    ("Mid day", 12 * 60),
+    ("Lunch", 13 * 60),
+    ("Dinner", 18 * 60),
+    ("Nighttime", 21 * 60),
+)
+NAMED_DOSE_PRESET_MAP = {label.lower(): minutes for label, minutes in NAMED_DOSE_PRESETS}
+EXERCISE_HABITS: Tuple[Tuple[str, str, float], ...] = (
+    ("walk", "Walk", 15.0),
+    ("light", "Light Exercise", 10.0),
+    ("stretch", "Stretch", 5.0),
+)
+DEFAULT_SETTINGS = {
+    "inference_backend": "Auto",
+    "auto_selected_inference_backend": "",
+    "enable_native_image_input": True,
+    "setup_complete": False,
+    "startup_password_enabled": False,
+}
+CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+JSON_BLOCK_RE = re.compile(r"\{.*\}", re.S)
+
+APP_PATHS: Optional["AppPaths"] = None
+litert_lm = None
+LITERT_IMPORT_ERROR = None
+_CRYPTO_LOCK = RLock()
+
+
+@dataclass
+class AppPaths:
+    root: Path
+    models_dir: Path
+    media_dir: Path
+    cache_dir: Path
+    temp_dir: Path
+    key_path: Path
+    vault_path: Path
+    settings_path: Path
+    plain_model_path: Path
+    encrypted_model_path: Path
+
+
+def _set_owner_only_permissions(path: Path, *, is_dir: bool = False) -> None:
+    try:
+        os.chmod(path, 0o700 if is_dir else 0o600)
+    except Exception:
+        pass
+
+
+def set_app_paths(root: Union[str, Path]) -> AppPaths:
+    global APP_PATHS
+
+    base = Path(root).expanduser()
+    base.mkdir(parents=True, exist_ok=True)
+    paths = AppPaths(
+        root=base,
+        models_dir=base / "models",
+        media_dir=base / "media",
+        cache_dir=base / ".litert_cache",
+        temp_dir=base / ".tmp",
+        key_path=base / ".enc_key",
+        vault_path=base / "medsafe_vault.json.aes",
+        settings_path=base / "settings.json",
+        plain_model_path=(base / "models" / MODEL_FILE),
+        encrypted_model_path=(base / "models" / f"{MODEL_FILE}.aes"),
+    )
+    for directory in (paths.root, paths.models_dir, paths.media_dir, paths.cache_dir, paths.temp_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+        _set_owner_only_permissions(directory, is_dir=True)
+    APP_PATHS = paths
+    return paths
+
+
+def default_storage_root() -> Path:
+    if sys.platform.startswith("win"):
+        appdata = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+        if appdata:
+            return Path(appdata).expanduser() / "MedSafe"
+        return Path.home() / "AppData" / "Local" / "MedSafe"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "MedSafe"
+    xdg_home = os.environ.get("XDG_DATA_HOME")
+    if xdg_home:
+        return Path(xdg_home).expanduser() / "medsafe"
+    return Path.home() / ".local" / "share" / "medsafe"
+
+
+def desktop_platform_name() -> str:
+    if sys.platform.startswith("win"):
+        return "Windows"
+    if sys.platform == "darwin":
+        return "macOS"
+    if sys.platform.startswith("linux"):
+        return "Linux"
+    return "desktop"
+
+
+def require_paths() -> AppPaths:
+    if APP_PATHS is None:
+        return set_app_paths(default_storage_root())
+    return APP_PATHS
+
+
+def human_size(value: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(max(0, value))
+    unit = units[0]
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            break
+        size /= 1024.0
+    return f"{size:.1f}{unit}" if unit != "B" else f"{int(size)}B"
+
+
+def sanitize_text(value: Any, *, max_chars: int = 4000) -> str:
+    text = CONTROL_CHARS_RE.sub("", str(value or "")).strip()
+    if len(text) > max_chars:
+        return text[:max_chars].rstrip()
+    return text
+
+
+def safe_float(value: Any) -> float:
+    try:
+        return float(str(value).strip())
+    except Exception:
+        return 0.0
+
+
+def normalize_setting_choice(value: Any, options: Tuple[str, ...], default: str) -> str:
+    text = sanitize_text(value, max_chars=32)
+    if not text:
+        return default
+    for option in options:
+        if text.lower() == option.lower():
+            return option
+    return default
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}")
+    tmp.write_bytes(data)
+    tmp.replace(path)
+    _set_owner_only_permissions(path)
+
+
+def _atomic_write_via_handle(path: Path, writer: Callable[[Any], None]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}")
+    try:
+        with tmp.open("wb") as handle:
+            writer(handle)
+        tmp.replace(path)
+        _set_owner_only_permissions(path)
+    finally:
+        safe_cleanup([tmp])
+
+
+def sha256_file(path: Path) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def aes_encrypt(data: bytes, key: bytes) -> bytes:
+    aes = AESGCM(key)
+    nonce = os.urandom(12)
+    return nonce + aes.encrypt(nonce, data, None)
+
+
+def aes_decrypt(data: bytes, key: bytes) -> bytes:
+    aes = AESGCM(key)
+    nonce, payload = data[:12], data[12:]
+    return aes.decrypt(nonce, payload, None)
+
+
+def derive_password_key(password: str, salt: bytes) -> bytes:
+    kdf = Scrypt(
+        salt=salt,
+        length=32,
+        n=2**14,
+        r=8,
+        p=1,
+    )
+    return kdf.derive(password.encode("utf-8"))
+
+
+def is_protected_key_blob(data: bytes) -> bool:
+    return data.startswith(KEY_WRAP_MAGIC) and len(data) > len(KEY_WRAP_MAGIC) + KEY_WRAP_SALT_LEN + KEY_WRAP_NONCE_LEN
+
+
+def protect_raw_key(raw_key: bytes, password: str) -> bytes:
+    clean_password = sanitize_text(password, max_chars=256)
+    if len(clean_password) < 6:
+        raise ValueError("Startup password must be at least 6 characters.")
+    if len(raw_key) != 32:
+        raise ValueError("Vault key must be 32 bytes.")
+    salt = os.urandom(KEY_WRAP_SALT_LEN)
+    nonce = os.urandom(KEY_WRAP_NONCE_LEN)
+    wrap_key = derive_password_key(clean_password, salt)
+    payload = AESGCM(wrap_key).encrypt(nonce, raw_key, KEY_WRAP_MAGIC)
+    return KEY_WRAP_MAGIC + salt + nonce + payload
+
+
+def unlock_protected_key(blob: bytes, password: str) -> bytes:
+    if not is_protected_key_blob(blob):
+        raise ValueError("Key file is not password-protected.")
+    clean_password = sanitize_text(password, max_chars=256)
+    if not clean_password:
+        raise ValueError("Enter the startup password.")
+    offset = len(KEY_WRAP_MAGIC)
+    salt = blob[offset : offset + KEY_WRAP_SALT_LEN]
+    nonce_start = offset + KEY_WRAP_SALT_LEN
+    nonce_end = nonce_start + KEY_WRAP_NONCE_LEN
+    nonce = blob[nonce_start:nonce_end]
+    payload = blob[nonce_end:]
+    raw_key = AESGCM(derive_password_key(clean_password, salt)).decrypt(nonce, payload, KEY_WRAP_MAGIC)
+    if len(raw_key) != 32:
+        raise ValueError("Unlocked vault key length is invalid.")
+    return raw_key
+
+
+def encrypt_file(src: Path, dest: Path, key: bytes) -> None:
+    aes = AESGCM(key)
+
+    def writer(handle: Any) -> None:
+        handle.write(FILE_ENCRYPTION_MAGIC)
+        handle.write(struct.pack(">I", FILE_ENCRYPTION_CHUNK_SIZE))
+        with src.open("rb") as source:
+            while True:
+                chunk = source.read(FILE_ENCRYPTION_CHUNK_SIZE)
+                if not chunk:
+                    break
+                nonce = os.urandom(12)
+                encrypted = aes.encrypt(nonce, chunk, None)
+                handle.write(struct.pack(">I", len(encrypted)))
+                handle.write(nonce)
+                handle.write(encrypted)
+
+    _atomic_write_via_handle(dest, writer)
+
+
+def decrypt_file(src: Path, dest: Path, key: bytes) -> None:
+    header_len = len(FILE_ENCRYPTION_MAGIC)
+    with src.open("rb") as handle:
+        header = handle.read(header_len)
+        if header == FILE_ENCRYPTION_MAGIC:
+            chunk_size_raw = handle.read(4)
+            if len(chunk_size_raw) != 4:
+                raise ValueError("Encrypted model header is truncated.")
+            chunk_size = struct.unpack(">I", chunk_size_raw)[0]
+            if chunk_size <= 0 or chunk_size > 64 * 1024 * 1024:
+                raise ValueError("Encrypted model chunk size is invalid.")
+            aes = AESGCM(key)
+
+            def writer(out_handle: Any) -> None:
+                while True:
+                    length_raw = handle.read(4)
+                    if not length_raw:
+                        return
+                    if len(length_raw) != 4:
+                        raise ValueError("Encrypted model chunk length is truncated.")
+                    encrypted_len = struct.unpack(">I", length_raw)[0]
+                    if encrypted_len < 16 or encrypted_len > chunk_size + 16:
+                        raise ValueError("Encrypted model chunk length is invalid.")
+                    nonce = handle.read(12)
+                    if len(nonce) != 12:
+                        raise ValueError("Encrypted model nonce is truncated.")
+                    payload = handle.read(encrypted_len)
+                    if len(payload) != encrypted_len:
+                        raise ValueError("Encrypted model chunk payload is truncated.")
+                    out_handle.write(aes.decrypt(nonce, payload, None))
+
+            _atomic_write_via_handle(dest, writer)
+            return
+
+    _atomic_write_bytes(dest, aes_decrypt(src.read_bytes(), key))
+
+
+def safe_cleanup(paths: List[Path]) -> None:
+    for path in paths:
+        try:
+            if not path.exists():
+                continue
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink()
+        except Exception:
+            pass
+
+
+def _tmp_path(prefix: str, suffix: str) -> Path:
+    paths = require_paths()
+    return paths.temp_dir / f"{prefix}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}{suffix}"
+
+
+def format_duration(seconds: float) -> str:
+    total = max(0, int(round(seconds)))
+    hours, remainder = divmod(total, 3600)
+    minutes, _ = divmod(remainder, 60)
+    if hours and minutes:
+        return f"{hours}h {minutes}m"
+    if hours:
+        return f"{hours}h"
+    return f"{minutes}m"
+
+
+def format_timestamp(ts: float) -> str:
+    if not ts:
+        return "Not logged yet"
+    return time.strftime("%b %d, %I:%M %p", time.localtime(ts))
+
+
+def format_relative_due(target_ts: Optional[float], now_ts: float) -> str:
+    if target_ts is None:
+        return "Flexible schedule"
+    delta = target_ts - now_ts
+    if abs(delta) < 60:
+        return "Due now"
+    if delta > 0:
+        return f"In {format_duration(delta)}"
+    return f"{format_duration(abs(delta))} overdue"
+
+
+def mg_from_text(text: str) -> float:
+    match = re.search(r"(\d+(?:\.\d+)?)\s*mg\b", text, re.I)
+    return safe_float(match.group(1)) if match else 0.0
+
+
+def infer_interval_from_text(text: str) -> float:
+    lowered = sanitize_text(text, max_chars=500).lower()
+    for pattern in (
+        r"every\s+(\d+(?:\.\d+)?)\s*(?:hours|hour|hrs|hr)\b",
+        r"q(\d+(?:\.\d+)?)h\b",
+    ):
+        match = re.search(pattern, lowered)
+        if match:
+            return safe_float(match.group(1))
+    named = {
+        "once daily": 24.0,
+        "daily": 24.0,
+        "twice daily": 12.0,
+        "two times daily": 12.0,
+        "three times daily": 8.0,
+        "four times daily": 6.0,
+        "every morning": 24.0,
+        "nightly": 24.0,
+        "at bedtime": 24.0,
+    }
+    for phrase, hours in named.items():
+        if phrase in lowered:
+            return hours
+    return 0.0
+
+
+def infer_max_daily_mg(text: str, dose_mg: float) -> float:
+    lowered = sanitize_text(text, max_chars=500).lower()
+    match = re.search(r"(?:max(?:imum)?|not more than|do not exceed)\s+(\d+(?:\.\d+)?)\s*mg", lowered)
+    if match:
+        return safe_float(match.group(1))
+    if dose_mg > 0:
+        tablet_match = re.search(r"(?:max(?:imum)?|not more than|do not exceed)\s+(\d+(?:\.\d+)?)\s+(?:tablets|capsules|pills?)", lowered)
+        if tablet_match:
+            return safe_float(tablet_match.group(1)) * dose_mg
+    return 0.0
+
+
+def collect_system_metrics() -> Dict[str, float]:
+    if psutil is None:
+        raise RuntimeError("psutil is not available for local entropy metrics.")
+
+    cpu = psutil.cpu_percent(interval=0.05) / 100.0
+    mem = psutil.virtual_memory().percent / 100.0
+    try:
+        load_raw = os.getloadavg()[0]
+        cpu_count = psutil.cpu_count(logical=True) or 1
+        load1 = max(0.0, min(1.0, load_raw / max(1.0, float(cpu_count))))
+    except Exception:
+        load1 = cpu
+    try:
+        temp_groups = psutil.sensors_temperatures()
+        if temp_groups:
+            first_group = next(iter(temp_groups.values()))
+            first_value = first_group[0].current
+            temp = max(0.0, min(1.0, (first_value - 20.0) / 70.0))
+        else:
+            temp = 0.0
+    except Exception:
+        temp = 0.0
+    return {"cpu": cpu, "mem": mem, "load1": load1, "temp": temp}
+
+
+def metrics_to_rgb(metrics: Dict[str, float]) -> Tuple[float, float, float]:
+    cpu = metrics.get("cpu", 0.1)
+    mem = metrics.get("mem", 0.1)
+    temp = metrics.get("temp", 0.1)
+    load1 = metrics.get("load1", 0.0)
+    r = cpu * (1.0 + load1)
+    g = mem * (1.0 + load1 * 0.5)
+    b = temp * (0.5 + cpu * 0.5)
+    top = max(r, g, b, 1.0)
+    return (
+        float(max(0.0, min(1.0, r / top))),
+        float(max(0.0, min(1.0, g / top))),
+        float(max(0.0, min(1.0, b / top))),
+    )
+
+
+def pennylane_entropic_score(rgb: Tuple[float, float, float], shots: int = 96) -> float:
+    if qml is None or pnp is None:
+        r, g, b = rgb
+        seed = (int(r * 255) << 16) | (int(g * 255) << 8) | int(b * 255)
+        fallback_random = random.Random(seed)
+        base = (0.34 * r) + (0.38 * g) + (0.28 * b)
+        noise = (fallback_random.random() - 0.5) * 0.06
+        return max(0.0, min(1.0, base + noise))
+
+    device = qml.device("default.qubit", wires=2, shots=shots)
+
+    @qml.qnode(device)
+    def circuit(a: float, b: float, c: float):
+        qml.RX(a * math.pi, wires=0)
+        qml.RY(b * math.pi, wires=1)
+        qml.CNOT(wires=[0, 1])
+        qml.RZ(c * math.pi, wires=1)
+        qml.RX((a + b) * math.pi / 2.0, wires=0)
+        qml.RY((b + c) * math.pi / 2.0, wires=1)
+        return qml.expval(qml.PauliZ(0)), qml.expval(qml.PauliZ(1))
+
+    a, b, c = map(float, rgb)
+    try:
+        ev0, ev1 = circuit(a, b, c)
+        combined = ((ev0 + 1.0) / 2.0 * 0.58) + ((ev1 + 1.0) / 2.0 * 0.42)
+        score = 1.0 / (1.0 + math.exp(-6.0 * (combined - 0.5)))
+        return float(max(0.0, min(1.0, score)))
+    except Exception:
+        return float(max(0.0, min(1.0, (a + b + c) / 3.0)))
+
+
+def entropic_summary_text(score: float) -> str:
+    if score >= 0.75:
+        level = "high"
+    elif score >= 0.45:
+        level = "medium"
+    else:
+        level = "low"
+    return f"entropic_score={score:.3f} (level={level})"
+
+
+def risk_level_from_score(score: float) -> str:
+    clamped = max(0.0, min(100.0, score))
+    if clamped >= 70.0:
+        return "High"
+    if clamped >= 40.0:
+        return "Medium"
+    return "Low"
+
+
+def normalized_risk_level_text(value: Any, score: float) -> str:
+    lowered = sanitize_text(value, max_chars=24).lower()
+    if lowered == "low":
+        return "Low"
+    if lowered == "medium":
+        return "Medium"
+    if lowered == "high":
+        return "High"
+    return risk_level_from_score(score)
+
+
+def context_signature_rgb(domain: str, context_text: str) -> Tuple[float, float, float]:
+    digest = hashlib.sha256(
+        f"{sanitize_text(domain, max_chars=64)}|{sanitize_text(context_text, max_chars=2400)}".encode("utf-8")
+    ).digest()
+    return (
+        digest[2] / 255.0,
+        digest[11] / 255.0,
+        digest[23] / 255.0,
+    )
+
+
+def keyword_risk_pressure(domain: str, context_text: str) -> float:
+    lowered = sanitize_text(context_text, max_chars=2400).lower()
+    if not lowered:
+        return 0.0
+    pressure = 0.0
+    cues = {
+        "medication_label": (
+            ("max", 0.05),
+            ("warning", 0.06),
+            ("prn", 0.06),
+            ("as needed", 0.06),
+            ("with food", 0.04),
+        ),
+        "dental_hygiene": (
+            ("bleeding", 0.10),
+            ("swelling", 0.10),
+            ("pain", 0.08),
+            ("redness", 0.08),
+        ),
+        "dental_recovery": (
+            ("swelling", 0.18),
+            ("bleeding", 0.16),
+            ("pus", 0.20),
+            ("fever", 0.20),
+            ("worse", 0.14),
+            ("infection", 0.18),
+            ("pain", 0.10),
+            ("throbbing", 0.12),
+            ("redness", 0.12),
+        ),
+    }.get(domain, ())
+    for token, boost in cues:
+        if token in lowered:
+            pressure += boost
+    return max(0.0, min(1.0, pressure))
+
+
+def build_quantum_risk_packet(domain: str, context_text: str) -> Dict[str, Any]:
+    configs = {
+        "medication_label": {
+            "domain_label": "medication_label",
+            "base_bias": 0.58,
+            "prior_rule": "Treat the local prior as conservative review pressure only. Visible label evidence wins, and blurry or conflicting text should raise risk instead of being guessed.",
+            "summary_low": "Low review risk prior. Still confirm the label before relying on the imported schedule.",
+            "summary_medium": "Medium review risk prior. Re-check the medication name, dose, interval, and max daily limit before relying on the import.",
+            "summary_high": "High review risk prior. Verify every key label detail manually before saving or using this medication schedule.",
+        },
+        "dental_hygiene": {
+            "domain_label": "dental_hygiene",
+            "base_bias": 0.42,
+            "prior_rule": "Use the local prior only as a gentle caution signal. Visible plaque, redness, swelling, or blurry framing should raise risk, but do not diagnose disease.",
+            "summary_low": "Low follow-up risk prior. Keep the routine consistent and monitor normally.",
+            "summary_medium": "Medium follow-up risk prior. If the photo shows buildup or gum irritation, pay closer attention and tighten the routine.",
+            "summary_high": "High follow-up risk prior. Visible concerns or poor image clarity should push toward a closer self-check and possible dentist follow-up.",
+        },
+        "dental_recovery": {
+            "domain_label": "dental_recovery",
+            "base_bias": 0.57,
+            "prior_rule": "Use the local prior as conservative follow-up pressure only. Visible warning signs or worsening symptom notes should raise risk, but do not diagnose or overstate certainty.",
+            "summary_low": "Low follow-up risk prior. Continue conservative aftercare and keep monitoring the site.",
+            "summary_medium": "Medium follow-up risk prior. Compare the photo with your aftercare plan and watch closely for worsening symptoms.",
+            "summary_high": "High follow-up risk prior. Visible warning signs or worsening notes deserve a careful re-check and may justify contacting a dentist.",
+        },
+    }
+    config = configs.get(domain, configs["dental_hygiene"])
+    fallback_metrics = {"cpu": 0.20, "mem": 0.24, "load1": 0.16, "temp": 0.05}
+    try:
+        metrics = collect_system_metrics()
+        metrics_line = "cpu={cpu:.2f},mem={mem:.2f},load={load1:.2f},temp={temp:.2f}".format(
+            cpu=metrics.get("cpu", 0.0),
+            mem=metrics.get("mem", 0.0),
+            load1=metrics.get("load1", 0.0),
+            temp=metrics.get("temp", 0.0),
+        )
+    except Exception:
+        metrics = fallback_metrics
+        metrics_line = "unavailable"
+
+    metrics_rgb = metrics_to_rgb(metrics)
+    signature_rgb = context_signature_rgb(domain, context_text)
+    sim_rgb = (
+        max(0.0, min(1.0, (metrics_rgb[0] * 0.52) + (signature_rgb[0] * 0.48))),
+        max(0.0, min(1.0, (metrics_rgb[1] * 0.48) + (signature_rgb[1] * 0.52))),
+        max(0.0, min(1.0, (metrics_rgb[2] * 0.40) + (signature_rgb[2] * 0.60))),
+    )
+    entropy_score = pennylane_entropic_score(sim_rgb)
+    entropy_text = entropic_summary_text(entropy_score)
+    metric_pressure = (
+        (metrics.get("cpu", 0.0) * 0.34)
+        + (metrics.get("mem", 0.0) * 0.26)
+        + (metrics.get("load1", 0.0) * 0.25)
+        + (metrics.get("temp", 0.0) * 0.15)
+    )
+    context_pressure = (signature_rgb[0] * 0.42) + (signature_rgb[1] * 0.34) + (signature_rgb[2] * 0.24)
+    keyword_pressure = keyword_risk_pressure(domain, context_text)
+    risk_fraction = max(
+        0.0,
+        min(
+            1.0,
+            (config["base_bias"] * 0.46)
+            + (entropy_score * 0.24)
+            + (metric_pressure * 0.12)
+            + (context_pressure * 0.12)
+            + (keyword_pressure * 0.06),
+        ),
+    )
+    risk_score = round(risk_fraction * 100.0, 1)
+    risk_level = risk_level_from_score(risk_score)
+    summary_key = f"summary_{risk_level.lower()}"
+    summary = config.get(summary_key, config["summary_medium"])
+    prompt_block = "\n".join(
+        [
+            "[quantum_risk_sim]",
+            "mode: medsafe_quantum_risk_v1",
+            f"domain: {config['domain_label']}",
+            f"system_metrics: {metrics_line}",
+            f"quantum_state: {entropy_text}",
+            "sim_signal_rgb: {:.2f},{:.2f},{:.2f}".format(*sim_rgb),
+            f"local_prior_risk_score: {risk_score:.1f}",
+            f"local_prior_risk_level: {risk_level}",
+            f"prior_rule: {config['prior_rule']}",
+            "[/quantum_risk_sim]",
+        ]
+    )
+    return {
+        "domain": config["domain_label"],
+        "metrics_line": metrics_line,
+        "entropy_text": entropy_text,
+        "risk_score": risk_score,
+        "risk_level": risk_level,
+        "risk_summary": summary,
+        "prompt_block": prompt_block,
+        "prior_rule": config["prior_rule"],
+    }
+
+
+def normalize_risk_fields(
+    raw_payload: Dict[str, Any],
+    fallback_packet: Dict[str, Any],
+    *,
+    summary_keys: Tuple[str, ...] = ("risk_summary", "review_summary"),
+) -> Dict[str, Any]:
+    raw_score = raw_payload.get("risk_score")
+    if raw_score is None:
+        raw_score = raw_payload.get("review_risk_score")
+    score = safe_float(raw_score if raw_score is not None else fallback_packet.get("risk_score", 0.0))
+    if 0.0 < score <= 1.0:
+        score *= 100.0
+    score = max(0.0, min(100.0, score))
+    if raw_score in (None, "", 0, 0.0) and score <= 0.0:
+        score = max(0.0, min(100.0, safe_float(fallback_packet.get("risk_score"))))
+    level = normalized_risk_level_text(
+        raw_payload.get("risk_level") or raw_payload.get("review_risk_level") or "",
+        score,
+    )
+    summary = ""
+    for key in summary_keys:
+        summary = sanitize_text(raw_payload.get(key) or "", max_chars=260)
+        if summary:
+            break
+    if not summary:
+        summary = sanitize_text(fallback_packet.get("risk_summary") or "", max_chars=260)
+    return {
+        "risk_score": score,
+        "risk_level": level,
+        "risk_summary": summary,
+    }
+
+
+def dental_hygiene_defaults() -> Dict[str, Any]:
+    return {
+        "brush_interval_hours": 12.0,
+        "floss_interval_hours": 24.0,
+        "rinse_interval_hours": 24.0,
+        "last_brush_ts": 0.0,
+        "last_floss_ts": 0.0,
+        "last_rinse_ts": 0.0,
+        "latest_score": 0.0,
+        "latest_rating": "",
+        "latest_summary": "",
+        "latest_suggestions": "",
+        "latest_warning_flags": "",
+        "latest_risk_score": 0.0,
+        "latest_risk_level": "",
+        "latest_risk_summary": "",
+        "latest_photo": "",
+        "latest_timestamp": 0.0,
+        "history": [],
+    }
+
+
+def dental_recovery_defaults() -> Dict[str, Any]:
+    return {
+        "enabled": False,
+        "procedure_type": "",
+        "procedure_date": "",
+        "symptom_notes": "",
+        "care_notes": "",
+        "latest_score": 0.0,
+        "latest_status": "",
+        "latest_summary": "",
+        "latest_advice": "",
+        "latest_warning_flags": "",
+        "latest_risk_score": 0.0,
+        "latest_risk_level": "",
+        "latest_risk_summary": "",
+        "latest_photo": "",
+        "latest_timestamp": 0.0,
+        "daily_logs": [],
+    }
+
+
+def exercise_defaults() -> Dict[str, Any]:
+    return {
+        "walk_interval_hours": 4.0,
+        "light_interval_hours": 8.0,
+        "stretch_interval_hours": 2.0,
+        "daily_walk_goal_minutes": 30.0,
+        "daily_light_goal_minutes": 20.0,
+        "daily_stretch_goal_minutes": 10.0,
+        "last_walk_ts": 0.0,
+        "last_light_ts": 0.0,
+        "last_stretch_ts": 0.0,
+        "notes": "",
+        "history": [],
+    }
+
+
+def vault_defaults() -> Dict[str, Any]:
+    return {
+        "version": 2,
+        "meds": [],
+        "assistant_history": [],
+        "vision_imports": [],
+        "dental_hygiene": dental_hygiene_defaults(),
+        "dental_recovery": dental_recovery_defaults(),
+        "exercise": exercise_defaults(),
+        "last_notifications": {},
+    }
+
+
+def ensure_vault_shape(raw: Any) -> Dict[str, Any]:
+    base = vault_defaults()
+    if not isinstance(raw, dict):
+        return base
+
+    meds: List[Dict[str, Any]] = []
+    for item in raw.get("meds", []) or []:
+        if not isinstance(item, dict):
+            continue
+        history_rows = []
+        for row in item.get("history", []) or []:
+            if isinstance(row, (list, tuple)) and len(row) >= 2:
+                history_rows.append([safe_float(row[0]), max(0.0, safe_float(row[1]))])
+        created_ts = safe_float(item.get("created_ts") or 0.0)
+        if created_ts <= 0.0:
+            created_ts = safe_float(item.get("last_taken_ts") or 0.0)
+        if created_ts <= 0.0 and not history_rows:
+            created_ts = time.time()
+        meds.append(
+            {
+                "id": sanitize_text(item.get("id") or uuid.uuid4().hex[:12], max_chars=32),
+                "name": sanitize_text(item.get("name") or "Medication", max_chars=120),
+                "dose_mg": max(0.0, safe_float(item.get("dose_mg"))),
+                "interval_hours": max(0.0, safe_float(item.get("interval_hours"))),
+                "max_daily_mg": max(0.0, safe_float(item.get("max_daily_mg"))),
+                "created_ts": created_ts,
+                "first_dose_time": sanitize_text(item.get("first_dose_time") or "", max_chars=20),
+                "custom_times_text": sanitize_text(item.get("custom_times_text") or "", max_chars=320),
+                "schedule_text": sanitize_text(item.get("schedule_text") or "", max_chars=240),
+                "notes": sanitize_text(item.get("notes") or "", max_chars=600),
+                "source": sanitize_text(item.get("source") or "manual", max_chars=40),
+                "source_photo": sanitize_text(item.get("source_photo") or "", max_chars=180),
+                "last_taken_ts": safe_float(item.get("last_taken_ts")),
+                "history": history_rows[-240:],
+            }
+        )
+
+    assistant_history = []
+    for item in raw.get("assistant_history", []) or []:
+        if not isinstance(item, dict):
+            continue
+        assistant_history.append(
+            {
+                "role": sanitize_text(item.get("role") or "assistant", max_chars=16) or "assistant",
+                "content": sanitize_text(item.get("content") or "", max_chars=3000),
+                "timestamp": safe_float(item.get("timestamp") or time.time()),
+            }
+        )
+
+    imports = []
+    for item in raw.get("vision_imports", []) or []:
+        if not isinstance(item, dict):
+            continue
+        imports.append(
+            {
+                "timestamp": safe_float(item.get("timestamp") or time.time()),
+                "image_name": sanitize_text(item.get("image_name") or "", max_chars=160),
+                "med_id": sanitize_text(item.get("med_id") or "", max_chars=32),
+                "summary": sanitize_text(item.get("summary") or "", max_chars=500),
+                "risk_score": max(0.0, min(100.0, safe_float(item.get("risk_score")))),
+                "risk_level": normalized_risk_level_text(item.get("risk_level") or "", safe_float(item.get("risk_score"))),
+                "risk_summary": sanitize_text(item.get("risk_summary") or "", max_chars=260),
+            }
+        )
+
+    hygiene_raw = raw.get("dental_hygiene") if isinstance(raw.get("dental_hygiene"), dict) else {}
+    hygiene = dental_hygiene_defaults()
+    hygiene["brush_interval_hours"] = max(1.0, safe_float(hygiene_raw.get("brush_interval_hours") or hygiene["brush_interval_hours"]))
+    hygiene["floss_interval_hours"] = max(1.0, safe_float(hygiene_raw.get("floss_interval_hours") or hygiene["floss_interval_hours"]))
+    hygiene["rinse_interval_hours"] = max(1.0, safe_float(hygiene_raw.get("rinse_interval_hours") or hygiene["rinse_interval_hours"]))
+    hygiene["last_brush_ts"] = safe_float(hygiene_raw.get("last_brush_ts"))
+    hygiene["last_floss_ts"] = safe_float(hygiene_raw.get("last_floss_ts"))
+    hygiene["last_rinse_ts"] = safe_float(hygiene_raw.get("last_rinse_ts"))
+    hygiene["latest_score"] = max(0.0, min(100.0, safe_float(hygiene_raw.get("latest_score"))))
+    hygiene["latest_rating"] = sanitize_text(hygiene_raw.get("latest_rating") or "", max_chars=80)
+    hygiene["latest_summary"] = sanitize_text(hygiene_raw.get("latest_summary") or "", max_chars=500)
+    hygiene["latest_suggestions"] = sanitize_text(hygiene_raw.get("latest_suggestions") or "", max_chars=700)
+    hygiene["latest_warning_flags"] = sanitize_text(hygiene_raw.get("latest_warning_flags") or "", max_chars=400)
+    hygiene["latest_risk_score"] = max(0.0, min(100.0, safe_float(hygiene_raw.get("latest_risk_score"))))
+    hygiene["latest_risk_level"] = normalized_risk_level_text(hygiene_raw.get("latest_risk_level") or "", hygiene["latest_risk_score"])
+    hygiene["latest_risk_summary"] = sanitize_text(hygiene_raw.get("latest_risk_summary") or "", max_chars=260)
+    hygiene["latest_photo"] = sanitize_text(hygiene_raw.get("latest_photo") or "", max_chars=180)
+    hygiene["latest_timestamp"] = safe_float(hygiene_raw.get("latest_timestamp"))
+    hygiene_history = []
+    for item in hygiene_raw.get("history", []) or []:
+        if not isinstance(item, dict):
+            continue
+        hygiene_history.append(
+            {
+                "timestamp": safe_float(item.get("timestamp") or time.time()),
+                "image_name": sanitize_text(item.get("image_name") or "", max_chars=160),
+                "score": max(0.0, min(100.0, safe_float(item.get("score")))),
+                "rating": sanitize_text(item.get("rating") or "", max_chars=80),
+                "summary": sanitize_text(item.get("summary") or "", max_chars=300),
+                "suggestions": sanitize_text(item.get("suggestions") or "", max_chars=400),
+                "warning_flags": sanitize_text(item.get("warning_flags") or "", max_chars=240),
+                "confidence": max(0.0, min(1.0, safe_float(item.get("confidence")))),
+                "risk_score": max(0.0, min(100.0, safe_float(item.get("risk_score")))),
+                "risk_level": normalized_risk_level_text(item.get("risk_level") or "", safe_float(item.get("risk_score"))),
+                "risk_summary": sanitize_text(item.get("risk_summary") or "", max_chars=220),
+            }
+        )
+    hygiene["history"] = hygiene_history[-20:]
+
+    recovery_raw = raw.get("dental_recovery") if isinstance(raw.get("dental_recovery"), dict) else {}
+    recovery = dental_recovery_defaults()
+    recovery["enabled"] = bool(recovery_raw.get("enabled", False))
+    recovery["procedure_type"] = sanitize_text(recovery_raw.get("procedure_type") or "", max_chars=120)
+    recovery["procedure_date"] = sanitize_text(recovery_raw.get("procedure_date") or "", max_chars=20)
+    recovery["symptom_notes"] = sanitize_text(recovery_raw.get("symptom_notes") or "", max_chars=600)
+    recovery["care_notes"] = sanitize_text(recovery_raw.get("care_notes") or "", max_chars=600)
+    recovery["latest_score"] = max(0.0, min(100.0, safe_float(recovery_raw.get("latest_score"))))
+    recovery["latest_status"] = sanitize_text(recovery_raw.get("latest_status") or "", max_chars=120)
+    recovery["latest_summary"] = sanitize_text(recovery_raw.get("latest_summary") or "", max_chars=700)
+    recovery["latest_advice"] = sanitize_text(recovery_raw.get("latest_advice") or "", max_chars=900)
+    recovery["latest_warning_flags"] = sanitize_text(recovery_raw.get("latest_warning_flags") or "", max_chars=400)
+    recovery["latest_risk_score"] = max(0.0, min(100.0, safe_float(recovery_raw.get("latest_risk_score"))))
+    recovery["latest_risk_level"] = normalized_risk_level_text(recovery_raw.get("latest_risk_level") or "", recovery["latest_risk_score"])
+    recovery["latest_risk_summary"] = sanitize_text(recovery_raw.get("latest_risk_summary") or "", max_chars=260)
+    recovery["latest_photo"] = sanitize_text(recovery_raw.get("latest_photo") or "", max_chars=180)
+    recovery["latest_timestamp"] = safe_float(recovery_raw.get("latest_timestamp"))
+    daily_logs = []
+    for item in recovery_raw.get("daily_logs", []) or []:
+        if not isinstance(item, dict):
+            continue
+        daily_logs.append(
+            {
+                "timestamp": safe_float(item.get("timestamp") or time.time()),
+                "image_name": sanitize_text(item.get("image_name") or "", max_chars=160),
+                "day_number": max(0, int(safe_float(item.get("day_number") or 0))),
+                "score": max(0.0, min(100.0, safe_float(item.get("score")))),
+                "status": sanitize_text(item.get("status") or "", max_chars=120),
+                "summary": sanitize_text(item.get("summary") or "", max_chars=400),
+                "advice": sanitize_text(item.get("advice") or "", max_chars=500),
+                "warning_flags": sanitize_text(item.get("warning_flags") or "", max_chars=260),
+                "confidence": max(0.0, min(1.0, safe_float(item.get("confidence")))),
+                "risk_score": max(0.0, min(100.0, safe_float(item.get("risk_score")))),
+                "risk_level": normalized_risk_level_text(item.get("risk_level") or "", safe_float(item.get("risk_score"))),
+                "risk_summary": sanitize_text(item.get("risk_summary") or "", max_chars=220),
+            }
+        )
+    recovery["daily_logs"] = daily_logs[-30:]
+
+    exercise_raw = raw.get("exercise") if isinstance(raw.get("exercise"), dict) else {}
+    exercise = exercise_defaults()
+    exercise["walk_interval_hours"] = max(0.5, safe_float(exercise_raw.get("walk_interval_hours") or exercise["walk_interval_hours"]))
+    exercise["light_interval_hours"] = max(0.5, safe_float(exercise_raw.get("light_interval_hours") or exercise["light_interval_hours"]))
+    exercise["stretch_interval_hours"] = max(0.5, safe_float(exercise_raw.get("stretch_interval_hours") or exercise["stretch_interval_hours"]))
+    exercise["daily_walk_goal_minutes"] = max(1.0, safe_float(exercise_raw.get("daily_walk_goal_minutes") or exercise["daily_walk_goal_minutes"]))
+    exercise["daily_light_goal_minutes"] = max(1.0, safe_float(exercise_raw.get("daily_light_goal_minutes") or exercise["daily_light_goal_minutes"]))
+    exercise["daily_stretch_goal_minutes"] = max(1.0, safe_float(exercise_raw.get("daily_stretch_goal_minutes") or exercise["daily_stretch_goal_minutes"]))
+    exercise["last_walk_ts"] = safe_float(exercise_raw.get("last_walk_ts"))
+    exercise["last_light_ts"] = safe_float(exercise_raw.get("last_light_ts"))
+    exercise["last_stretch_ts"] = safe_float(exercise_raw.get("last_stretch_ts"))
+    exercise["notes"] = sanitize_text(exercise_raw.get("notes") or "", max_chars=800)
+    exercise_history = []
+    for item in exercise_raw.get("history", []) or []:
+        if not isinstance(item, dict):
+            continue
+        habit_name = sanitize_text(item.get("habit") or "", max_chars=16).lower()
+        if habit_name not in {"walk", "light", "stretch"}:
+            continue
+        exercise_history.append(
+            {
+                "timestamp": safe_float(item.get("timestamp") or time.time()),
+                "habit": habit_name,
+                "minutes": max(0.0, safe_float(item.get("minutes"))),
+            }
+        )
+    exercise["history"] = exercise_history[-240:]
+
+    base["meds"] = meds
+    base["assistant_history"] = assistant_history[-24:]
+    base["vision_imports"] = imports[-16:]
+    base["dental_hygiene"] = hygiene
+    base["dental_recovery"] = recovery
+    base["exercise"] = exercise
+    if isinstance(raw.get("last_notifications"), dict):
+        base["last_notifications"] = dict(raw["last_notifications"])
+    return base
+
+
+class EncryptedVault:
+    def __init__(self, paths: AppPaths):
+        self.paths = paths
+        self.lock = RLock()
+        self.cached_key: Optional[bytes] = None
+        self.session_password: Optional[str] = None
+
+    def clear_cached_key(self) -> None:
+        with self.lock:
+            self.cached_key = None
+            self.session_password = None
+
+    def is_key_protected(self) -> bool:
+        with self.lock:
+            if not self.paths.key_path.exists():
+                return False
+            try:
+                return is_protected_key_blob(self.paths.key_path.read_bytes())
+            except Exception:
+                return False
+
+    def is_unlocked(self) -> bool:
+        return self.cached_key is not None
+
+    def save_key(self, raw_key: bytes, password: Optional[str] = None) -> bytes:
+        with self.lock:
+            if len(raw_key) != 32:
+                raise ValueError("Vault key must be 32 bytes.")
+            blob = protect_raw_key(raw_key, password) if password else raw_key
+            _atomic_write_bytes(self.paths.key_path, blob)
+            self.cached_key = raw_key
+            self.session_password = sanitize_text(password, max_chars=256) if password else None
+            return raw_key
+
+    def get_or_create_key(self, password: Optional[str] = None, *, allow_create: bool = True) -> bytes:
+        with self.lock:
+            if self.cached_key is not None:
+                return self.cached_key
+            if self.paths.key_path.exists():
+                data = self.paths.key_path.read_bytes()
+                if is_protected_key_blob(data):
+                    active_password = sanitize_text(password or self.session_password or "", max_chars=256)
+                    if not active_password:
+                        raise RuntimeError("A startup password is required to unlock this encrypted vault.")
+                    try:
+                        raw_key = unlock_protected_key(data, active_password)
+                    except Exception as exc:
+                        raise RuntimeError("Startup password could not unlock the encrypted vault.") from exc
+                    self.cached_key = raw_key
+                    self.session_password = active_password
+                    return raw_key
+                if len(data) >= 32:
+                    self.cached_key = data[:32]
+                    self.session_password = None
+                    return self.cached_key
+                raise RuntimeError("The local vault key file is invalid.")
+            if not allow_create:
+                raise RuntimeError("The local vault key is missing.")
+            key = AESGCM.generate_key(256)
+            return self.save_key(key, password=password)
+
+    def enable_password(self, password: str, current_password: Optional[str] = None) -> None:
+        with self.lock:
+            raw_key = self.get_or_create_key(password=current_password)
+            self.save_key(raw_key, password=password)
+
+    def disable_password(self, current_password: Optional[str] = None) -> None:
+        with self.lock:
+            raw_key = self.get_or_create_key(password=current_password)
+            self.save_key(raw_key, password=None)
+
+    def rotate_key(self, new_password: Optional[str] = None, current_password: Optional[str] = None) -> None:
+        with self.lock:
+            current_key = self.get_or_create_key(password=current_password)
+            if new_password is None and self.is_key_protected():
+                new_password = current_password or self.session_password
+            next_key = AESGCM.generate_key(256)
+            if self.paths.vault_path.exists():
+                plaintext = aes_decrypt(self.paths.vault_path.read_bytes(), current_key)
+                _atomic_write_bytes(self.paths.vault_path, aes_encrypt(plaintext, next_key))
+            if self.paths.encrypted_model_path.exists():
+                temp_plain = _tmp_path("medsafe_rotate_model", ".litertlm")
+                temp_encrypted = _tmp_path("medsafe_rotate_model", ".litertlm.aes")
+                try:
+                    decrypt_file(self.paths.encrypted_model_path, temp_plain, current_key)
+                    encrypt_file(temp_plain, temp_encrypted, next_key)
+                    temp_encrypted.replace(self.paths.encrypted_model_path)
+                    _set_owner_only_permissions(self.paths.encrypted_model_path)
+                finally:
+                    safe_cleanup([temp_plain, temp_encrypted])
+            self.save_key(next_key, password=new_password)
+
+    def load(self, password: Optional[str] = None) -> Dict[str, Any]:
+        with self.lock:
+            if not self.paths.vault_path.exists():
+                return vault_defaults()
+            try:
+                plaintext = aes_decrypt(
+                    self.paths.vault_path.read_bytes(),
+                    self.get_or_create_key(password=password, allow_create=False),
+                )
+                return ensure_vault_shape(json.loads(plaintext.decode("utf-8")))
+            except RuntimeError:
+                raise
+            except Exception:
+                return vault_defaults()
+
+    def save(self, data: Dict[str, Any], password: Optional[str] = None) -> None:
+        with self.lock:
+            payload = json.dumps(ensure_vault_shape(data), ensure_ascii=False, indent=2).encode("utf-8")
+            _atomic_write_bytes(self.paths.vault_path, aes_encrypt(payload, self.get_or_create_key(password=password)))
+
+
+def load_settings(paths: Optional[AppPaths] = None) -> Dict[str, Any]:
+    target = (paths or require_paths()).settings_path
+    if not target.exists():
+        return dict(DEFAULT_SETTINGS)
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return dict(DEFAULT_SETTINGS)
+    settings = dict(DEFAULT_SETTINGS)
+    settings.update({key: raw.get(key, default) for key, default in DEFAULT_SETTINGS.items()})
+    settings["inference_backend"] = normalize_setting_choice(settings.get("inference_backend"), INFERENCE_BACKEND_OPTIONS, "Auto")
+    settings["auto_selected_inference_backend"] = normalize_setting_choice(
+        settings.get("auto_selected_inference_backend"),
+        ("", "CPU", "GPU"),
+        "",
+    )
+    settings["enable_native_image_input"] = bool(settings.get("enable_native_image_input", True))
+    settings["setup_complete"] = bool(settings.get("setup_complete", False))
+    settings["startup_password_enabled"] = bool(settings.get("startup_password_enabled", False))
+    return settings
+
+
+def save_settings(settings: Dict[str, Any], paths: Optional[AppPaths] = None) -> None:
+    target = (paths or require_paths()).settings_path
+    _atomic_write_bytes(target, json.dumps(load_settings(paths) | settings, indent=2).encode("utf-8"))
+
+
+def existing_app_install(paths: AppPaths) -> bool:
+    return any(
+        path.exists()
+        for path in (
+            paths.key_path,
+            paths.vault_path,
+            paths.plain_model_path,
+            paths.encrypted_model_path,
+        )
+    )
+
+
+def require_litert_lm() -> None:
+    global litert_lm, LITERT_IMPORT_ERROR
+    if litert_lm is None and LITERT_IMPORT_ERROR is None:
+        try:
+            import litert_lm as litert_lm_module
+        except Exception as exc:
+            LITERT_IMPORT_ERROR = exc
+        else:
+            litert_lm = litert_lm_module
+    if litert_lm is None:
+        detail = f" Import error: {LITERT_IMPORT_ERROR}" if LITERT_IMPORT_ERROR else ""
+        raise RuntimeError("LiteRT-LM is not installed on this device yet." + detail)
+
+
+def _litert_backend_attr(*names: str) -> Any:
+    require_litert_lm()
+    for name in names:
+        try:
+            return getattr(litert_lm.Backend, name)
+        except Exception:
+            continue
+    return None
+
+
+def _litert_cpu_backend() -> Any:
+    backend = _litert_backend_attr("CPU")
+    if backend is None:
+        raise RuntimeError("This LiteRT-LM build does not expose a CPU backend.")
+    return backend
+
+
+def _litert_gpu_backend() -> Any:
+    backend = _litert_backend_attr("GPU", "WEBGPU", "WEB_GPU", "GPU_WEBGPU")
+    if backend is None:
+        available = ", ".join(name for name in dir(litert_lm.Backend) if not name.startswith("_"))
+        raise RuntimeError(f"GPU backend not available in LiteRT-LM. Available: {available or 'unknown'}")
+    return backend
+
+
+def gpu_inference_looks_available() -> bool:
+    if os.environ.get("MEDSAFE_DISABLE_GPU_AUTO") == "1":
+        return False
+    if os.environ.get("MEDSAFE_FORCE_GPU_AUTO") == "1":
+        return True
+    if os.path.exists("/dev/dri"):
+        try:
+            return any(Path("/dev/dri").glob("renderD*"))
+        except Exception:
+            return False
+    return any(Path(path).exists() for path in ("/dev/nvidia0", "/dev/nvidiactl"))
+
+
+def choose_auto_inference_backend_name() -> str:
+    gpu_backend = _litert_backend_attr("GPU", "WEBGPU", "WEB_GPU", "GPU_WEBGPU")
+    return "GPU" if gpu_backend is not None and gpu_inference_looks_available() else "CPU"
+
+
+def resolve_inference_backend_name(preference: str = "Auto") -> Tuple[str, bool]:
+    selected = normalize_setting_choice(preference, INFERENCE_BACKEND_OPTIONS, "Auto")
+    if selected != "Auto":
+        return selected, False
+    settings = load_settings()
+    saved = normalize_setting_choice(settings.get("auto_selected_inference_backend"), ("", "CPU", "GPU"), "")
+    if saved:
+        return saved, True
+    auto_selected = choose_auto_inference_backend_name()
+    save_settings({"auto_selected_inference_backend": auto_selected})
+    return auto_selected, True
+
+
+def backend_value_for_name(backend_name: str) -> Any:
+    if backend_name == "GPU":
+        return _litert_gpu_backend()
+    return _litert_cpu_backend()
+
+
+def validate_image_path(image_path: Union[str, Path]) -> Path:
+    raw_path = Path(image_path).expanduser()
+    if raw_path.is_symlink():
+        raise ValueError("Symlinked images are not allowed.")
+    path = raw_path.resolve(strict=True)
+    if not path.is_file():
+        raise ValueError("Selected image is not a regular file.")
+    if path.suffix.lower() not in ALLOWED_IMAGE_EXTENSIONS:
+        allowed = ", ".join(sorted(ALLOWED_IMAGE_EXTENSIONS))
+        raise ValueError(f"Unsupported image type. Allowed extensions: {allowed}.")
+    size = path.stat().st_size
+    if size <= 0:
+        raise ValueError("Selected image is empty.")
+    if size > MAX_IMAGE_BYTES:
+        raise ValueError(f"Selected image is too large. Limit: {human_size(MAX_IMAGE_BYTES)}.")
+    with path.open("rb") as handle:
+        header = handle.read(16)
+    looks_like_jpeg = path.suffix.lower() in {".jpg", ".jpeg"} and header.startswith(b"\xff\xd8\xff")
+    looks_like_png = path.suffix.lower() == ".png" and header.startswith(b"\x89PNG\r\n\x1a\n")
+    looks_like_webp = path.suffix.lower() == ".webp" and header[:4] == b"RIFF" and header[8:12] == b"WEBP"
+    if not (looks_like_jpeg or looks_like_png or looks_like_webp):
+        raise ValueError("Selected image bytes do not match the file extension.")
+    return path
+
+
+def configured_model_supports_native_image_input() -> bool:
+    lowered = MODEL_FILE.lower()
+    return any(marker in lowered for marker in ("gemma-4", "gemma-3n", "multimodal", "vision"))
+
+
+def image_metadata_prompt(image_path: Path, *, native_requested: bool, native_allowed: bool) -> str:
+    return (
+        "\n\n[Validated image attachment]\n"
+        f"filename: {sanitize_text(image_path.name, max_chars=160)}\n"
+        f"type: {sanitize_text(image_path.suffix.lower(), max_chars=16)}\n"
+        f"size: {human_size(image_path.stat().st_size)}\n"
+        f"sha256: {sha256_file(image_path)}\n"
+        f"image_input_mode: {'native pixels enabled' if native_requested and native_allowed else 'metadata only'}\n"
+        "security_note: only use visible evidence from the image.\n"
+    )
+
+
+def create_default_messages(system_text: Optional[str] = None) -> List[dict]:
+    if not system_text:
+        return []
+    return [{"role": "system", "content": [{"type": "text", "text": system_text}]}]
+
+
+def response_to_text(response: dict) -> str:
+    if not isinstance(response, dict):
+        return sanitize_text(response)
+    parts = response.get("content", [])
+    texts: List[str] = []
+    for item in parts:
+        if isinstance(item, dict) and item.get("type") == "text":
+            texts.append(item.get("text", ""))
+    return sanitize_text("".join(texts), max_chars=6000)
+
+
+def create_user_message(user_text: str, image_path: Optional[str] = None) -> Any:
+    clean_text = sanitize_text(user_text, max_chars=9000)
+    if not image_path:
+        return clean_text
+    safe_image_path = validate_image_path(image_path)
+    return {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": clean_text},
+            {"type": "image", "path": str(safe_image_path)},
+        ],
+    }
+
+
+def load_litert_engine(
+    model_path: Path,
+    cache_dir: Optional[Path] = None,
+    *,
+    enable_vision: bool = False,
+    inference_backend: str = "Auto",
+):
+    require_litert_lm()
+    try:
+        litert_lm.set_min_log_severity(litert_lm.LogSeverity.ERROR)
+    except Exception:
+        pass
+
+    backend_name, auto_selected = resolve_inference_backend_name(inference_backend)
+    try:
+        backend_value = backend_value_for_name(backend_name)
+    except RuntimeError:
+        if auto_selected and backend_name == "GPU":
+            save_settings({"auto_selected_inference_backend": "CPU"})
+            backend_name = "CPU"
+            backend_value = _litert_cpu_backend()
+        else:
+            raise
+
+    engine_kwargs = {
+        "backend": backend_value,
+        "cache_dir": str(cache_dir or require_paths().cache_dir),
+    }
+    if enable_vision:
+        engine_kwargs["vision_backend"] = backend_value
+    try:
+        return litert_lm.Engine(str(model_path), **engine_kwargs)
+    except TypeError as exc:
+        if enable_vision:
+            raise RuntimeError(
+                "This LiteRT-LM build rejected native vision input. Upgrade LiteRT-LM before using bottle-photo import."
+            ) from exc
+        raise
+    except Exception as exc:
+        if auto_selected and backend_name == "GPU":
+            save_settings({"auto_selected_inference_backend": "CPU"})
+            cpu_backend = _litert_cpu_backend()
+            engine_kwargs["backend"] = cpu_backend
+            if enable_vision:
+                engine_kwargs["vision_backend"] = cpu_backend
+            return litert_lm.Engine(str(model_path), **engine_kwargs)
+        raise exc
+
+
+@contextmanager
+def temporary_litert_cache():
+    paths = require_paths()
+    cache_path = paths.cache_dir / f"worker_{os.getpid()}_{time.time_ns()}"
+    cache_path.mkdir(parents=True, exist_ok=False)
+    try:
+        yield cache_path
+    finally:
+        shutil.rmtree(cache_path, ignore_errors=True)
+
+
+@contextmanager
+def unlocked_model_path(key: bytes):
+    paths = require_paths()
+    if paths.encrypted_model_path.exists():
+        temp_model = _tmp_path("gemma_model", ".litertlm")
+        decrypt_file(paths.encrypted_model_path, temp_model, key)
+        try:
+            yield temp_model
+        finally:
+            safe_cleanup([temp_model])
+        return
+    if paths.plain_model_path.exists():
+        yield paths.plain_model_path
+        return
+    raise FileNotFoundError("Gemma 4 model not found. Download it from the Model tab first.")
+
+
+def litert_chat_blocking(
+    key: bytes,
+    user_text: str,
+    *,
+    system_text: Optional[str] = None,
+    image_path: Optional[str] = None,
+    native_image_input: bool = False,
+    inference_backend: str = "Auto",
+) -> str:
+    safe_image_path = validate_image_path(image_path) if image_path else None
+    native_allowed = bool(safe_image_path) and native_image_input and configured_model_supports_native_image_input()
+    prompt_text = sanitize_text(user_text, max_chars=12000)
+    model_image_path = str(safe_image_path) if native_allowed and safe_image_path else None
+    if safe_image_path is not None and not native_allowed:
+        prompt_text += image_metadata_prompt(
+            safe_image_path,
+            native_requested=native_image_input,
+            native_allowed=native_allowed,
+        )
+
+    with unlocked_model_path(key) as model_path, temporary_litert_cache() as cache_dir:
+        engine = load_litert_engine(
+            model_path,
+            cache_dir=cache_dir,
+            enable_vision=bool(model_image_path),
+            inference_backend=inference_backend,
+        )
+        with engine:
+            messages = create_default_messages(system_text)
+            with engine.create_conversation(messages=messages) as conversation:
+                return response_to_text(conversation.send_message(create_user_message(prompt_text, model_image_path)))
+
+
+def download_model_httpx(
+    url: str,
+    dest: Path,
+    *,
+    expected_sha: Optional[str] = None,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> str:
+    import hashlib
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256()
+    with httpx.stream("GET", url, follow_redirects=True, timeout=NETWORK_TIMEOUT) as response:
+        response.raise_for_status()
+        total = int(response.headers.get("Content-Length") or 0)
+        done = 0
+        tmp = dest.with_suffix(dest.suffix + f".download.{uuid.uuid4().hex}")
+        try:
+            with tmp.open("wb") as handle:
+                for chunk in response.iter_bytes(chunk_size=1024 * 256):
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    digest.update(chunk)
+                    done += len(chunk)
+                    if progress_callback:
+                        progress_callback(done, total)
+            tmp.replace(dest)
+        finally:
+            safe_cleanup([tmp])
+    sha = digest.hexdigest()
+    if expected_sha and sha.lower() != expected_sha.lower():
+        safe_cleanup([dest])
+        raise ValueError(f"Downloaded model SHA mismatch. Expected {expected_sha}, got {sha}.")
+    return sha
+
+
+def download_and_encrypt_model(key: bytes, reporter: Optional[Callable[[str, Any], None]] = None) -> str:
+    paths = require_paths()
+    plain_temp = _tmp_path("gemma_download", ".litertlm")
+    encrypted_temp = _tmp_path("gemma_sealed", ".litertlm.aes")
+    try:
+        if reporter:
+            reporter("status", "Downloading Gemma 4 into a temporary vault...")
+
+        def on_progress(done: int, total: int) -> None:
+            if reporter and total:
+                reporter("progress", done / total)
+            if reporter:
+                reporter(
+                    "status",
+                    f"Downloading model... {human_size(done)} of {human_size(total) if total else 'unknown'}",
+                )
+
+        sha = download_model_httpx(
+            MODEL_REPO + MODEL_FILE,
+            plain_temp,
+            expected_sha=EXPECTED_HASH,
+            progress_callback=on_progress,
+        )
+        if reporter:
+            reporter("status", "Encrypting and sealing the model...")
+        encrypt_file(plain_temp, encrypted_temp, key)
+        encrypted_temp.replace(paths.encrypted_model_path)
+        _set_owner_only_permissions(paths.encrypted_model_path)
+        safe_cleanup([paths.plain_model_path])
+        if reporter:
+            reporter("progress", 1.0)
+            reporter("status", "Gemma 4 is ready for offline use.")
+        return sha
+    finally:
+        safe_cleanup([plain_temp, encrypted_temp])
+
+
+def verify_model_hash(key: bytes) -> Tuple[str, bool]:
+    with unlocked_model_path(key) as model_path:
+        sha = sha256_file(model_path)
+    return sha, sha.lower() == EXPECTED_HASH.lower()
+
+
+def selected_or_matching_med_id(data: Dict[str, Any], payload_name: str, selected_med_id: Optional[str]) -> Optional[str]:
+    meds = list(data.get("meds") or [])
+    if selected_med_id and any(str(item.get("id")) == selected_med_id for item in meds):
+        return selected_med_id
+    lowered = payload_name.strip().lower()
+    for item in meds:
+        if sanitize_text(item.get("name"), max_chars=120).lower() == lowered:
+            return str(item.get("id"))
+    return None
+
+
+def total_taken_last_24h(med: Dict[str, Any], now_ts: float) -> float:
+    cutoff = now_ts - 24 * 3600.0
+    total = 0.0
+    for row in med.get("history", []) or []:
+        if len(row) < 2:
+            continue
+        ts = safe_float(row[0])
+        mg = max(0.0, safe_float(row[1]))
+        if ts >= cutoff:
+            total += mg
+    return total
+
+
+def parse_clock_minutes(value: Any) -> Optional[int]:
+    text = sanitize_text(value, max_chars=40).lower().replace(".", "")
+    if not text:
+        return None
+    if text == "noon":
+        return 12 * 60
+    if text == "midnight":
+        return 0
+    match = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?\s*([ap]m)?", text)
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2) or "0")
+    meridiem = match.group(3)
+    if minute > 59:
+        return None
+    if meridiem:
+        if hour < 1 or hour > 12:
+            return None
+        hour %= 12
+        if meridiem == "pm":
+            hour += 12
+    elif hour > 23:
+        return None
+    return (hour * 60 + minute) % 1440
+
+
+def extract_clock_minutes(value: Any) -> Optional[int]:
+    text = sanitize_text(value, max_chars=80).lower().replace(".", "")
+    if not text:
+        return None
+    exact = parse_clock_minutes(text)
+    if exact is not None:
+        return exact
+    match = re.search(r"(?<!\d)(\d{1,2})(?::(\d{2}))?\s*([ap]m)?\b", text)
+    if not match:
+        return None
+    return parse_clock_minutes(match.group(0))
+
+
+def format_clock_minutes(minutes: int) -> str:
+    normalized = int(minutes) % 1440
+    hour_24 = normalized // 60
+    minute = normalized % 60
+    suffix = "AM" if hour_24 < 12 else "PM"
+    hour_12 = hour_24 % 12 or 12
+    return f"{hour_12}:{minute:02d} {suffix}"
+
+
+def time_bucket_label(minutes: int) -> str:
+    hour = (int(minutes) % 1440) // 60
+    if 5 <= hour < 10:
+        return "Breakfast"
+    if 10 <= hour < 12:
+        return "Daytime"
+    if 12 <= hour < 13:
+        return "Mid day"
+    if 13 <= hour < 15:
+        return "Lunch"
+    if 17 <= hour < 21:
+        return "Dinner"
+    return "Nighttime"
+
+
+def _normalize_slot_templates(raw_slots: List[Tuple[str, int]]) -> List[Tuple[str, int]]:
+    results: List[Tuple[str, int]] = []
+    seen_minutes = set()
+    used_labels = set()
+    for raw_label, raw_minutes in sorted(raw_slots, key=lambda item: (int(item[1]) % 1440, sanitize_text(item[0], max_chars=40).lower())):
+        minutes = int(raw_minutes) % 1440
+        if minutes in seen_minutes:
+            continue
+        seen_minutes.add(minutes)
+        label = sanitize_text(raw_label or time_bucket_label(minutes), max_chars=40) or time_bucket_label(minutes)
+        candidate = label
+        index = 2
+        while candidate in used_labels:
+            candidate = f"{label} {index}"
+            index += 1
+        used_labels.add(candidate)
+        results.append((candidate, minutes))
+    return results[:8]
+
+
+def infer_named_dose_slots(text: str) -> List[Tuple[str, int]]:
+    lowered = sanitize_text(text, max_chars=500).lower()
+    if not lowered:
+        return []
+    aliases = {
+        "breakfast": "Breakfast",
+        "morning": "Breakfast",
+        "daytime": "Daytime",
+        "mid day": "Mid day",
+        "midday": "Mid day",
+        "noon": "Mid day",
+        "lunch": "Lunch",
+        "dinner": "Dinner",
+        "supper": "Dinner",
+        "evening": "Dinner",
+        "nighttime": "Nighttime",
+        "bedtime": "Nighttime",
+        "night": "Nighttime",
+    }
+    found = []
+    for label, minutes in NAMED_DOSE_PRESETS:
+        for alias, target in aliases.items():
+            if target == label and alias in lowered:
+                found.append((label, minutes))
+                break
+    return _normalize_slot_templates(found)
+
+
+def parse_custom_dose_times_text(text: str) -> List[Tuple[str, int]]:
+    clean = sanitize_text(text, max_chars=600)
+    if not clean:
+        return []
+    aliases = {
+        "breakfast": "Breakfast",
+        "morning": "Breakfast",
+        "daytime": "Daytime",
+        "mid day": "Mid day",
+        "midday": "Mid day",
+        "noon": "Mid day",
+        "lunch": "Lunch",
+        "dinner": "Dinner",
+        "supper": "Dinner",
+        "evening": "Dinner",
+        "nighttime": "Nighttime",
+        "bedtime": "Nighttime",
+        "night": "Nighttime",
+    }
+    raw_slots: List[Tuple[str, int]] = []
+    for segment in [part.strip() for part in re.split(r"[\n,;]+", clean) if part.strip()]:
+        lowered = segment.lower()
+        label_guess = ""
+        for alias, mapped_label in aliases.items():
+            if alias in lowered:
+                label_guess = mapped_label
+                break
+        minutes = extract_clock_minutes(segment)
+        if minutes is None and label_guess:
+            minutes = NAMED_DOSE_PRESET_MAP.get(label_guess.lower())
+        if minutes is None:
+            continue
+        label_text = sanitize_text(
+            re.sub(r"(?i)(?<!\d)\d{1,2}(?::\d{2})?\s*([ap]m)?\b", "", segment).strip(" -"),
+            max_chars=40,
+        )
+        label = label_guess or label_text or time_bucket_label(minutes)
+        raw_slots.append((label, minutes))
+    return _normalize_slot_templates(raw_slots)
+
+
+def planned_daily_dose_count(med: Dict[str, Any]) -> int:
+    dose = max(0.0, safe_float(med.get("dose_mg")))
+    interval = max(0.0, safe_float(med.get("interval_hours")))
+    max_daily = max(0.0, safe_float(med.get("max_daily_mg")))
+    counts = []
+    if interval > 0:
+        counts.append(max(1, int(math.ceil(24.0 / interval - 1e-9))))
+    if dose > 0 and max_daily > 0:
+        counts.append(max(1, int(math.floor(max_daily / dose + 1e-9))))
+    if not counts:
+        return 0
+    return max(1, min(counts))
+
+
+def default_first_dose_minutes(med: Dict[str, Any]) -> int:
+    schedule_text = sanitize_text(med.get("schedule_text") or "", max_chars=300)
+    inferred = infer_named_dose_slots(schedule_text)
+    if inferred:
+        return inferred[0][1]
+    interval = max(0.0, safe_float(med.get("interval_hours")))
+    if 0.0 < interval <= 8.0:
+        return 6 * 60
+    return 8 * 60
+
+
+def resolved_medication_slot_templates(med: Dict[str, Any]) -> List[Tuple[str, int]]:
+    custom_slots = parse_custom_dose_times_text(sanitize_text(med.get("custom_times_text") or "", max_chars=600))
+    if custom_slots:
+        return custom_slots
+    inferred_slots = infer_named_dose_slots(sanitize_text(med.get("schedule_text") or "", max_chars=500))
+    if inferred_slots:
+        return inferred_slots
+    interval = max(0.0, safe_float(med.get("interval_hours")))
+    count = planned_daily_dose_count(med)
+    if interval <= 0 or count <= 0:
+        return []
+    anchor = parse_clock_minutes(med.get("first_dose_time")) or default_first_dose_minutes(med)
+    raw_slots = []
+    for index in range(count):
+        minutes = int(round(anchor + index * interval * 60.0)) % 1440
+        raw_slots.append((time_bucket_label(minutes), minutes))
+    return _normalize_slot_templates(raw_slots)
+
+
+def clock_minutes_to_timestamp(target_day: date, minutes: int) -> float:
+    normalized = int(minutes) % 1440
+    hour = normalized // 60
+    minute = normalized % 60
+    return datetime.combine(target_day, dt_time(hour=hour, minute=minute)).timestamp()
+
+
+def medication_slot_match_tolerance_seconds(med: Dict[str, Any]) -> float:
+    interval = max(0.0, safe_float(med.get("interval_hours")))
+    if interval > 0:
+        return max(45.0 * 60.0, min(3.0 * 3600.0, interval * 3600.0 * 0.45))
+    return 2.0 * 3600.0
+
+
+def medication_due_lead_seconds(med: Dict[str, Any]) -> float:
+    interval = max(0.0, safe_float(med.get("interval_hours")))
+    if interval > 0:
+        return max(15.0 * 60.0, min(45.0 * 60.0, interval * 3600.0 * 0.15))
+    return 30.0 * 60.0
+
+
+def medication_miss_grace_seconds(med: Dict[str, Any]) -> float:
+    interval = max(0.0, safe_float(med.get("interval_hours")))
+    if interval > 0:
+        return max(45.0 * 60.0, min(2.0 * 3600.0, interval * 3600.0 * 0.25))
+    return 60.0 * 60.0
+
+
+def build_medication_daily_slots(
+    med: Dict[str, Any],
+    target_day: date,
+    now_ts: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    templates = resolved_medication_slot_templates(med)
+    if not templates:
+        return []
+    now = now_ts or time.time()
+    slots = [
+        {
+            "slot_key": f"{target_day.isoformat()}::{index}",
+            "index": index,
+            "label": label,
+            "minutes": minutes,
+            "time_text": format_clock_minutes(minutes),
+            "scheduled_ts": clock_minutes_to_timestamp(target_day, minutes),
+        }
+        for index, (label, minutes) in enumerate(templates)
+    ]
+    created_ts = safe_float(med.get("created_ts") or 0.0)
+    if created_ts > 0:
+        slots = [slot for slot in slots if safe_float(slot.get("scheduled_ts")) >= created_ts]
+    if not slots:
+        return []
+    tolerance = medication_slot_match_tolerance_seconds(med)
+    day_start = clock_minutes_to_timestamp(target_day, 0)
+    day_end = day_start + 24.0 * 3600.0
+    history_rows = [
+        (row_index, safe_float(row[0]), max(0.0, safe_float(row[1])))
+        for row_index, row in enumerate(list(med.get("history") or []))
+        if len(row) >= 2 and (day_start - tolerance) <= safe_float(row[0]) < (day_end + tolerance)
+    ]
+    used_rows = set()
+    for slot in slots:
+        best_match = None
+        for row_index, ts, amount in history_rows:
+            if row_index in used_rows or amount <= 0:
+                continue
+            gap = abs(ts - slot["scheduled_ts"])
+            if gap > tolerance:
+                continue
+            if best_match is None or gap < best_match[0]:
+                best_match = (gap, row_index, ts, amount)
+        if best_match is not None:
+            _, row_index, taken_ts, taken_amount = best_match
+            used_rows.add(row_index)
+            slot["taken_ts"] = taken_ts
+            slot["taken_amount"] = taken_amount
+
+    due_lead = medication_due_lead_seconds(med)
+    miss_grace = medication_miss_grace_seconds(med)
+    for slot in slots:
+        scheduled_ts = slot["scheduled_ts"]
+        if slot.get("taken_ts"):
+            slot["status"] = "taken"
+            slot["status_text"] = f"Taken {time.strftime('%I:%M %p', time.localtime(slot['taken_ts'])).lstrip('0')}"
+            continue
+        if now < scheduled_ts - due_lead:
+            slot["status"] = "upcoming"
+            slot["status_text"] = format_relative_due(scheduled_ts, now)
+            continue
+        if now <= scheduled_ts + miss_grace:
+            slot["status"] = "due"
+            slot["status_text"] = "Due now"
+            continue
+        slot["status"] = "missed"
+        slot["status_text"] = f"Missed {format_duration(now - scheduled_ts)} ago"
+    return slots
+
+
+def build_dashboard_daily_checklist_entries(
+    meds: List[Dict[str, Any]],
+    target_day: date,
+    now_ts: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for med in meds:
+        med_name = sanitize_text(med.get("name") or "Medication", max_chars=120)
+        dose_mg = max(0.0, safe_float(med.get("dose_mg")))
+        dose_text = f"{int(dose_mg) if dose_mg.is_integer() else dose_mg:g} mg" if dose_mg > 0 else "Dose not set"
+        for slot in build_medication_daily_slots(med, target_day, now_ts):
+            entry = dict(slot)
+            entry["med_id"] = str(med.get("id"))
+            entry["med_name"] = med_name
+            entry["dose_text"] = dose_text
+            rows.append(entry)
+    rows.sort(
+        key=lambda item: (
+            safe_float(item.get("scheduled_ts")) or float("inf"),
+            sanitize_text(item.get("med_name") or "", max_chars=120).lower(),
+            sanitize_text(item.get("label") or "", max_chars=40).lower(),
+        )
+    )
+    return rows
+
+
+def next_unchecked_medication_slot(med: Dict[str, Any], now_ts: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    now = now_ts or time.time()
+    today = datetime.fromtimestamp(now).date()
+    for day_offset in range(0, 3):
+        slots = build_medication_daily_slots(med, today + timedelta(days=day_offset), now)
+        for slot in slots:
+            if slot.get("status") != "taken":
+                return slot
+    return None
+
+
+def next_due_timestamp(med: Dict[str, Any]) -> Optional[float]:
+    slot = next_unchecked_medication_slot(med, time.time())
+    if slot is not None:
+        return safe_float(slot.get("scheduled_ts"))
+    interval_hours = max(0.0, safe_float(med.get("interval_hours")))
+    last_taken_ts = safe_float(med.get("last_taken_ts"))
+    if interval_hours <= 0:
+        return None
+    if last_taken_ts <= 0:
+        return time.time()
+    return last_taken_ts + interval_hours * 3600.0
+
+
+def medication_due_status(med: Dict[str, Any], now_ts: Optional[float] = None) -> Dict[str, Any]:
+    now = now_ts or time.time()
+    slot = next_unchecked_medication_slot(med, now)
+    if slot is not None:
+        if slot.get("status") == "missed":
+            return {
+                "state": "Missed",
+                "text": f"{slot['label']} missed {format_duration(now - safe_float(slot['scheduled_ts']))} ago",
+                "next_ts": safe_float(slot["scheduled_ts"]),
+                "due_now": True,
+                "overdue": True,
+                "slot": slot,
+            }
+        if slot.get("status") == "due":
+            return {
+                "state": "Due",
+                "text": f"{slot['label']} due now",
+                "next_ts": safe_float(slot["scheduled_ts"]),
+                "due_now": True,
+                "overdue": False,
+                "slot": slot,
+            }
+        return {
+            "state": "Scheduled",
+            "text": f"{slot['label']} {format_relative_due(safe_float(slot['scheduled_ts']), now)}",
+            "next_ts": safe_float(slot["scheduled_ts"]),
+            "due_now": False,
+            "overdue": False,
+            "slot": slot,
+        }
+    interval_hours = max(0.0, safe_float(med.get("interval_hours")))
+    last_taken_ts = safe_float(med.get("last_taken_ts"))
+    next_ts = next_due_timestamp(med)
+    if interval_hours <= 0:
+        return {"state": "Flexible", "text": "Flexible schedule", "next_ts": None, "due_now": False, "overdue": False}
+    if last_taken_ts <= 0:
+        return {"state": "Ready", "text": "No dose logged yet", "next_ts": next_ts, "due_now": True, "overdue": False}
+    delta = (next_ts or now) - now
+    if delta <= -3600:
+        return {"state": "Overdue", "text": format_relative_due(next_ts, now), "next_ts": next_ts, "due_now": True, "overdue": True}
+    if delta <= 0:
+        return {"state": "Due", "text": "Due now", "next_ts": next_ts, "due_now": True, "overdue": False}
+    return {"state": "Scheduled", "text": format_relative_due(next_ts, now), "next_ts": next_ts, "due_now": False, "overdue": False}
+
+
+def medication_card_line(med: Dict[str, Any], now_ts: Optional[float] = None) -> str:
+    now = now_ts or time.time()
+    status = medication_due_status(med, now)
+    dose = max(0.0, safe_float(med.get("dose_mg")))
+    interval = max(0.0, safe_float(med.get("interval_hours")))
+    daily = total_taken_last_24h(med, now)
+    dose_text = f"{int(dose) if dose.is_integer() else dose:g} mg"
+    interval_text = f"every {int(interval) if interval.is_integer() else interval:g}h" if interval > 0 else "flex schedule"
+    max_daily = max(0.0, safe_float(med.get("max_daily_mg")))
+    daily_text = f"{daily:g}/{max_daily:g} mg today" if max_daily > 0 else f"{daily:g} mg today"
+    return f"{dose_text} | {interval_text} | {status['text']} | {daily_text}"
+
+
+def build_timeline_text(meds: List[Dict[str, Any]], now_ts: Optional[float] = None) -> str:
+    if not meds:
+        return "No medications yet. Add one manually or import a bottle photo."
+    now = now_ts or time.time()
+    ranked = sorted(
+        meds,
+        key=lambda med: (
+            0 if medication_due_status(med, now)["overdue"] else 1 if medication_due_status(med, now)["due_now"] else 2,
+            medication_due_status(med, now)["next_ts"] or float("inf"),
+            sanitize_text(med.get("name"), max_chars=120).lower(),
+        ),
+    )
+    lines = []
+    for index, med in enumerate(ranked[:6], start=1):
+        status = medication_due_status(med, now)
+        lines.append(f"{index}. {sanitize_text(med.get('name'), max_chars=120)} | {status['text']}")
+    return "\n".join(lines)
+
+
+def build_med_history_text(med: Optional[Dict[str, Any]]) -> str:
+    if not med:
+        return "Select a medication to see recent logs."
+    rows = list(med.get("history") or [])[-5:]
+    if not rows:
+        return "No doses logged for this medication yet."
+    lines = []
+    for ts, amount in reversed(rows):
+        lines.append(f"{format_timestamp(safe_float(ts))} • {safe_float(amount):g} mg")
+    return "\n".join(lines)
+
+
+def build_medication_schedule_text(med: Optional[Dict[str, Any]], now_ts: Optional[float] = None) -> str:
+    if not med:
+        return "Select a medication to see today's planned doses."
+    now = now_ts or time.time()
+    slots = build_medication_daily_slots(med, datetime.fromtimestamp(now).date(), now)
+    if not slots:
+        next_slot = next_unchecked_medication_slot(med, now)
+        if next_slot is not None:
+            return f"Next planned slot: {next_slot['label']} {next_slot['time_text']} | {next_slot['status_text']}"
+        return "No daily time plan yet. Add custom times or save an interval to generate suggested times."
+    lines = []
+    for slot in slots:
+        if slot.get("status") == "taken":
+            marker = "[x]"
+        elif slot.get("status") == "missed":
+            marker = "[X]"
+        else:
+            marker = "[ ]"
+        lines.append(f"{marker} {slot['label']} {slot['time_text']} | {slot['status_text']}")
+    return "\n".join(lines)
+
+
+def build_medication_nudge_text(med: Optional[Dict[str, Any]], now_ts: Optional[float] = None) -> str:
+    if not med:
+        return "Select a medication to see the next gentle reminder."
+    now = now_ts or time.time()
+    slots = build_medication_daily_slots(med, datetime.fromtimestamp(now).date(), now)
+    if not slots:
+        next_slot = next_unchecked_medication_slot(med, now)
+        if next_slot is not None:
+            med_name = sanitize_text(med.get("name") or "This medication", max_chars=120)
+            return f"Gentle nudge: {med_name} next planned dose is {next_slot['label']} at {next_slot['time_text']}."
+        return "Add custom times or save an interval to let MedSafe build a dose plan."
+    missed = [slot for slot in slots if slot.get("status") == "missed"]
+    due = [slot for slot in slots if slot.get("status") == "due"]
+    upcoming = [slot for slot in slots if slot.get("status") == "upcoming"]
+    taken = [slot for slot in slots if slot.get("status") == "taken"]
+    med_name = sanitize_text(med.get("name") or "This medication", max_chars=120)
+    if missed:
+        slot = missed[0]
+        return f"Gentle nudge: {med_name} missed {slot['label']} {format_duration(now - safe_float(slot['scheduled_ts']))} ago."
+    if due:
+        slot = due[0]
+        return f"Gentle nudge: {med_name} {slot['label']} dose is due now."
+    if upcoming:
+        slot = upcoming[0]
+        return f"Gentle nudge: {med_name} {slot['label']} dose is planned for {slot['time_text']}."
+    return f"All planned doses for {med_name} are checked off today ({len(taken)} completed)."
+
+
+def dose_safety_level(med: Dict[str, Any], dose_mg: float, now_ts: float) -> Tuple[str, str]:
+    dose_value = max(0.0, dose_mg)
+    interval_hours = max(0.0, safe_float(med.get("interval_hours")))
+    max_daily = max(0.0, safe_float(med.get("max_daily_mg")))
+    last_taken = safe_float(med.get("last_taken_ts"))
+    minutes_since = (now_ts - last_taken) / 60.0 if last_taken > 0 else 1e9
+    projected = total_taken_last_24h(med, now_ts) + dose_value
+    ratio = (projected / max_daily) if max_daily > 0 else 0.0
+    way_too_soon = interval_hours > 0 and minutes_since < interval_hours * 60.0 * 0.50
+    too_soon = interval_hours > 0 and minutes_since < interval_hours * 60.0 * 0.85
+    next_slot = next_unchecked_medication_slot(med, now_ts)
+
+    if dose_value <= 0:
+        return "High", "Dose is missing or invalid. Enter a valid mg value before logging."
+    if max_daily > 0 and projected > max_daily + 1e-6:
+        return "High", f"Unsafe: this would exceed the stored 24h limit ({projected:g}/{max_daily:g} mg)."
+    if way_too_soon:
+        return "High", f"Unsafe: this is much earlier than the stored {interval_hours:g}h interval."
+    if next_slot is not None and next_slot.get("status") == "upcoming":
+        early_by = safe_float(next_slot.get("scheduled_ts")) - now_ts
+        if early_by > medication_due_lead_seconds(med):
+            return "Medium", f"Caution: the next planned dose window is {next_slot['label']} at {next_slot['time_text']}."
+    if too_soon:
+        return "Medium", f"Caution: this is earlier than the stored {interval_hours:g}h interval."
+    if max_daily > 0 and abs(projected - max_daily) <= 1e-6:
+        return "Low", f"On schedule. This dose reaches the stored 24h limit at {projected:g} mg."
+    if max_daily > 0 and ratio >= 0.90:
+        return "Medium", f"Caution: close to the 24h limit ({projected:g}/{max_daily:g} mg projected)."
+    if interval_hours <= 0 and max_daily <= 0:
+        return "Medium", "Schedule has no interval or daily limit stored, so this stays a caution check."
+    if next_slot is not None and next_slot.get("status") == "missed":
+        return "Low", f"Okay to log now if the bottle directions still fit. Missed slot: {next_slot['label']}."
+    if next_slot is not None and next_slot.get("status") == "due":
+        return "Low", f"Looks on schedule for {next_slot['label']}. Projected 24h total after this dose: {projected:g} mg."
+    return "Low", f"Looks on schedule. Projected 24h total after this dose: {projected:g} mg."
+
+
+def habit_due_status(last_ts: float, interval_hours: float, now_ts: Optional[float] = None) -> Dict[str, Any]:
+    now = now_ts or time.time()
+    interval_seconds = max(1.0, interval_hours) * 3600.0
+    if last_ts <= 0:
+        return {"state": "Ready", "text": "Ready now", "due_now": True, "overdue": False}
+    target = last_ts + interval_seconds
+    delta = target - now
+    if delta <= -3600:
+        return {"state": "Overdue", "text": format_relative_due(target, now), "due_now": True, "overdue": True}
+    if delta <= 0:
+        return {"state": "Due", "text": "Due now", "due_now": True, "overdue": False}
+    return {"state": "Scheduled", "text": format_relative_due(target, now), "due_now": False, "overdue": False}
+
+
+def dental_rating_from_score(score: float) -> str:
+    if score >= 88:
+        return "Excellent"
+    if score >= 72:
+        return "Good"
+    if score >= 55:
+        return "Needs polish"
+    return "Needs attention"
+
+
+def parse_date_string(raw: str) -> Optional[date]:
+    text = sanitize_text(raw, max_chars=20)
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def days_since_date_string(raw: str) -> Optional[int]:
+    parsed = parse_date_string(raw)
+    if not parsed:
+        return None
+    return max(0, (date.today() - parsed).days)
+
+
+def build_dental_hygiene_history_text(state: Dict[str, Any]) -> str:
+    rows = list(state.get("history") or [])
+    if not rows:
+        return "No dental hygiene photo reviews yet."
+    lines = []
+    for item in rows[-3:][::-1]:
+        risk_score = max(0.0, min(100.0, safe_float(item.get("risk_score"))))
+        risk_level = normalized_risk_level_text(item.get("risk_level") or "", risk_score)
+        risk_suffix = f" • risk {risk_level} {risk_score:.0f}/100" if risk_score > 0 else ""
+        lines.append(
+            "{when} • {score:.0f}/100 • {rating}{risk}".format(
+                when=format_timestamp(safe_float(item.get("timestamp"))),
+                score=max(0.0, min(100.0, safe_float(item.get("score")))),
+                rating=sanitize_text(item.get("rating") or "Review", max_chars=80),
+                risk=risk_suffix,
+            )
+        )
+    return "\n".join(lines)
+
+
+def build_recovery_history_text(state: Dict[str, Any]) -> str:
+    rows = list(state.get("daily_logs") or [])
+    if not rows:
+        return "No recovery photo check-ins yet."
+    lines = []
+    for item in rows[-3:][::-1]:
+        score = max(0.0, min(100.0, safe_float(item.get("score"))))
+        risk_score = max(0.0, min(100.0, safe_float(item.get("risk_score"))))
+        risk_level = normalized_risk_level_text(item.get("risk_level") or "", risk_score)
+        risk_suffix = f" • risk {risk_level} {risk_score:.0f}/100" if risk_score > 0 else ""
+        if score > 0:
+            lines.append(
+                "Day {day} • {status} • {score:.0f}/100{risk} • {when}".format(
+                    day=max(0, int(safe_float(item.get("day_number") or 0))),
+                    status=sanitize_text(item.get("status") or "Review", max_chars=80),
+                    score=score,
+                    risk=risk_suffix,
+                    when=format_timestamp(safe_float(item.get("timestamp"))),
+                )
+            )
+        else:
+            lines.append(
+                "Day {day} • {status}{risk} • {when}".format(
+                    day=max(0, int(safe_float(item.get("day_number") or 0))),
+                    status=sanitize_text(item.get("status") or "Review", max_chars=80),
+                    risk=risk_suffix,
+                    when=format_timestamp(safe_float(item.get("timestamp"))),
+                )
+            )
+    return "\n".join(lines)
+
+
+def score_change_text(rows: List[Dict[str, Any]], key: str = "score") -> str:
+    if not rows:
+        return "Take a first AI review to start the trend."
+    if len(rows) < 2:
+        return "First AI review saved."
+    latest = max(0.0, min(100.0, safe_float(rows[-1].get(key))))
+    previous = max(0.0, min(100.0, safe_float(rows[-2].get(key))))
+    delta = latest - previous
+    if abs(delta) < 2.0:
+        return "Holding steady versus the last review."
+    direction = "up" if delta > 0 else "down"
+    return f"{abs(delta):.0f} points {direction} versus the last review."
+
+
+def score_palette(score: float) -> Tuple[float, float, float, float]:
+    if score >= 80:
+        return (0.58, 0.96, 0.77, 1)
+    if score >= 55:
+        return (1.00, 0.84, 0.46, 1)
+    return (1.00, 0.62, 0.68, 1)
+
+
+def habit_palette(status: Dict[str, Any]) -> Tuple[Tuple[float, float, float, float], Tuple[float, float, float, float]]:
+    if status.get("overdue"):
+        return (1.00, 0.69, 0.74, 1), (1.00, 0.84, 0.87, 1)
+    if status.get("due_now"):
+        return (1.00, 0.86, 0.50, 1), (1.00, 0.93, 0.74, 1)
+    return (0.68, 0.98, 0.84, 1), (0.82, 0.96, 0.91, 1)
+
+
+def build_dental_overview(
+    hygiene: Dict[str, Any],
+    recovery: Dict[str, Any],
+    now_ts: Optional[float] = None,
+) -> Tuple[str, str]:
+    now = now_ts or time.time()
+    habits = [
+        ("Brush", habit_due_status(safe_float(hygiene.get("last_brush_ts")), safe_float(hygiene.get("brush_interval_hours")) or 12.0, now)),
+        ("Floss", habit_due_status(safe_float(hygiene.get("last_floss_ts")), safe_float(hygiene.get("floss_interval_hours")) or 24.0, now)),
+        ("Rinse", habit_due_status(safe_float(hygiene.get("last_rinse_ts")), safe_float(hygiene.get("rinse_interval_hours")) or 24.0, now)),
+    ]
+    urgent = next((item for item in habits if item[1].get("overdue")), None)
+    if urgent is None:
+        urgent = next((item for item in habits if item[1].get("due_now")), None)
+    if urgent is None:
+        urgent = habits[0]
+
+    latest_rating = sanitize_text(hygiene.get("latest_rating") or "", max_chars=80)
+    latest_score = max(0.0, min(100.0, safe_float(hygiene.get("latest_score"))))
+    rating_text = f"Latest hygiene review: {latest_rating} ({latest_score:.0f}/100)." if latest_rating else "No hygiene photo review saved yet."
+
+    recovery_enabled = bool(recovery.get("enabled"))
+    if recovery_enabled:
+        day_count = days_since_date_string(str(recovery.get("procedure_date") or ""))
+        day_text = f"day {day_count + 1}" if day_count is not None else "an unknown day"
+        recovery_line = (
+            f"Recovery mode is active for {sanitize_text(recovery.get('procedure_type') or 'dental work', max_chars=80)} on {day_text}."
+        )
+    else:
+        recovery_line = "Recovery mode is off right now."
+
+    if urgent[1].get("overdue"):
+        title = f"{urgent[0]} is overdue"
+    elif urgent[1].get("due_now"):
+        title = f"{urgent[0]} is ready now"
+    elif latest_rating:
+        title = f"{latest_rating} hygiene rhythm"
+    else:
+        title = "Dental studio ready"
+
+    body = f"{urgent[0]}: {urgent[1]['text']}. {rating_text} {recovery_line}"
+    return title, body
+
+
+def build_exercise_daily_totals(state: Dict[str, Any], now_ts: Optional[float] = None) -> Dict[str, float]:
+    now = now_ts or time.time()
+    today = datetime.fromtimestamp(now).date()
+    day_start = datetime.combine(today, dt_time.min).timestamp()
+    totals = {"walk": 0.0, "light": 0.0, "stretch": 0.0}
+    for item in list(state.get("history") or []):
+        habit_name = sanitize_text(item.get("habit") or "", max_chars=16).lower()
+        if habit_name not in totals:
+            continue
+        if safe_float(item.get("timestamp")) >= day_start:
+            totals[habit_name] += max(0.0, safe_float(item.get("minutes")))
+    return totals
+
+
+def build_exercise_history_text(state: Dict[str, Any]) -> str:
+    rows = list(state.get("history") or [])
+    if not rows:
+        return "No movement sessions logged yet."
+    labels = {"walk": "Walk", "light": "Light Exercise", "stretch": "Stretch"}
+    lines = []
+    for item in rows[-5:][::-1]:
+        habit_name = sanitize_text(item.get("habit") or "", max_chars=16).lower()
+        lines.append(
+            "{when} • {habit} • {minutes:g} min".format(
+                when=format_timestamp(safe_float(item.get("timestamp"))),
+                habit=labels.get(habit_name, "Movement"),
+                minutes=max(0.0, safe_float(item.get("minutes"))),
+            )
+        )
+    return "\n".join(lines)
+
+
+def build_exercise_overview(
+    state: Dict[str, Any],
+    now_ts: Optional[float] = None,
+) -> Tuple[str, str]:
+    now = now_ts or time.time()
+    habits = [
+        ("Walk", habit_due_status(safe_float(state.get("last_walk_ts")), safe_float(state.get("walk_interval_hours")) or 4.0, now)),
+        ("Light exercise", habit_due_status(safe_float(state.get("last_light_ts")), safe_float(state.get("light_interval_hours")) or 8.0, now)),
+        ("Stretch", habit_due_status(safe_float(state.get("last_stretch_ts")), safe_float(state.get("stretch_interval_hours")) or 2.0, now)),
+    ]
+    urgent = next((item for item in habits if item[1].get("overdue")), None)
+    if urgent is None:
+        urgent = next((item for item in habits if item[1].get("due_now")), None)
+    if urgent is None:
+        urgent = habits[0]
+
+    totals = build_exercise_daily_totals(state, now)
+    walk_goal = max(1.0, safe_float(state.get("daily_walk_goal_minutes")) or 30.0)
+    light_goal = max(1.0, safe_float(state.get("daily_light_goal_minutes")) or 20.0)
+    stretch_goal = max(1.0, safe_float(state.get("daily_stretch_goal_minutes")) or 10.0)
+    progress_line = (
+        f"Today's movement: walk {totals['walk']:.0f}/{walk_goal:.0f} min, "
+        f"light {totals['light']:.0f}/{light_goal:.0f} min, "
+        f"stretch {totals['stretch']:.0f}/{stretch_goal:.0f} min."
+    )
+    notes_text = sanitize_text(state.get("notes") or "", max_chars=220)
+    notes_line = f" Focus note: {notes_text}" if notes_text else ""
+
+    if urgent[1].get("overdue"):
+        title = f"{urgent[0]} reminder overdue"
+    elif urgent[1].get("due_now"):
+        title = f"{urgent[0]} reminder ready now"
+    else:
+        title = "Movement rhythm on track"
+
+    body = f"{urgent[0]}: {urgent[1]['text']}. {progress_line}{notes_line}"
+    return title, body
+
+
+def build_schedule_context(data: Dict[str, Any], selected_med_id: Optional[str]) -> str:
+    meds = list(data.get("meds") or [])
+    now = time.time()
+    lines = ["Local health schedule context:"]
+    if meds:
+        for med in meds:
+            status = medication_due_status(med, now)
+            schedule_preview = sanitize_text(build_medication_schedule_text(med, now).replace("\n", " | "), max_chars=260)
+            marker = " [selected]" if str(med.get("id")) == selected_med_id else ""
+            lines.append(
+                "- {name}{marker}: dose={dose:g}mg interval={interval:g}h max_daily={max_daily:g}mg "
+                "last_taken={last_taken} next_due={next_due} plan={plan} notes={notes}".format(
+                    name=sanitize_text(med.get("name"), max_chars=120),
+                    marker=marker,
+                    dose=max(0.0, safe_float(med.get("dose_mg"))),
+                    interval=max(0.0, safe_float(med.get("interval_hours"))),
+                    max_daily=max(0.0, safe_float(med.get("max_daily_mg"))),
+                    last_taken=format_timestamp(safe_float(med.get("last_taken_ts"))),
+                    next_due=status["text"],
+                    plan=schedule_preview or "no daily plan",
+                    notes=sanitize_text(med.get("notes") or "none", max_chars=180) or "none",
+                )
+            )
+    else:
+        lines.append("- No medications are stored yet.")
+
+    hygiene = data.get("dental_hygiene") or dental_hygiene_defaults()
+    lines.append("")
+    lines.append("Dental hygiene:")
+    lines.append(
+        "- brush={brush} floss={floss} rinse={rinse} latest_rating={rating} latest_score={score:g} latest_risk={risk} latest_summary={summary}".format(
+            brush=habit_due_status(safe_float(hygiene.get("last_brush_ts")), safe_float(hygiene.get("brush_interval_hours")) or 12.0, now)["text"],
+            floss=habit_due_status(safe_float(hygiene.get("last_floss_ts")), safe_float(hygiene.get("floss_interval_hours")) or 24.0, now)["text"],
+            rinse=habit_due_status(safe_float(hygiene.get("last_rinse_ts")), safe_float(hygiene.get("rinse_interval_hours")) or 24.0, now)["text"],
+            rating=sanitize_text(hygiene.get("latest_rating") or "not rated", max_chars=80),
+            score=max(0.0, safe_float(hygiene.get("latest_score"))),
+            risk=(
+                f"{normalized_risk_level_text(hygiene.get('latest_risk_level') or '', safe_float(hygiene.get('latest_risk_score')))}"
+                f":{max(0.0, safe_float(hygiene.get('latest_risk_score'))):.0f}"
+            ),
+            summary=sanitize_text(hygiene.get("latest_summary") or "no photo review yet", max_chars=180),
+        )
+    )
+
+    recovery = data.get("dental_recovery") or dental_recovery_defaults()
+    lines.append("")
+    lines.append("Dental recovery:")
+    if recovery.get("enabled"):
+        lines.append(
+            "- procedure={procedure} date={when} latest_status={status} latest_score={score:g} latest_risk={risk} symptoms={symptoms}".format(
+                procedure=sanitize_text(recovery.get("procedure_type") or "unknown", max_chars=120),
+                when=sanitize_text(recovery.get("procedure_date") or "unknown", max_chars=20),
+                status=sanitize_text(recovery.get("latest_status") or "awaiting photo check-in", max_chars=140),
+                score=max(0.0, safe_float(recovery.get("latest_score"))),
+                risk=(
+                    f"{normalized_risk_level_text(recovery.get('latest_risk_level') or '', safe_float(recovery.get('latest_risk_score')))}"
+                    f":{max(0.0, safe_float(recovery.get('latest_risk_score'))):.0f}"
+                ),
+                symptoms=sanitize_text(recovery.get("symptom_notes") or "none", max_chars=180),
+            )
+        )
+    else:
+        lines.append("- recovery mode not enabled")
+    latest_imports = list(data.get("vision_imports") or [])
+    if latest_imports:
+        latest_import = latest_imports[-1]
+        lines.append("")
+        lines.append(
+            "- latest bottle import: {summary} review_risk={risk} note={note}".format(
+                summary=sanitize_text(latest_import.get("summary") or "schedule imported", max_chars=180),
+                risk=(
+                    f"{normalized_risk_level_text(latest_import.get('risk_level') or '', safe_float(latest_import.get('risk_score')))}"
+                    f":{max(0.0, safe_float(latest_import.get('risk_score'))):.0f}"
+                ),
+                note=sanitize_text(latest_import.get("risk_summary") or "none", max_chars=180),
+            )
+        )
+    return "\n".join(lines)
+
+
+def build_recent_assistant_context(history: List[Dict[str, Any]]) -> str:
+    if not history:
+        return "No prior assistant messages."
+    lines = ["Recent local chat memory:"]
+    for item in history[-6:]:
+        role = "User" if item.get("role") == "user" else "Assistant"
+        lines.append(f"{role}: {sanitize_text(item.get('content') or '', max_chars=280)}")
+    return "\n".join(lines)
+
+
+def run_assistant_request(
+    key: bytes,
+    data: Dict[str, Any],
+    prompt: str,
+    selected_med_id: Optional[str],
+    settings: Dict[str, Any],
+) -> str:
+    system_text = (
+        "You are MedSafe, a private local health scheduling assistant running entirely on the user's device.\n"
+        "Use only the medication, dental hygiene, and recovery facts in the provided context and the user's request.\n"
+        "You are not a clinician and cannot verify interactions, diagnoses, allergies, organ function, or procedure complications.\n"
+        "Be concise, practical, and clear when uncertainty exists."
+    )
+    user_text = "\n\n".join(
+        [
+            build_schedule_context(data, selected_med_id),
+            build_recent_assistant_context(list(data.get("assistant_history") or [])),
+            f"User request: {sanitize_text(prompt, max_chars=1500)}",
+            "Answer directly. Use short paragraphs or bullets only when useful.",
+        ]
+    )
+    return litert_chat_blocking(
+        key,
+        user_text,
+        system_text=system_text,
+        native_image_input=False,
+        inference_backend=settings.get("inference_backend", "Auto"),
+    )
+
+
+def extract_json_object(text: str) -> Dict[str, Any]:
+    candidate = sanitize_text(text, max_chars=12000)
+    if candidate.startswith("```"):
+        candidate = candidate.strip("`")
+        candidate = candidate.replace("json\n", "", 1).strip()
+    try:
+        loaded = json.loads(candidate)
+        return loaded if isinstance(loaded, dict) else {}
+    except Exception:
+        pass
+    match = JSON_BLOCK_RE.search(candidate)
+    if not match:
+        return {}
+    try:
+        loaded = json.loads(match.group(0))
+        return loaded if isinstance(loaded, dict) else {}
+    except Exception:
+        return {}
+
+
+def normalize_photo_payload(raw_payload: Dict[str, Any], image_name: str, risk_packet: Dict[str, Any]) -> Dict[str, Any]:
+    name = sanitize_text(
+        raw_payload.get("name")
+        or raw_payload.get("medication_name")
+        or raw_payload.get("medicine")
+        or "",
+        max_chars=140,
+    )
+    schedule_text = sanitize_text(
+        raw_payload.get("schedule_text") or raw_payload.get("directions") or raw_payload.get("label_schedule") or "",
+        max_chars=240,
+    )
+    notes = sanitize_text(
+        raw_payload.get("notes") or raw_payload.get("warnings") or raw_payload.get("caution") or "",
+        max_chars=500,
+    )
+    source_text = " ".join(part for part in (name, schedule_text, notes) if part)
+    dose_mg = max(0.0, safe_float(raw_payload.get("dose_mg") or raw_payload.get("strength_mg") or 0.0))
+    if dose_mg <= 0:
+        dose_mg = mg_from_text(source_text)
+    interval_hours = max(0.0, safe_float(raw_payload.get("interval_hours") or 0.0))
+    if interval_hours <= 0:
+        interval_hours = infer_interval_from_text(source_text)
+    max_daily_mg = max(0.0, safe_float(raw_payload.get("max_daily_mg") or 0.0))
+    if max_daily_mg <= 0:
+        max_daily_mg = infer_max_daily_mg(source_text, dose_mg)
+    confidence = safe_float(raw_payload.get("confidence") or raw_payload.get("score") or 0.0)
+    if confidence > 1.0 and confidence <= 100.0:
+        confidence /= 100.0
+    confidence = max(0.0, min(1.0, confidence))
+    risk_fields = normalize_risk_fields(raw_payload, risk_packet)
+    if not name:
+        raise ValueError("The model could not confidently read a medication name from that photo.")
+    if not schedule_text:
+        schedule_text = "Imported from bottle photo. Review directions before relying on it."
+    return {
+        "name": name,
+        "dose_mg": dose_mg,
+        "interval_hours": interval_hours,
+        "max_daily_mg": max_daily_mg,
+        "schedule_text": schedule_text,
+        "notes": notes,
+        "confidence": confidence,
+        "source": "vision",
+        "source_photo": sanitize_text(image_name, max_chars=180),
+        "risk_score": risk_fields["risk_score"],
+        "risk_level": risk_fields["risk_level"],
+        "risk_summary": risk_fields["risk_summary"],
+    }
+
+
+def analyze_medication_image(key: bytes, image_path: Path, settings: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+    risk_packet = build_quantum_risk_packet(
+        "medication_label",
+        "medicine bottle import review for visible label text and schedule extraction",
+    )
+    system_text = (
+        "You are a medication label extraction assistant.\n"
+        "Read only visible label text from the provided medicine bottle or box image.\n"
+        "Use the provided quantum risk simulation as a conservative review prior only.\n"
+        "Visible label evidence is more important than the prior.\n"
+        "If text is blurry, cut off, or conflicting, raise risk and lower confidence instead of guessing.\n"
+        "Return raw JSON only.\n"
+        "If something is unclear, keep the field conservative instead of inventing details."
+    )
+    prompt = (
+        "Extract the medication schedule from this image.\n"
+        f"{risk_packet['prompt_block']}\n"
+        "Return JSON with exactly these keys:\n"
+        "{"
+        '"name":"",'
+        '"dose_mg":0,'
+        '"interval_hours":0,'
+        '"max_daily_mg":0,'
+        '"schedule_text":"",'
+        '"notes":"",'
+        '"confidence":0,'
+        '"risk_score":0,'
+        '"risk_level":"",'
+        '"risk_summary":""'
+        "}\n"
+        "Rules:\n"
+        "- Use numbers only for numeric fields.\n"
+        "- Use 0 when the label does not clearly show a value.\n"
+        "- Put PRN, take-with-food, tablet-count, or warning notes into notes.\n"
+        "- risk_score is 0-100 for how cautiously the user should manually review this extraction before relying on it.\n"
+        "- risk_level must be exactly Low, Medium, or High.\n"
+        "- risk_summary should be one short sentence about what needs verification.\n"
+        "- Never output markdown fences or commentary."
+    )
+    raw = litert_chat_blocking(
+        key,
+        prompt,
+        system_text=system_text,
+        image_path=str(validate_image_path(image_path)),
+        native_image_input=bool(settings.get("enable_native_image_input", True)),
+        inference_backend=settings.get("inference_backend", "Auto"),
+    )
+    payload = normalize_photo_payload(extract_json_object(raw), image_path.name, risk_packet)
+    return payload, raw
+
+
+def merge_notes(existing: str, incoming: str) -> str:
+    clean_existing = sanitize_text(existing, max_chars=500)
+    clean_incoming = sanitize_text(incoming, max_chars=500)
+    if not clean_existing:
+        return clean_incoming
+    if not clean_incoming or clean_incoming in clean_existing:
+        return clean_existing
+    return f"{clean_existing}\n{clean_incoming}"
+
+
+def apply_vision_payload(
+    data: Dict[str, Any],
+    payload: Dict[str, Any],
+    *,
+    selected_med_id: Optional[str] = None,
+) -> Tuple[Dict[str, Any], str, bool]:
+    updated = ensure_vault_shape(data)
+    meds = list(updated.get("meds") or [])
+    target_id = selected_or_matching_med_id(updated, payload["name"], selected_med_id)
+    created = False
+    med_id = target_id or uuid.uuid4().hex[:12]
+    for med in meds:
+        if str(med.get("id")) != med_id:
+            continue
+        med["name"] = payload["name"]
+        if payload["dose_mg"] > 0:
+            med["dose_mg"] = payload["dose_mg"]
+        if payload["interval_hours"] > 0:
+            med["interval_hours"] = payload["interval_hours"]
+        if payload["max_daily_mg"] > 0:
+            med["max_daily_mg"] = payload["max_daily_mg"]
+        med["schedule_text"] = payload["schedule_text"] or med.get("schedule_text", "")
+        med["notes"] = merge_notes(str(med.get("notes") or ""), payload.get("notes", ""))
+        med["source"] = "vision"
+        med["source_photo"] = payload.get("source_photo", "")
+        break
+    else:
+        created = True
+        meds.append(
+            {
+                "id": med_id,
+                "name": payload["name"],
+                "dose_mg": max(0.0, safe_float(payload.get("dose_mg"))),
+                "interval_hours": max(0.0, safe_float(payload.get("interval_hours"))),
+                "max_daily_mg": max(0.0, safe_float(payload.get("max_daily_mg"))),
+                "created_ts": time.time(),
+                "first_dose_time": "",
+                "custom_times_text": "",
+                "schedule_text": payload.get("schedule_text", ""),
+                "notes": payload.get("notes", ""),
+                "source": "vision",
+                "source_photo": payload.get("source_photo", ""),
+                "last_taken_ts": 0.0,
+                "history": [],
+            }
+        )
+    updated["meds"] = meds
+    updated["vision_imports"] = list(updated.get("vision_imports") or []) + [
+        {
+            "timestamp": time.time(),
+            "image_name": payload.get("source_photo", ""),
+            "med_id": med_id,
+            "summary": "{name} | {dose:g}mg | every {interval:g}h".format(
+                name=payload["name"],
+                dose=max(0.0, safe_float(payload.get("dose_mg"))),
+                interval=max(0.0, safe_float(payload.get("interval_hours"))),
+            ),
+            "risk_score": max(0.0, min(100.0, safe_float(payload.get("risk_score")))),
+            "risk_level": normalized_risk_level_text(payload.get("risk_level") or "", safe_float(payload.get("risk_score"))),
+            "risk_summary": sanitize_text(payload.get("risk_summary") or "", max_chars=260),
+        }
+    ]
+    updated["vision_imports"] = updated["vision_imports"][-16:]
+    return updated, med_id, created
+
+
+def normalize_dental_hygiene_payload(
+    raw_payload: Dict[str, Any],
+    image_name: str,
+    risk_packet: Dict[str, Any],
+) -> Dict[str, Any]:
+    score = safe_float(raw_payload.get("hygiene_score") or raw_payload.get("score") or 0.0)
+    if 0.0 < score <= 1.0:
+        score *= 100.0
+    score = max(0.0, min(100.0, score))
+    rating = sanitize_text(raw_payload.get("rating") or raw_payload.get("grade") or "", max_chars=80)
+    if not rating:
+        rating = dental_rating_from_score(score)
+    summary = sanitize_text(
+        raw_payload.get("visible_signs") or raw_payload.get("summary") or raw_payload.get("findings") or "",
+        max_chars=500,
+    )
+    suggestions = sanitize_text(
+        raw_payload.get("suggestions") or raw_payload.get("care_suggestions") or raw_payload.get("advice") or "",
+        max_chars=700,
+    )
+    warning_flags = sanitize_text(
+        raw_payload.get("warning_flags") or raw_payload.get("red_flags") or "",
+        max_chars=400,
+    )
+    confidence = safe_float(raw_payload.get("confidence") or raw_payload.get("score_confidence") or 0.0)
+    if confidence > 1.0 and confidence <= 100.0:
+        confidence /= 100.0
+    confidence = max(0.0, min(1.0, confidence))
+    risk_fields = normalize_risk_fields(raw_payload, risk_packet)
+    return {
+        "score": score,
+        "rating": rating,
+        "summary": summary or "Review the photo manually; the model did not provide a clear hygiene summary.",
+        "suggestions": suggestions or "Brush gently for two minutes, floss carefully, and stay consistent with your routine.",
+        "warning_flags": warning_flags,
+        "confidence": confidence,
+        "source_photo": sanitize_text(image_name, max_chars=180),
+        "risk_score": risk_fields["risk_score"],
+        "risk_level": risk_fields["risk_level"],
+        "risk_summary": risk_fields["risk_summary"],
+    }
+
+
+def analyze_dental_hygiene_image(key: bytes, image_path: Path, settings: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+    risk_packet = build_quantum_risk_packet(
+        "dental_hygiene",
+        "teeth and mouth hygiene photo review with visible-cleanliness scoring",
+    )
+    system_text = (
+        "You are a dental hygiene photo reviewer.\n"
+        "Use only visible evidence from the image.\n"
+        "Do not diagnose disease or claim certainty.\n"
+        "Give general hygiene coaching, not medical treatment advice.\n"
+        "Use the provided quantum risk simulation as a conservative follow-up prior only.\n"
+        "Visible image evidence is more important than the prior.\n"
+        "Return raw JSON only."
+    )
+    prompt = (
+        "Review this mouth or teeth photo and rate visible dental hygiene.\n"
+        f"{risk_packet['prompt_block']}\n"
+        "Return JSON with exactly these keys:\n"
+        "{"
+        '"hygiene_score":0,'
+        '"rating":"",'
+        '"visible_signs":"",'
+        '"suggestions":"",'
+        '"warning_flags":"",'
+        '"confidence":0,'
+        '"risk_score":0,'
+        '"risk_level":"",'
+        '"risk_summary":""'
+        "}\n"
+        "Rules:\n"
+        "- hygiene_score is 0-100 based only on visible cleanliness and gum appearance.\n"
+        "- warning_flags should mention only clearly visible concerns or 'none'.\n"
+        "- suggestions should be gentle hygiene coaching, not diagnosis.\n"
+        "- risk_score is 0-100 for how strongly the visible photo suggests closer follow-up or extra care, not diagnosis.\n"
+        "- risk_level must be exactly Low, Medium, or High.\n"
+        "- risk_summary should be one short sentence about the caution level.\n"
+        "- never output markdown fences or extra commentary."
+    )
+    raw = litert_chat_blocking(
+        key,
+        prompt,
+        system_text=system_text,
+        image_path=str(validate_image_path(image_path)),
+        native_image_input=bool(settings.get("enable_native_image_input", True)),
+        inference_backend=settings.get("inference_backend", "Auto"),
+    )
+    return normalize_dental_hygiene_payload(extract_json_object(raw), image_path.name, risk_packet), raw
+
+
+def apply_dental_hygiene_payload(data: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+    updated = ensure_vault_shape(data)
+    hygiene = dict(updated.get("dental_hygiene") or dental_hygiene_defaults())
+    hygiene["latest_score"] = payload["score"]
+    hygiene["latest_rating"] = payload["rating"]
+    hygiene["latest_summary"] = payload["summary"]
+    hygiene["latest_suggestions"] = payload["suggestions"]
+    hygiene["latest_warning_flags"] = payload["warning_flags"]
+    hygiene["latest_risk_score"] = payload["risk_score"]
+    hygiene["latest_risk_level"] = payload["risk_level"]
+    hygiene["latest_risk_summary"] = payload["risk_summary"]
+    hygiene["latest_photo"] = payload["source_photo"]
+    hygiene["latest_timestamp"] = time.time()
+    hygiene["history"] = list(hygiene.get("history") or []) + [
+        {
+            "timestamp": hygiene["latest_timestamp"],
+            "image_name": payload["source_photo"],
+            "score": payload["score"],
+            "rating": payload["rating"],
+            "summary": payload["summary"],
+            "suggestions": payload["suggestions"],
+            "warning_flags": payload["warning_flags"],
+            "confidence": payload["confidence"],
+            "risk_score": payload["risk_score"],
+            "risk_level": payload["risk_level"],
+            "risk_summary": payload["risk_summary"],
+        }
+    ]
+    hygiene["history"] = hygiene["history"][-20:]
+    updated["dental_hygiene"] = hygiene
+    return updated
+
+
+def normalize_dental_recovery_payload(
+    raw_payload: Dict[str, Any],
+    image_name: str,
+    recovery_state: Dict[str, Any],
+    risk_packet: Dict[str, Any],
+) -> Dict[str, Any]:
+    score = safe_float(raw_payload.get("recovery_score") or raw_payload.get("healing_score") or 0.0)
+    if 0.0 < score <= 1.0:
+        score *= 100.0
+    score = max(0.0, min(100.0, score))
+    status = sanitize_text(
+        raw_payload.get("status") or raw_payload.get("healing_status") or raw_payload.get("rating") or "",
+        max_chars=120,
+    )
+    summary = sanitize_text(
+        raw_payload.get("healing_summary") or raw_payload.get("summary") or raw_payload.get("visible_signs") or "",
+        max_chars=700,
+    )
+    advice = sanitize_text(
+        raw_payload.get("care_suggestions") or raw_payload.get("advice") or raw_payload.get("care_advice") or "",
+        max_chars=900,
+    )
+    warning_flags = sanitize_text(
+        raw_payload.get("warning_flags") or raw_payload.get("red_flags") or raw_payload.get("urgent_flags") or "",
+        max_chars=420,
+    )
+    confidence = safe_float(raw_payload.get("confidence") or 0.0)
+    if confidence > 1.0 and confidence <= 100.0:
+        confidence /= 100.0
+    confidence = max(0.0, min(1.0, confidence))
+    risk_fields = normalize_risk_fields(raw_payload, risk_packet)
+    day_number = (days_since_date_string(str(recovery_state.get("procedure_date") or "")) or 0) + 1
+    if not status:
+        if score >= 80:
+            status = "Looks steady"
+        elif score >= 55:
+            status = "Monitor closely"
+        elif score > 0:
+            status = "Needs dentist review"
+        else:
+            status = "Needs manual review"
+    return {
+        "score": score,
+        "status": status,
+        "summary": summary or "Review the photo manually; the model did not provide a clear healing summary.",
+        "advice": advice or "Follow your dentist's aftercare directions and reach out if symptoms feel worse instead of better.",
+        "warning_flags": warning_flags,
+        "confidence": confidence,
+        "day_number": day_number,
+        "source_photo": sanitize_text(image_name, max_chars=180),
+        "risk_score": risk_fields["risk_score"],
+        "risk_level": risk_fields["risk_level"],
+        "risk_summary": risk_fields["risk_summary"],
+    }
+
+
+def analyze_dental_recovery_image(
+    key: bytes,
+    image_path: Path,
+    settings: Dict[str, Any],
+    recovery_state: Dict[str, Any],
+) -> Tuple[Dict[str, Any], str]:
+    days_since = days_since_date_string(str(recovery_state.get("procedure_date") or ""))
+    day_text = f"day {days_since + 1}" if days_since is not None else "an unknown day"
+    risk_packet = build_quantum_risk_packet(
+        "dental_recovery",
+        "\n".join(
+            [
+                sanitize_text(recovery_state.get("procedure_type") or "unknown procedure", max_chars=120),
+                sanitize_text(recovery_state.get("procedure_date") or "unknown date", max_chars=20),
+                sanitize_text(recovery_state.get("symptom_notes") or "no symptom notes", max_chars=400),
+                sanitize_text(recovery_state.get("care_notes") or "no care notes", max_chars=400),
+            ]
+        ),
+    )
+    system_text = (
+        "You are a dental recovery photo reviewer.\n"
+        "Use only visible evidence plus the provided procedure context.\n"
+        "Do not diagnose or replace a dentist.\n"
+        "Give general, conservative aftercare suggestions and clearly call out warning signs that deserve professional follow-up.\n"
+        "Use the provided quantum risk simulation as a conservative follow-up prior only.\n"
+        "Visible evidence and the user's recovery notes are more important than the prior.\n"
+        "Return raw JSON only."
+    )
+    prompt = (
+        "Review this dental recovery photo.\n"
+        f"Procedure type: {sanitize_text(recovery_state.get('procedure_type') or 'unknown', max_chars=120)}\n"
+        f"Procedure date: {sanitize_text(recovery_state.get('procedure_date') or 'unknown', max_chars=20)}\n"
+        f"Days since procedure: {days_since if days_since is not None else 'unknown'}\n"
+        f"Symptom notes: {sanitize_text(recovery_state.get('symptom_notes') or 'none', max_chars=300)}\n"
+        f"Care notes: {sanitize_text(recovery_state.get('care_notes') or 'none', max_chars=300)}\n\n"
+        f"{risk_packet['prompt_block']}\n"
+        "Return JSON with exactly these keys:\n"
+        "{"
+        '"recovery_score":0,'
+        '"status":"",'
+        '"healing_summary":"",'
+        '"care_suggestions":"",'
+        '"warning_flags":"",'
+        '"confidence":0,'
+        '"risk_score":0,'
+        '"risk_level":"",'
+        '"risk_summary":""'
+        "}\n"
+        "Rules:\n"
+        f"- evaluate only what is visible for {day_text}.\n"
+        "- care_suggestions must stay general and conservative.\n"
+        "- warning_flags should mention swelling, discharge, worsening redness, or other signs that should be checked by a dentist if clearly visible or consistent with the notes.\n"
+        "- risk_score is 0-100 for how strongly the image and notes suggest closer follow-up or dentist contact, not diagnosis.\n"
+        "- risk_level must be exactly Low, Medium, or High.\n"
+        "- risk_summary should be one short sentence about the caution level.\n"
+        "- never output markdown fences or extra commentary."
+    )
+    raw = litert_chat_blocking(
+        key,
+        prompt,
+        system_text=system_text,
+        image_path=str(validate_image_path(image_path)),
+        native_image_input=bool(settings.get("enable_native_image_input", True)),
+        inference_backend=settings.get("inference_backend", "Auto"),
+    )
+    return normalize_dental_recovery_payload(extract_json_object(raw), image_path.name, recovery_state, risk_packet), raw
+
+
+def apply_dental_recovery_payload(data: Dict[str, Any], payload: Dict[str, Any], recovery_state: Dict[str, Any]) -> Dict[str, Any]:
+    updated = ensure_vault_shape(data)
+    recovery = dict(updated.get("dental_recovery") or dental_recovery_defaults())
+    recovery["enabled"] = True
+    recovery["procedure_type"] = sanitize_text(recovery_state.get("procedure_type") or recovery.get("procedure_type") or "", max_chars=120)
+    recovery["procedure_date"] = sanitize_text(recovery_state.get("procedure_date") or recovery.get("procedure_date") or "", max_chars=20)
+    recovery["symptom_notes"] = sanitize_text(recovery_state.get("symptom_notes") or recovery.get("symptom_notes") or "", max_chars=600)
+    recovery["care_notes"] = sanitize_text(recovery_state.get("care_notes") or recovery.get("care_notes") or "", max_chars=600)
+    recovery["latest_score"] = payload["score"]
+    recovery["latest_status"] = payload["status"]
+    recovery["latest_summary"] = payload["summary"]
+    recovery["latest_advice"] = payload["advice"]
+    recovery["latest_warning_flags"] = payload["warning_flags"]
+    recovery["latest_risk_score"] = payload["risk_score"]
+    recovery["latest_risk_level"] = payload["risk_level"]
+    recovery["latest_risk_summary"] = payload["risk_summary"]
+    recovery["latest_photo"] = payload["source_photo"]
+    recovery["latest_timestamp"] = time.time()
+    recovery["daily_logs"] = list(recovery.get("daily_logs") or []) + [
+        {
+            "timestamp": recovery["latest_timestamp"],
+            "image_name": payload["source_photo"],
+            "day_number": payload["day_number"],
+            "score": payload["score"],
+            "status": payload["status"],
+            "summary": payload["summary"],
+            "advice": payload["advice"],
+            "warning_flags": payload["warning_flags"],
+            "confidence": payload["confidence"],
+            "risk_score": payload["risk_score"],
+            "risk_level": payload["risk_level"],
+            "risk_summary": payload["risk_summary"],
+        }
+    ]
+    recovery["daily_logs"] = recovery["daily_logs"][-30:]
+    updated["dental_recovery"] = recovery
+    return updated
+
+
+def warning_text_needs_attention(text: str) -> bool:
+    lowered = sanitize_text(text, max_chars=300).lower()
+    if not lowered or lowered in {"none", "none.", "none clearly visible", "no obvious warning flags"}:
+        return False
+    return any(token in lowered for token in ("warning", "urgent", "call", "dentist", "swelling", "pus", "bleeding", "infection", "review"))
+
+
+class BackgroundGradient(Widget):
+    top_color = ListProperty([0.08, 0.11, 0.10, 1])
+    bottom_color = ListProperty([0.03, 0.04, 0.07, 1])
+    steps = NumericProperty(40)
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.bind(pos=self._redraw, size=self._redraw, top_color=self._redraw, bottom_color=self._redraw, steps=self._redraw)
+
+    def _redraw(self, *_args):
+        self.canvas.before.clear()
+        x, y = self.pos
+        width, height = self.size
+        steps = max(8, int(self.steps))
+        with self.canvas.before:
+            for index in range(steps):
+                ratio = index / max(1, steps - 1)
+                r = self.top_color[0] + (self.bottom_color[0] - self.top_color[0]) * ratio
+                g = self.top_color[1] + (self.bottom_color[1] - self.top_color[1]) * ratio
+                b = self.top_color[2] + (self.bottom_color[2] - self.top_color[2]) * ratio
+                a = self.top_color[3] + (self.bottom_color[3] - self.top_color[3]) * ratio
+                Color(r, g, b, a)
+                Rectangle(pos=(x, y + (height * index / steps)), size=(width, height / steps + 1))
+
+
+class GlassCard(Widget):
+    radius = NumericProperty(dp(24))
+    fill = ListProperty([1, 1, 1, 0.055])
+    border = ListProperty([1, 1, 1, 0.14])
+    highlight = ListProperty([1, 1, 1, 0.07])
+    shine_x = NumericProperty(0.0)
+    shine_alpha = NumericProperty(0.0)
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.bind(
+            pos=self._redraw,
+            size=self._redraw,
+            radius=self._redraw,
+            fill=self._redraw,
+            border=self._redraw,
+            highlight=self._redraw,
+            shine_x=self._redraw,
+            shine_alpha=self._redraw,
+        )
+        Clock.schedule_once(lambda _dt: self._start_animation(), 0.2)
+
+    def _start_animation(self):
+        self.shine_x = -0.3
+        self.shine_alpha = 0.0
+        loop = (
+            (Animation(shine_alpha=0.18, duration=0.35, t="out_quad") & Animation(shine_x=1.25, duration=1.0, t="out_cubic"))
+            + Animation(shine_alpha=0.0, duration=0.35, t="out_quad")
+        )
+        loop.repeat = True
+        loop.start(self)
+
+    def _redraw(self, *_args):
+        self.canvas.clear()
+        x, y = self.pos
+        width, height = self.size
+        radius = float(self.radius)
+        with self.canvas:
+            Color(0, 0, 0, 0.18)
+            RoundedRectangle(pos=(x, y - dp(2)), size=(width, height + dp(3)), radius=[radius])
+            Color(*self.fill)
+            RoundedRectangle(pos=(x, y), size=(width, height), radius=[radius])
+            Color(*self.highlight)
+            RoundedRectangle(pos=(x + dp(1), y + height * 0.55), size=(width - dp(2), height * 0.45), radius=[radius])
+            Color(*self.border)
+            Line(rounded_rectangle=[x, y, width, height, radius], width=dp(1.1))
+            if self.shine_alpha > 0.001:
+                Color(1, 1, 1, self.shine_alpha)
+                Rectangle(pos=(x + width * self.shine_x, y), size=(width * 0.18, height))
+
+
+class GradientButton(MDRaisedButton):
+    start_color = ListProperty([0.15, 0.70, 0.48, 1])
+    end_color = ListProperty([0.18, 0.45, 0.95, 1])
+    border_color = ListProperty([1, 1, 1, 0.14])
+    border_width = NumericProperty(dp(1.0))
+    radius = NumericProperty(dp(18))
+    steps = NumericProperty(24)
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.md_bg_color = (0, 0, 0, 0)
+        self.elevation = 0
+        self.bind(
+            pos=self._redraw,
+            size=self._redraw,
+            start_color=self._redraw,
+            end_color=self._redraw,
+            border_color=self._redraw,
+            border_width=self._redraw,
+            radius=self._redraw,
+            steps=self._redraw,
+        )
+        Clock.schedule_once(lambda _dt: self._redraw(), 0)
+
+    def _build_gradient_texture(self) -> Texture:
+        steps = max(2, int(self.steps))
+        buffer = bytearray()
+        for index in range(steps):
+            ratio = index / max(1, steps - 1)
+            r = self.start_color[0] + (self.end_color[0] - self.start_color[0]) * ratio
+            g = self.start_color[1] + (self.end_color[1] - self.start_color[1]) * ratio
+            b = self.start_color[2] + (self.end_color[2] - self.start_color[2]) * ratio
+            a = self.start_color[3] + (self.end_color[3] - self.start_color[3]) * ratio
+            buffer.extend([int(255 * r), int(255 * g), int(255 * b), int(255 * a)])
+        texture = Texture.create(size=(1, steps), colorfmt="rgba")
+        texture.blit_buffer(bytes(buffer), colorfmt="rgba", bufferfmt="ubyte")
+        texture.wrap = "repeat"
+        texture.mag_filter = "linear"
+        texture.min_filter = "linear"
+        return texture
+
+    def _redraw(self, *_args):
+        self.canvas.before.clear()
+        if self.width <= 0 or self.height <= 0:
+            return
+        with self.canvas.before:
+            Color(1, 1, 1, 1)
+            RoundedRectangle(
+                pos=self.pos,
+                size=self.size,
+                radius=[self.radius],
+                texture=self._build_gradient_texture(),
+            )
+            Color(*self.border_color)
+            Line(rounded_rectangle=[self.x, self.y, self.width, self.height, self.radius], width=self.border_width)
+
+
+class DoseWheel(Widget):
+    value = NumericProperty(0.5)
+    level = StringProperty("MEDIUM")
+    sweep = NumericProperty(0.0)
+    glow = NumericProperty(0.25)
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.bind(pos=self._redraw, size=self._redraw, value=self._redraw, level=self._redraw, sweep=self._redraw, glow=self._redraw)
+        Clock.schedule_once(lambda _dt: self._start_animation(), 0.05)
+
+    def _start_animation(self):
+        sweep = Animation(sweep=1.0, duration=2.1, t="linear")
+        sweep.repeat = True
+        sweep.start(self)
+        glow = Animation(glow=0.42, duration=0.9, t="in_out_quad") + Animation(glow=0.22, duration=0.9, t="in_out_quad")
+        glow.repeat = True
+        glow.start(self)
+
+    def set_level(self, level: str):
+        text = sanitize_text(level, max_chars=16).upper()
+        if text.startswith("LOW"):
+            target = 0.0
+            self.level = "LOW"
+        elif text.startswith("HIGH"):
+            target = 1.0
+            self.level = "HIGH"
+        else:
+            target = 0.5
+            self.level = "MEDIUM"
+        Animation.cancel_all(self, "value")
+        Animation(value=target, duration=0.45, t="out_cubic").start(self)
+
+    def _level_color(self) -> Tuple[float, float, float]:
+        if self.level == "LOW":
+            return (0.12, 0.90, 0.48)
+        if self.level == "HIGH":
+            return (0.98, 0.26, 0.34)
+        return (0.98, 0.78, 0.24)
+
+    def _redraw(self, *_args):
+        self.canvas.clear()
+        center_x, center_y = self.center
+        radius = min(self.width, self.height) * 0.41
+        thickness = max(dp(12), radius * 0.16)
+        active = self._level_color()
+        angle = -135.0 + 270.0 * float(self.value)
+        angle_rad = math.radians(angle)
+        sweep_angle = -135.0 + 270.0 * float(self.sweep)
+        segments = [
+            ("LOW", (0.12, 0.85, 0.45), -135.0, -45.0),
+            ("MED", (0.98, 0.78, 0.24), -45.0, 45.0),
+            ("HIGH", (0.98, 0.26, 0.34), 45.0, 135.0),
+        ]
+        with self.canvas:
+            Color(1, 1, 1, 0.04)
+            Line(circle=(center_x, center_y, radius + dp(10), -140, 140), width=dp(1.2))
+            Color(0.08, 0.10, 0.14, 0.65)
+            Line(circle=(center_x, center_y, radius, -140, 140), width=thickness, cap="round")
+            for name, rgb, start, end in segments:
+                boost = 1.0 + (0.85 * float(self.glow) if (self.level == "MEDIUM" and name == "MED") or self.level == name else 0.0)
+                for spread in range(5, 0, -1):
+                    Color(rgb[0], rgb[1], rgb[2], (0.05 + 0.03 * spread) * boost)
+                    Line(circle=(center_x, center_y, radius, start + 3, end - 3), width=thickness + dp(2.4 * spread), cap="round")
+                Color(rgb[0], rgb[1], rgb[2], 0.78)
+                Line(circle=(center_x, center_y, radius, start + 3, end - 3), width=thickness, cap="round")
+            Color(active[0], active[1], active[2], 0.25 + 0.18 * float(self.glow))
+            Line(circle=(center_x, center_y, radius, sweep_angle - 8, sweep_angle + 8), width=thickness + dp(6), cap="round")
+            needle_x = center_x + math.cos(angle_rad) * (radius * 0.92)
+            needle_y = center_y + math.sin(angle_rad) * (radius * 0.92)
+            Color(active[0], active[1], active[2], 0.18 + 0.18 * float(self.glow))
+            Line(points=[center_x, center_y, needle_x, needle_y], width=max(dp(3.2), thickness * 0.16), cap="round")
+            Color(0.97, 0.98, 0.99, 0.98)
+            Line(points=[center_x, center_y, needle_x, needle_y], width=max(dp(2), thickness * 0.10), cap="round")
+            Color(0.06, 0.08, 0.10, 0.9)
+            RoundedRectangle(pos=(center_x - dp(12), center_y - dp(12)), size=(dp(24), dp(24)), radius=[dp(12)])
+            Color(1, 1, 1, 0.18)
+            Line(rounded_rectangle=[center_x - dp(18), center_y - dp(18), dp(36), dp(36), dp(18)], width=dp(1.0))
+
+
+KV = r"""
+<BackgroundGradient>:
+    size_hint: 1, 1
+<GlassCard>:
+    size_hint: 1, None
+<GradientButton>:
+    text_color: 0.98, 0.99, 1, 1
+<DoseWheel>:
+    size_hint: None, None
+
+MDScreen:
+    BackgroundGradient:
+        top_color: 0.08, 0.11, 0.10, 1
+        bottom_color: 0.03, 0.04, 0.07, 1
+
+    MDBoxLayout:
+        orientation: "vertical"
+
+        MDTopAppBar:
+            title: "MedSafe"
+            md_bg_color: 0.04, 0.06, 0.08, 0.98
+            specific_text_color: 0.95, 0.98, 0.99, 1
+            left_action_items: [["heart-pulse", lambda x: None]]
+            right_action_items: [["refresh", lambda x: app.refresh_from_disk()]]
+
+        MDLabel:
+            id: status_label
+            text: "Encrypted local scheduler ready."
+            theme_text_color: "Custom"
+            text_color: 0.78, 0.88, 0.85, 1
+            halign: "center"
+            size_hint_y: None
+            height: "28dp"
+
+        MDBottomNavigation:
+            id: bottom_nav
+            panel_color: 0.05, 0.07, 0.09, 0.98
+
+            MDBottomNavigationItem:
+                name: "today"
+                text: "Today"
+                icon: "clock-outline"
+
+                ScrollView:
+                    do_scroll_x: False
+
+                    MDBoxLayout:
+                        orientation: "vertical"
+                        spacing: "12dp"
+                        padding: "12dp"
+                        size_hint_y: None
+                        height: self.minimum_height
+
+                        FloatLayout:
+                            size_hint_y: None
+                            height: "330dp"
+
+                            GlassCard:
+                                pos: self.parent.pos
+                                size: self.parent.size
+                                radius: dp(28)
+                                fill: 1, 1, 1, 0.055
+                                border: 0.65, 0.98, 0.82, 0.16
+                                highlight: 1, 1, 1, 0.08
+
+                            MDBoxLayout:
+                                orientation: "vertical"
+                                padding: "16dp"
+                                spacing: "12dp"
+                                pos: self.parent.pos
+                                size: self.parent.size
+
+                                MDLabel:
+                                    text: "Dose Safety Pulse"
+                                    theme_text_color: "Custom"
+                                    text_color: 0.95, 0.99, 0.97, 1
+                                    bold: True
+                                    font_style: "H6"
+                                    size_hint_y: None
+                                    height: "30dp"
+
+                                MDLabel:
+                                    id: dashboard_selection
+                                    text: "Select a medication to log doses."
+                                    theme_text_color: "Custom"
+                                    text_color: 0.67, 0.80, 0.78, 1
+                                    size_hint_y: None
+                                    height: "24dp"
+
+                                MDBoxLayout:
+                                    spacing: "10dp"
+                                    size_hint_y: None
+                                    height: "182dp"
+
+                                    DoseWheel:
+                                        id: dose_wheel
+                                        size: "190dp", "190dp"
+
+                                    MDBoxLayout:
+                                        orientation: "vertical"
+                                        spacing: "8dp"
+
+                                        MDLabel:
+                                            id: dashboard_risk_title
+                                            text: "Awaiting check"
+                                            theme_text_color: "Custom"
+                                            text_color: 0.96, 0.99, 0.98, 1
+                                            bold: True
+                                            font_style: "H5"
+                                            size_hint_y: None
+                                            height: "38dp"
+
+                                        MDLabel:
+                                            id: dashboard_risk_caption
+                                            text: "Log a selected dose to score timing and daily totals."
+                                            theme_text_color: "Custom"
+                                            text_color: 0.79, 0.88, 0.86, 1
+                                            text_size: self.width, None
+                                            size_hint_y: None
+                                            height: self.texture_size[1]
+
+                                        MDLabel:
+                                            text: "Due now"
+                                            theme_text_color: "Custom"
+                                            text_color: 0.67, 0.80, 0.78, 1
+                                            size_hint_y: None
+                                            height: "20dp"
+
+                                        MDLabel:
+                                            id: today_due_count
+                                            text: "0 meds"
+                                            theme_text_color: "Custom"
+                                            text_color: 0.96, 0.99, 0.98, 1
+                                            bold: True
+                                            size_hint_y: None
+                                            height: "28dp"
+
+                                        MDLabel:
+                                            text: "Next dose"
+                                            theme_text_color: "Custom"
+                                            text_color: 0.67, 0.80, 0.78, 1
+                                            size_hint_y: None
+                                            height: "20dp"
+
+                                        MDLabel:
+                                            id: today_next_due
+                                            text: "No schedule yet"
+                                            theme_text_color: "Custom"
+                                            text_color: 0.96, 0.99, 0.98, 1
+                                            bold: True
+                                            text_size: self.width, None
+                                            size_hint_y: None
+                                            height: self.texture_size[1]
+
+                                MDBoxLayout:
+                                    spacing: "8dp"
+                                    size_hint_y: None
+                                    height: "46dp"
+
+                                    GradientButton:
+                                        text: "Log Selected Dose"
+                                        on_release: app.on_log_dose()
+
+                                    GradientButton:
+                                        text: "Take Bottle Photo"
+                                        start_color: 0.18, 0.56, 0.94, 1
+                                        end_color: 0.12, 0.35, 0.68, 1
+                                        on_release: app.on_take_bottle_photo()
+
+                                    GradientButton:
+                                        text: "Refresh"
+                                        start_color: 0.19, 0.79, 0.58, 1
+                                        end_color: 0.12, 0.46, 0.34, 1
+                                        on_release: app.refresh_from_disk()
+
+                                MDLabel:
+                                    id: dashboard_model_state
+                                    text: "Model: not downloaded yet"
+                                    theme_text_color: "Custom"
+                                    text_color: 0.67, 0.80, 0.78, 1
+                                    size_hint_y: None
+                                    height: "24dp"
+
+                        FloatLayout:
+                            size_hint_y: None
+                            height: "250dp"
+
+                            GlassCard:
+                                pos: self.parent.pos
+                                size: self.parent.size
+                                radius: dp(24)
+                                fill: 1, 1, 1, 0.05
+                                border: 1, 1, 1, 0.11
+                                highlight: 1, 1, 1, 0.06
+
+                            MDBoxLayout:
+                                orientation: "vertical"
+                                padding: "16dp"
+                                spacing: "10dp"
+                                pos: self.parent.pos
+                                size: self.parent.size
+
+                                MDLabel:
+                                    text: "Schedule Lineup"
+                                    theme_text_color: "Custom"
+                                    text_color: 0.95, 0.99, 0.97, 1
+                                    bold: True
+                                    size_hint_y: None
+                                    height: "28dp"
+
+                                MDLabel:
+                                    id: today_timeline
+                                    text: "No medications yet."
+                                    theme_text_color: "Custom"
+                                    text_color: 0.82, 0.90, 0.88, 1
+                                    text_size: self.width, None
+                                    size_hint_y: None
+                                    height: self.texture_size[1]
+
+                        FloatLayout:
+                            size_hint_y: None
+                            height: "250dp"
+
+                            GlassCard:
+                                pos: self.parent.pos
+                                size: self.parent.size
+                                radius: dp(24)
+                                fill: 1, 1, 1, 0.05
+                                border: 1, 1, 1, 0.11
+                                highlight: 1, 1, 1, 0.06
+
+                            MDBoxLayout:
+                                orientation: "vertical"
+                                padding: "16dp"
+                                spacing: "10dp"
+                                pos: self.parent.pos
+                                size: self.parent.size
+
+                                MDLabel:
+                                    text: "Selected Medication"
+                                    theme_text_color: "Custom"
+                                    text_color: 0.95, 0.99, 0.97, 1
+                                    bold: True
+                                    size_hint_y: None
+                                    height: "28dp"
+
+                                MDLabel:
+                                    id: selected_med_summary
+                                    text: "No medication selected."
+                                    theme_text_color: "Custom"
+                                    text_color: 0.82, 0.90, 0.88, 1
+                                    text_size: self.width, None
+                                    size_hint_y: None
+                                    height: self.texture_size[1]
+
+                                MDLabel:
+                                    id: selected_med_history
+                                    text: "Select a medication to see recent logs."
+                                    theme_text_color: "Custom"
+                                    text_color: 0.67, 0.80, 0.78, 1
+                                    text_size: self.width, None
+                                    size_hint_y: None
+                                    height: self.texture_size[1]
+
+            MDBottomNavigationItem:
+                name: "schedule"
+                text: "Schedule"
+                icon: "format-list-bulleted-square"
+
+                ScrollView:
+                    do_scroll_x: False
+
+                    MDBoxLayout:
+                        orientation: "vertical"
+                        spacing: "12dp"
+                        padding: "12dp"
+                        size_hint_y: None
+                        height: self.minimum_height
+
+                        FloatLayout:
+                            size_hint_y: None
+                            height: "540dp"
+
+                            GlassCard:
+                                pos: self.parent.pos
+                                size: self.parent.size
+                                radius: dp(28)
+                                fill: 1, 1, 1, 0.055
+                                border: 1, 1, 1, 0.12
+                                highlight: 1, 1, 1, 0.07
+
+                            MDBoxLayout:
+                                orientation: "vertical"
+                                padding: "16dp"
+                                spacing: "10dp"
+                                pos: self.parent.pos
+                                size: self.parent.size
+
+                                MDLabel:
+                                    text: "Medication Editor"
+                                    theme_text_color: "Custom"
+                                    text_color: 0.95, 0.99, 0.97, 1
+                                    bold: True
+                                    font_style: "H6"
+                                    size_hint_y: None
+                                    height: "30dp"
+
+                                MDLabel:
+                                    id: form_selection
+                                    text: "Creating a new medication"
+                                    theme_text_color: "Custom"
+                                    text_color: 0.67, 0.80, 0.78, 1
+                                    size_hint_y: None
+                                    height: "24dp"
+
+                                MDTextField:
+                                    id: med_name
+                                    hint_text: "Medication name"
+                                    mode: "fill"
+                                    fill_color: 1, 1, 1, 0.06
+
+                                MDBoxLayout:
+                                    spacing: "8dp"
+                                    size_hint_y: None
+                                    height: "82dp"
+
+                                    MDTextField:
+                                        id: dose_mg
+                                        hint_text: "Dose (mg)"
+                                        mode: "fill"
+                                        input_filter: "float"
+                                        fill_color: 1, 1, 1, 0.06
+
+                                    MDTextField:
+                                        id: interval_h
+                                        hint_text: "Interval (hours)"
+                                        mode: "fill"
+                                        input_filter: "float"
+                                        fill_color: 1, 1, 1, 0.06
+
+                                    MDTextField:
+                                        id: max_daily
+                                        hint_text: "Max daily (mg)"
+                                        mode: "fill"
+                                        input_filter: "float"
+                                        fill_color: 1, 1, 1, 0.06
+
+                                MDTextField:
+                                    id: schedule_text
+                                    hint_text: "Bottle directions or reminder note"
+                                    mode: "fill"
+                                    multiline: True
+                                    fill_color: 1, 1, 1, 0.06
+
+                                MDTextField:
+                                    id: med_notes
+                                    hint_text: "Notes"
+                                    mode: "fill"
+                                    multiline: True
+                                    fill_color: 1, 1, 1, 0.06
+
+                                MDBoxLayout:
+                                    spacing: "8dp"
+                                    size_hint_y: None
+                                    height: "46dp"
+
+                                    GradientButton:
+                                        text: "Save / Update"
+                                        on_release: app.on_save_med()
+
+                                    GradientButton:
+                                        text: "New"
+                                        start_color: 0.18, 0.56, 0.94, 1
+                                        end_color: 0.12, 0.35, 0.68, 1
+                                        on_release: app.on_new_med()
+
+                                MDBoxLayout:
+                                    spacing: "8dp"
+                                    size_hint_y: None
+                                    height: "46dp"
+
+                                    GradientButton:
+                                        text: "Log Dose Now"
+                                        start_color: 0.19, 0.79, 0.58, 1
+                                        end_color: 0.12, 0.46, 0.34, 1
+                                        on_release: app.on_log_dose()
+
+                                    GradientButton:
+                                        text: "Delete"
+                                        start_color: 0.94, 0.42, 0.38, 1
+                                        end_color: 0.71, 0.21, 0.22, 1
+                                        on_release: app.on_delete_med()
+
+                                MDLabel:
+                                    id: form_schedule_preview
+                                    text: "Saved schedules appear below."
+                                    theme_text_color: "Custom"
+                                    text_color: 0.67, 0.80, 0.78, 1
+                                    text_size: self.width, None
+                                    size_hint_y: None
+                                    height: self.texture_size[1]
+
+                        FloatLayout:
+                            size_hint_y: None
+                            height: "360dp"
+
+                            GlassCard:
+                                pos: self.parent.pos
+                                size: self.parent.size
+                                radius: dp(24)
+                                fill: 1, 1, 1, 0.05
+                                border: 1, 1, 1, 0.11
+                                highlight: 1, 1, 1, 0.06
+
+                            MDBoxLayout:
+                                orientation: "vertical"
+                                padding: "16dp"
+                                spacing: "10dp"
+                                pos: self.parent.pos
+                                size: self.parent.size
+
+                                MDLabel:
+                                    text: "Saved Medications"
+                                    theme_text_color: "Custom"
+                                    text_color: 0.95, 0.99, 0.97, 1
+                                    bold: True
+                                    size_hint_y: None
+                                    height: "28dp"
+
+                                ScrollView:
+                                    do_scroll_x: False
+
+                                    MDList:
+                                        id: med_list
+
+            MDBottomNavigationItem:
+                name: "vision"
+                text: "Vision"
+                icon: "camera-outline"
+
+                ScrollView:
+                    do_scroll_x: False
+
+                    MDBoxLayout:
+                        orientation: "vertical"
+                        spacing: "12dp"
+                        padding: "12dp"
+                        size_hint_y: None
+                        height: self.minimum_height
+
+                        FloatLayout:
+                            size_hint_y: None
+                            height: "300dp"
+
+                            GlassCard:
+                                pos: self.parent.pos
+                                size: self.parent.size
+                                radius: dp(28)
+                                fill: 1, 1, 1, 0.055
+                                border: 0.60, 0.79, 1.0, 0.16
+                                highlight: 1, 1, 1, 0.08
+
+                            MDBoxLayout:
+                                orientation: "vertical"
+                                padding: "16dp"
+                                spacing: "10dp"
+                                pos: self.parent.pos
+                                size: self.parent.size
+
+                                MDLabel:
+                                    text: "Bottle Photo Import"
+                                    theme_text_color: "Custom"
+                                    text_color: 0.95, 0.99, 0.97, 1
+                                    bold: True
+                                    font_style: "H6"
+                                    size_hint_y: None
+                                    height: "30dp"
+
+                                MDLabel:
+                                    text: "Take a picture of a medicine bottle or choose an existing image. Gemma 4 will read the visible directions and add or update a schedule entry."
+                                    theme_text_color: "Custom"
+                                    text_color: 0.82, 0.90, 0.88, 1
+                                    text_size: self.width, None
+                                    size_hint_y: None
+                                    height: self.texture_size[1]
+
+                                MDLabel:
+                                    id: vision_status
+                                    text: "Ready for a bottle photo."
+                                    theme_text_color: "Custom"
+                                    text_color: 0.67, 0.80, 0.78, 1
+                                    text_size: self.width, None
+                                    size_hint_y: None
+                                    height: self.texture_size[1]
+
+                                MDLabel:
+                                    id: vision_last_file
+                                    text: "Last image: none"
+                                    theme_text_color: "Custom"
+                                    text_color: 0.67, 0.80, 0.78, 1
+                                    size_hint_y: None
+                                    height: "24dp"
+
+                                MDBoxLayout:
+                                    spacing: "8dp"
+                                    size_hint_y: None
+                                    height: "46dp"
+
+                                    GradientButton:
+                                        text: "Take Bottle Photo"
+                                        start_color: 0.18, 0.56, 0.94, 1
+                                        end_color: 0.12, 0.35, 0.68, 1
+                                        on_release: app.on_take_bottle_photo()
+
+                                    GradientButton:
+                                        text: "Use Existing Photo"
+                                        start_color: 0.19, 0.79, 0.58, 1
+                                        end_color: 0.12, 0.46, 0.34, 1
+                                        on_release: app.on_pick_bottle_photo()
+
+                        FloatLayout:
+                            size_hint_y: None
+                            height: "330dp"
+
+                            GlassCard:
+                                pos: self.parent.pos
+                                size: self.parent.size
+                                radius: dp(24)
+                                fill: 1, 1, 1, 0.05
+                                border: 1, 1, 1, 0.11
+                                highlight: 1, 1, 1, 0.06
+
+                            MDBoxLayout:
+                                orientation: "vertical"
+                                padding: "16dp"
+                                spacing: "10dp"
+                                pos: self.parent.pos
+                                size: self.parent.size
+
+                                MDLabel:
+                                    text: "Latest Import"
+                                    theme_text_color: "Custom"
+                                    text_color: 0.95, 0.99, 0.97, 1
+                                    bold: True
+                                    size_hint_y: None
+                                    height: "28dp"
+
+                                MDLabel:
+                                    id: vision_result
+                                    text: "No bottle photo processed yet."
+                                    theme_text_color: "Custom"
+                                    text_color: 0.82, 0.90, 0.88, 1
+                                    text_size: self.width, None
+                                    size_hint_y: None
+                                    height: self.texture_size[1]
+
+            MDBottomNavigationItem:
+                name: "dental"
+                text: "Dental"
+                icon: "tooth-outline"
+
+                ScrollView:
+                    do_scroll_x: False
+
+                    MDBoxLayout:
+                        orientation: "vertical"
+                        spacing: "12dp"
+                        padding: "12dp"
+                        size_hint_y: None
+                        height: self.minimum_height
+
+                        FloatLayout:
+                            size_hint_y: None
+                            height: "540dp"
+
+                            GlassCard:
+                                pos: self.parent.pos
+                                size: self.parent.size
+                                radius: dp(28)
+                                fill: 1, 1, 1, 0.055
+                                border: 0.88, 0.90, 0.42, 0.18
+                                highlight: 1, 1, 1, 0.08
+
+                            MDBoxLayout:
+                                orientation: "vertical"
+                                padding: "16dp"
+                                spacing: "10dp"
+                                pos: self.parent.pos
+                                size: self.parent.size
+
+                                MDLabel:
+                                    text: "Oral Care Studio"
+                                    theme_text_color: "Custom"
+                                    text_color: 0.95, 0.99, 0.97, 1
+                                    bold: True
+                                    font_style: "H6"
+                                    size_hint_y: None
+                                    height: "30dp"
+
+                                MDLabel:
+                                    text: "A private LiteRT-LM dental dashboard for reminders, photo reviews, and recovery journaling."
+                                    theme_text_color: "Custom"
+                                    text_color: 0.82, 0.90, 0.88, 1
+                                    text_size: self.width, None
+                                    size_hint_y: None
+                                    height: self.texture_size[1]
+
+                                MDLabel:
+                                    id: dental_overview_title
+                                    text: "Dental studio ready"
+                                    theme_text_color: "Custom"
+                                    text_color: 0.98, 0.99, 1, 1
+                                    bold: True
+                                    font_style: "H5"
+                                    size_hint_y: None
+                                    height: self.texture_size[1]
+
+                                MDLabel:
+                                    id: dental_overview_body
+                                    text: "Keep the daily rhythm steady, use the vision coach when you want a check-in, and switch on recovery mode after dental work."
+                                    theme_text_color: "Custom"
+                                    text_color: 0.78, 0.88, 0.86, 1
+                                    text_size: self.width, None
+                                    size_hint_y: None
+                                    height: self.texture_size[1]
+
+                                GridLayout:
+                                    cols: 3
+                                    spacing: "8dp"
+                                    size_hint_y: None
+                                    height: "122dp"
+
+                                    FloatLayout:
+                                        GlassCard:
+                                            pos: self.parent.pos
+                                            size: self.parent.size
+                                            radius: dp(22)
+                                            fill: 1, 1, 1, 0.05
+                                            border: 0.98, 0.83, 0.44, 0.20
+                                            highlight: 1, 1, 1, 0.06
+
+                                        MDBoxLayout:
+                                            orientation: "vertical"
+                                            padding: "14dp"
+                                            spacing: "8dp"
+                                            pos: self.parent.pos
+                                            size: self.parent.size
+
+                                            MDLabel:
+                                                text: "Brush"
+                                                theme_text_color: "Custom"
+                                                text_color: 0.78, 0.88, 0.86, 1
+                                                size_hint_y: None
+                                                height: "22dp"
+
+                                            MDLabel:
+                                                id: dental_brush_status
+                                                text: "Ready now"
+                                                theme_text_color: "Custom"
+                                                text_color: 1.00, 0.86, 0.50, 1
+                                                bold: True
+                                                size_hint_y: None
+                                                height: "28dp"
+
+                                            MDLabel:
+                                                id: dental_brush_caption
+                                                text: "Every 12h"
+                                                theme_text_color: "Custom"
+                                                text_color: 1.00, 0.93, 0.74, 1
+                                                text_size: self.width, None
+                                                size_hint_y: None
+                                                height: self.texture_size[1]
+
+                                    FloatLayout:
+                                        GlassCard:
+                                            pos: self.parent.pos
+                                            size: self.parent.size
+                                            radius: dp(22)
+                                            fill: 1, 1, 1, 0.05
+                                            border: 0.60, 0.84, 1.0, 0.20
+                                            highlight: 1, 1, 1, 0.06
+
+                                        MDBoxLayout:
+                                            orientation: "vertical"
+                                            padding: "14dp"
+                                            spacing: "8dp"
+                                            pos: self.parent.pos
+                                            size: self.parent.size
+
+                                            MDLabel:
+                                                text: "Floss"
+                                                theme_text_color: "Custom"
+                                                text_color: 0.78, 0.88, 0.86, 1
+                                                size_hint_y: None
+                                                height: "22dp"
+
+                                            MDLabel:
+                                                id: dental_floss_status
+                                                text: "Ready now"
+                                                theme_text_color: "Custom"
+                                                text_color: 0.70, 0.98, 0.84, 1
+                                                bold: True
+                                                size_hint_y: None
+                                                height: "28dp"
+
+                                            MDLabel:
+                                                id: dental_floss_caption
+                                                text: "Every 24h"
+                                                theme_text_color: "Custom"
+                                                text_color: 0.82, 0.96, 0.91, 1
+                                                text_size: self.width, None
+                                                size_hint_y: None
+                                                height: self.texture_size[1]
+
+                                    FloatLayout:
+                                        GlassCard:
+                                            pos: self.parent.pos
+                                            size: self.parent.size
+                                            radius: dp(22)
+                                            fill: 1, 1, 1, 0.05
+                                            border: 0.52, 0.94, 0.76, 0.20
+                                            highlight: 1, 1, 1, 0.06
+
+                                        MDBoxLayout:
+                                            orientation: "vertical"
+                                            padding: "14dp"
+                                            spacing: "8dp"
+                                            pos: self.parent.pos
+                                            size: self.parent.size
+
+                                            MDLabel:
+                                                text: "Rinse"
+                                                theme_text_color: "Custom"
+                                                text_color: 0.78, 0.88, 0.86, 1
+                                                size_hint_y: None
+                                                height: "22dp"
+
+                                            MDLabel:
+                                                id: dental_rinse_status
+                                                text: "Ready now"
+                                                theme_text_color: "Custom"
+                                                text_color: 0.70, 0.98, 0.84, 1
+                                                bold: True
+                                                size_hint_y: None
+                                                height: "28dp"
+
+                                            MDLabel:
+                                                id: dental_rinse_caption
+                                                text: "Every 24h"
+                                                theme_text_color: "Custom"
+                                                text_color: 0.82, 0.96, 0.91, 1
+                                                text_size: self.width, None
+                                                size_hint_y: None
+                                                height: self.texture_size[1]
+
+                                MDLabel:
+                                    text: "Reminder rhythm (hours between routines)"
+                                    theme_text_color: "Custom"
+                                    text_color: 0.78, 0.88, 0.86, 1
+                                    size_hint_y: None
+                                    height: "22dp"
+
+                                MDBoxLayout:
+                                    spacing: "8dp"
+                                    size_hint_y: None
+                                    height: "82dp"
+
+                                    MDTextField:
+                                        id: dental_brush_interval
+                                        hint_text: "Brush"
+                                        helper_text: "hours"
+                                        helper_text_mode: "persistent"
+                                        mode: "fill"
+                                        input_filter: "float"
+                                        fill_color: 1, 1, 1, 0.06
+
+                                    MDTextField:
+                                        id: dental_floss_interval
+                                        hint_text: "Floss"
+                                        helper_text: "hours"
+                                        helper_text_mode: "persistent"
+                                        mode: "fill"
+                                        input_filter: "float"
+                                        fill_color: 1, 1, 1, 0.06
+
+                                    MDTextField:
+                                        id: dental_rinse_interval
+                                        hint_text: "Rinse"
+                                        helper_text: "hours"
+                                        helper_text_mode: "persistent"
+                                        mode: "fill"
+                                        input_filter: "float"
+                                        fill_color: 1, 1, 1, 0.06
+
+                                MDBoxLayout:
+                                    spacing: "8dp"
+                                    size_hint_y: None
+                                    height: "46dp"
+
+                                    GradientButton:
+                                        text: "Save Reminder Rhythm"
+                                        start_color: 0.98, 0.83, 0.44, 1
+                                        end_color: 0.78, 0.56, 0.14, 1
+                                        on_release: app.on_save_dental_intervals()
+
+                                    GradientButton:
+                                        text: "Reset Defaults"
+                                        start_color: 0.34, 0.60, 0.98, 1
+                                        end_color: 0.18, 0.36, 0.70, 1
+                                        on_release: app.on_reset_dental_intervals()
+
+                                MDBoxLayout:
+                                    spacing: "8dp"
+                                    size_hint_y: None
+                                    height: "46dp"
+
+                                    GradientButton:
+                                        text: "Log Brush"
+                                        start_color: 0.93, 0.76, 0.22, 1
+                                        end_color: 0.78, 0.55, 0.12, 1
+                                        on_release: app.on_log_dental_habit("brush")
+
+                                    GradientButton:
+                                        text: "Log Floss"
+                                        start_color: 0.30, 0.76, 0.95, 1
+                                        end_color: 0.16, 0.46, 0.78, 1
+                                        on_release: app.on_log_dental_habit("floss")
+
+                                    GradientButton:
+                                        text: "Log Rinse"
+                                        start_color: 0.20, 0.82, 0.60, 1
+                                        end_color: 0.12, 0.50, 0.36, 1
+                                        on_release: app.on_log_dental_habit("rinse")
+
+                        FloatLayout:
+                            size_hint_y: None
+                            height: "430dp"
+
+                            GlassCard:
+                                pos: self.parent.pos
+                                size: self.parent.size
+                                radius: dp(24)
+                                fill: 1, 1, 1, 0.05
+                                border: 0.75, 0.88, 1.0, 0.16
+                                highlight: 1, 1, 1, 0.06
+
+                            MDBoxLayout:
+                                orientation: "vertical"
+                                padding: "16dp"
+                                spacing: "10dp"
+                                pos: self.parent.pos
+                                size: self.parent.size
+
+                                MDLabel:
+                                    text: "Smile Vision Coach"
+                                    theme_text_color: "Custom"
+                                    text_color: 0.95, 0.99, 0.97, 1
+                                    bold: True
+                                    size_hint_y: None
+                                    height: "28dp"
+
+                                MDLabel:
+                                    text: "Use a front-facing mouth photo to get a private cleanliness rating, visible-sign summary, and gentle suggestions."
+                                    theme_text_color: "Custom"
+                                    text_color: 0.82, 0.90, 0.88, 1
+                                    text_size: self.width, None
+                                    size_hint_y: None
+                                    height: self.texture_size[1]
+
+                                MDLabel:
+                                    id: dental_hygiene_status
+                                    text: "Ready for a teeth photo."
+                                    theme_text_color: "Custom"
+                                    text_color: 0.67, 0.80, 0.78, 1
+                                    text_size: self.width, None
+                                    size_hint_y: None
+                                    height: self.texture_size[1]
+
+                                MDLabel:
+                                    id: dental_hygiene_photo
+                                    text: "Last hygiene photo: none"
+                                    theme_text_color: "Custom"
+                                    text_color: 0.67, 0.80, 0.78, 1
+                                    size_hint_y: None
+                                    height: "24dp"
+
+                                MDBoxLayout:
+                                    spacing: "8dp"
+                                    size_hint_y: None
+                                    height: "46dp"
+
+                                    GradientButton:
+                                        text: "Take Teeth Photo"
+                                        start_color: 0.30, 0.76, 0.95, 1
+                                        end_color: 0.16, 0.46, 0.78, 1
+                                        on_release: app.on_take_dental_hygiene_photo()
+
+                                    GradientButton:
+                                        text: "Use Existing Photo"
+                                        start_color: 0.20, 0.82, 0.60, 1
+                                        end_color: 0.12, 0.50, 0.36, 1
+                                        on_release: app.on_pick_dental_hygiene_photo()
+
+                                MDLabel:
+                                    id: dental_hygiene_rating
+                                    text: "No hygiene rating yet."
+                                    theme_text_color: "Custom"
+                                    text_color: 0.96, 0.99, 0.98, 1
+                                    bold: True
+                                    size_hint_y: None
+                                    height: "26dp"
+
+                                MDLabel:
+                                    id: dental_hygiene_trend
+                                    text: "Trend: take two AI reviews over time to compare your hygiene rhythm."
+                                    theme_text_color: "Custom"
+                                    text_color: 0.78, 0.88, 0.86, 1
+                                    text_size: self.width, None
+                                    size_hint_y: None
+                                    height: self.texture_size[1]
+
+                                MDLabel:
+                                    id: dental_hygiene_summary
+                                    text: "Take a photo for a cleanliness score, visible-sign review, and gentle brushing/flossing suggestions."
+                                    theme_text_color: "Custom"
+                                    text_color: 0.82, 0.90, 0.88, 1
+                                    text_size: self.width, None
+                                    size_hint_y: None
+                                    height: self.texture_size[1]
+
+                        FloatLayout:
+                            size_hint_y: None
+                            height: "720dp"
+
+                            GlassCard:
+                                pos: self.parent.pos
+                                size: self.parent.size
+                                radius: dp(24)
+                                fill: 1, 1, 1, 0.05
+                                border: 1.0, 0.72, 0.82, 0.16
+                                highlight: 1, 1, 1, 0.06
+
+                            MDBoxLayout:
+                                orientation: "vertical"
+                                padding: "16dp"
+                                spacing: "10dp"
+                                pos: self.parent.pos
+                                size: self.parent.size
+
+                                MDLabel:
+                                    text: "Recovery Journal"
+                                    theme_text_color: "Custom"
+                                    text_color: 0.95, 0.99, 0.97, 1
+                                    bold: True
+                                    size_hint_y: None
+                                    height: "28dp"
+
+                                MDLabel:
+                                    text: "For extractions, crowns, fillings, caps, implants, and similar dental work, save context once and then run daily photo check-ins."
+                                    theme_text_color: "Custom"
+                                    text_color: 0.82, 0.90, 0.88, 1
+                                    text_size: self.width, None
+                                    size_hint_y: None
+                                    height: self.texture_size[1]
+
+                                MDLabel:
+                                    id: recovery_mode_status
+                                    text: "Recovery mode is off."
+                                    theme_text_color: "Custom"
+                                    text_color: 0.67, 0.80, 0.78, 1
+                                    text_size: self.width, None
+                                    size_hint_y: None
+                                    height: self.texture_size[1]
+
+                                MDLabel:
+                                    id: recovery_snapshot
+                                    text: "Set a procedure type and date to start a daily recovery journal."
+                                    theme_text_color: "Custom"
+                                    text_color: 0.78, 0.88, 0.86, 1
+                                    text_size: self.width, None
+                                    size_hint_y: None
+                                    height: self.texture_size[1]
+
+                                MDTextField:
+                                    id: recovery_procedure_type
+                                    hint_text: "Procedure type (extraction, crown, filling, implant, cap)"
+                                    mode: "fill"
+                                    fill_color: 1, 1, 1, 0.06
+
+                                MDTextField:
+                                    id: recovery_procedure_date
+                                    hint_text: "Procedure date (YYYY-MM-DD)"
+                                    mode: "fill"
+                                    fill_color: 1, 1, 1, 0.06
+
+                                MDTextField:
+                                    id: recovery_symptom_notes
+                                    hint_text: "Symptom notes (pain, swelling, sensitivity, bleeding)"
+                                    mode: "fill"
+                                    multiline: True
+                                    fill_color: 1, 1, 1, 0.06
+
+                                MDTextField:
+                                    id: recovery_care_notes
+                                    hint_text: "Dentist instructions or recovery notes"
+                                    mode: "fill"
+                                    multiline: True
+                                    fill_color: 1, 1, 1, 0.06
+
+                                MDBoxLayout:
+                                    spacing: "8dp"
+                                    size_hint_y: None
+                                    height: "46dp"
+
+                                    GradientButton:
+                                        text: "Save Recovery Mode"
+                                        start_color: 1.00, 0.62, 0.52, 1
+                                        end_color: 0.83, 0.34, 0.37, 1
+                                        on_release: app.on_save_recovery_mode()
+
+                                    GradientButton:
+                                        text: "Pause Recovery"
+                                        start_color: 0.38, 0.44, 0.74, 1
+                                        end_color: 0.24, 0.28, 0.54, 1
+                                        on_release: app.on_pause_recovery_mode()
+
+                                MDLabel:
+                                    id: recovery_last_photo
+                                    text: "Last recovery photo: none"
+                                    theme_text_color: "Custom"
+                                    text_color: 0.67, 0.80, 0.78, 1
+                                    size_hint_y: None
+                                    height: "24dp"
+
+                                MDBoxLayout:
+                                    spacing: "8dp"
+                                    size_hint_y: None
+                                    height: "46dp"
+
+                                    GradientButton:
+                                        text: "Take Recovery Photo"
+                                        start_color: 1.00, 0.62, 0.52, 1
+                                        end_color: 0.83, 0.34, 0.37, 1
+                                        on_release: app.on_take_recovery_photo()
+
+                                    GradientButton:
+                                        text: "Use Existing Photo"
+                                        start_color: 0.38, 0.44, 0.74, 1
+                                        end_color: 0.24, 0.28, 0.54, 1
+                                        on_release: app.on_pick_recovery_photo()
+
+                                MDLabel:
+                                    id: recovery_result
+                                    text: "Recovery suggestions here stay general and should never replace your dentist's instructions."
+                                    theme_text_color: "Custom"
+                                    text_color: 0.82, 0.90, 0.88, 1
+                                    text_size: self.width, None
+                                    size_hint_y: None
+                                    height: self.texture_size[1]
+
+            MDBottomNavigationItem:
+                name: "assistant"
+                text: "Assistant"
+                icon: "chat-processing-outline"
+
+                ScrollView:
+                    do_scroll_x: False
+
+                    MDBoxLayout:
+                        orientation: "vertical"
+                        spacing: "12dp"
+                        padding: "12dp"
+                        size_hint_y: None
+                        height: self.minimum_height
+
+                        FloatLayout:
+                            size_hint_y: None
+                            height: "560dp"
+
+                            GlassCard:
+                                pos: self.parent.pos
+                                size: self.parent.size
+                                radius: dp(28)
+                                fill: 1, 1, 1, 0.055
+                                border: 1, 1, 1, 0.12
+                                highlight: 1, 1, 1, 0.07
+
+                            MDBoxLayout:
+                                orientation: "vertical"
+                                padding: "16dp"
+                                spacing: "10dp"
+                                pos: self.parent.pos
+                                size: self.parent.size
+
+                                MDLabel:
+                                    text: "Local Gemma Assistant"
+                                    theme_text_color: "Custom"
+                                    text_color: 0.95, 0.99, 0.97, 1
+                                    bold: True
+                                    font_style: "H6"
+                                    size_hint_y: None
+                                    height: "30dp"
+
+                                MDLabel:
+                                    text: "Ask about upcoming doses, schedule consistency, dental hygiene reminders, or recovery check-ins already stored in the encrypted vault."
+                                    theme_text_color: "Custom"
+                                    text_color: 0.82, 0.90, 0.88, 1
+                                    text_size: self.width, None
+                                    size_hint_y: None
+                                    height: self.texture_size[1]
+
+                                ScrollView:
+                                    do_scroll_x: False
+
+                                    MDLabel:
+                                        id: assistant_history
+                                        text: "No assistant messages yet."
+                                        theme_text_color: "Custom"
+                                        text_color: 0.82, 0.90, 0.88, 1
+                                        text_size: self.width, None
+                                        valign: "top"
+                                        size_hint_y: None
+                                        height: self.texture_size[1]
+
+                                MDTextField:
+                                    id: assistant_input
+                                    hint_text: "Ask MedSafe about this schedule"
+                                    mode: "fill"
+                                    multiline: True
+                                    fill_color: 1, 1, 1, 0.06
+
+                                MDBoxLayout:
+                                    spacing: "8dp"
+                                    size_hint_y: None
+                                    height: "46dp"
+
+                                    GradientButton:
+                                        text: "Send"
+                                        on_release: app.on_assistant_send()
+
+                                    GradientButton:
+                                        text: "Clear Chat"
+                                        start_color: 0.94, 0.42, 0.38, 1
+                                        end_color: 0.71, 0.21, 0.22, 1
+                                        on_release: app.on_assistant_clear()
+
+            MDBottomNavigationItem:
+                name: "model"
+                text: "Model"
+                icon: "download-circle-outline"
+
+                ScrollView:
+                    do_scroll_x: False
+
+                    MDBoxLayout:
+                        orientation: "vertical"
+                        spacing: "12dp"
+                        padding: "12dp"
+                        size_hint_y: None
+                        height: self.minimum_height
+
+                        FloatLayout:
+                            size_hint_y: None
+                            height: "360dp"
+
+                            GlassCard:
+                                pos: self.parent.pos
+                                size: self.parent.size
+                                radius: dp(28)
+                                fill: 1, 1, 1, 0.055
+                                border: 1, 1, 1, 0.12
+                                highlight: 1, 1, 1, 0.07
+
+                            MDBoxLayout:
+                                orientation: "vertical"
+                                padding: "16dp"
+                                spacing: "10dp"
+                                pos: self.parent.pos
+                                size: self.parent.size
+
+                                MDLabel:
+                                    text: "Gemma 4 Runtime"
+                                    theme_text_color: "Custom"
+                                    text_color: 0.95, 0.99, 0.97, 1
+                                    bold: True
+                                    font_style: "H6"
+                                    size_hint_y: None
+                                    height: "30dp"
+
+                                MDLabel:
+                                    id: model_status
+                                    text: "No model downloaded yet."
+                                    theme_text_color: "Custom"
+                                    text_color: 0.82, 0.90, 0.88, 1
+                                    text_size: self.width, None
+                                    size_hint_y: None
+                                    height: self.texture_size[1]
+
+                                MDLabel:
+                                    id: model_backend_label
+                                    text: "Backend: Auto"
+                                    theme_text_color: "Custom"
+                                    text_color: 0.67, 0.80, 0.78, 1
+                                    size_hint_y: None
+                                    height: "24dp"
+
+                                MDProgressBar:
+                                    id: model_progress
+                                    value: 0
+                                    max: 100
+                                    type: "determinate"
+
+                                MDBoxLayout:
+                                    spacing: "8dp"
+                                    size_hint_y: None
+                                    height: "46dp"
+
+                                    GradientButton:
+                                        text: "Download & Seal"
+                                        on_release: app.on_model_download()
+
+                                    GradientButton:
+                                        text: "Verify SHA"
+                                        start_color: 0.18, 0.56, 0.94, 1
+                                        end_color: 0.12, 0.35, 0.68, 1
+                                        on_release: app.on_model_verify()
+
+                                MDBoxLayout:
+                                    spacing: "8dp"
+                                    size_hint_y: None
+                                    height: "46dp"
+
+                                    GradientButton:
+                                        text: "Cycle Backend"
+                                        start_color: 0.19, 0.79, 0.58, 1
+                                        end_color: 0.12, 0.46, 0.34, 1
+                                        on_release: app.on_cycle_backend()
+
+                                    GradientButton:
+                                        text: "Toggle Vision"
+                                        start_color: 0.94, 0.65, 0.30, 1
+                                        end_color: 0.72, 0.44, 0.16, 1
+                                        on_release: app.on_toggle_native_image_input()
+
+                                MDBoxLayout:
+                                    spacing: "8dp"
+                                    size_hint_y: None
+                                    height: "46dp"
+
+                                    GradientButton:
+                                        text: "Delete Plain Cache"
+                                        start_color: 0.94, 0.42, 0.38, 1
+                                        end_color: 0.71, 0.21, 0.22, 1
+                                        on_release: app.on_delete_plain_model()
+
+                                    GradientButton:
+                                        text: "Refresh"
+                                        start_color: 0.18, 0.56, 0.94, 1
+                                        end_color: 0.12, 0.35, 0.68, 1
+                                        on_release: app.refresh_model_status()
+"""
+
+
+class MedSafeApp(MDApp):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.paths: Optional[AppPaths] = None
+        self.vault: Optional[EncryptedVault] = None
+        self.settings_data: Dict[str, Any] = dict(DEFAULT_SETTINGS)
+        self.data_cache: Dict[str, Any] = vault_defaults()
+        self.selected_med_id: Optional[str] = None
+        self.last_form_med_id: Optional[str] = None
+        self.last_check_level = "Medium"
+        self.last_check_display = "Awaiting check"
+        self.last_check_message = "Log a selected dose to score timing and daily totals."
+        self.dialog: Optional[MDDialog] = None
+
+    def build(self):
+        self.title = "MedSafe"
+        self.theme_cls.primary_palette = "Teal"
+        self.theme_cls.accent_palette = "BlueGray"
+
+        storage_root = Path(getattr(self, "user_data_dir", "") or ".medsafe_data")
+        self.paths = set_app_paths(storage_root)
+        self.vault = EncryptedVault(self.paths)
+        self.settings_data = load_settings(self.paths)
+
+        root = Builder.load_string(KV)
+        self._request_runtime_permissions()
+        Clock.schedule_once(lambda _dt: self.refresh_from_disk(), 0.05)
+        Clock.schedule_interval(lambda _dt: self.refresh_time_sensitive_labels(), 60.0)
+        return root
+
+    def _request_runtime_permissions(self) -> None:
+        if not request_permissions or not Permission:
+            return
+        wanted = []
+        for name in ("CAMERA", "READ_EXTERNAL_STORAGE", "WRITE_EXTERNAL_STORAGE", "POST_NOTIFICATIONS"):
+            if hasattr(Permission, name):
+                wanted.append(getattr(Permission, name))
+        if wanted:
+            try:
+                request_permissions(wanted)
+            except Exception:
+                pass
+
+    def on_stop(self):
+        self.dialog = None
+
+    def set_status(self, text: str) -> None:
+        if self.root:
+            self.root.ids.status_label.text = sanitize_text(text, max_chars=220)
+
+    def show_dialog(self, title: str, text: str) -> None:
+        if self.dialog:
+            try:
+                self.dialog.dismiss()
+            except Exception:
+                pass
+        self.dialog = MDDialog(
+            title=sanitize_text(title, max_chars=80),
+            text=sanitize_text(text, max_chars=3000),
+            buttons=[MDFlatButton(text="OK", on_release=lambda *_args: self.dialog.dismiss() if self.dialog else None)],
+        )
+        self.dialog.open()
+
+    def set_field_text(self, widget_id: str, value: str, *, force: bool = False) -> None:
+        if not self.root:
+            return
+        widget = self.root.ids.get(widget_id)
+        if widget is None:
+            return
+        next_text = sanitize_text(value, max_chars=4000)
+        if force or not bool(getattr(widget, "focus", False)):
+            if getattr(widget, "text", None) != next_text:
+                widget.text = next_text
+
+    def refresh_from_disk(self) -> None:
+        if not self.vault:
+            return
+        self.data_cache = ensure_vault_shape(self.vault.load())
+        if self.selected_med_id and not self.current_selected_med():
+            self.selected_med_id = None
+        if not self.selected_med_id and self.data_cache.get("meds"):
+            sorted_meds = sorted(
+                list(self.data_cache.get("meds") or []),
+                key=lambda med: (
+                    0 if medication_due_status(med)["overdue"] else 1 if medication_due_status(med)["due_now"] else 2,
+                    medication_due_status(med)["next_ts"] or float("inf"),
+                ),
+            )
+            self.selected_med_id = str(sorted_meds[0].get("id"))
+        self.refresh_ui()
+
+    def refresh_time_sensitive_labels(self) -> None:
+        self.refresh_dashboard()
+        self.refresh_med_list()
+        self.refresh_dental_ui()
+
+    def refresh_ui(self) -> None:
+        self.refresh_dashboard()
+        self.refresh_med_list()
+        self.refresh_form()
+        self.refresh_assistant_history()
+        self.refresh_model_status()
+        self.refresh_vision_summary()
+        self.refresh_dental_ui()
+
+    def save_data(self) -> None:
+        if self.vault:
+            self.vault.save(self.data_cache)
+
+    def current_selected_med(self) -> Optional[Dict[str, Any]]:
+        for med in self.data_cache.get("meds", []) or []:
+            if str(med.get("id")) == self.selected_med_id:
+                return med
+        return None
+
+    def _render_daily_checklist(self, med: Optional[Dict[str, Any]], now: float) -> None:
+        frame = self.ids.daily_checklist_frame
+        for child in frame.winfo_children():
+            child.destroy()
+        frame.grid_columnconfigure(0, weight=1)
+        if not med:
+            ctk.CTkLabel(
+                frame,
+                text="Select a medication to build today's checklist.",
+                anchor="w",
+                justify="left",
+                wraplength=500,
+                text_color=DESKTOP_MUTED,
+                font=ctk.CTkFont(size=13),
+            ).grid(row=0, column=0, sticky="ew", padx=12, pady=12)
+            return
+        slots = build_medication_daily_slots(med, datetime.fromtimestamp(now).date(), now)
+        if not slots:
+            next_slot = next_unchecked_medication_slot(med, now)
+            message = "Add custom times or save an interval to generate a daily checklist."
+            if next_slot is not None:
+                message = f"No remaining slots today. Next planned dose: {next_slot['label']} {next_slot['time_text']}."
+            ctk.CTkLabel(
+                frame,
+                text=message,
+                anchor="w",
+                justify="left",
+                wraplength=500,
+                text_color=DESKTOP_MUTED,
+                font=ctk.CTkFont(size=13),
+            ).grid(row=0, column=0, sticky="ew", padx=12, pady=12)
+            return
+        for row_index, slot in enumerate(slots):
+            row = ctk.CTkFrame(frame, fg_color="transparent")
+            row.grid(row=row_index, column=0, sticky="ew", padx=8, pady=4)
+            row.grid_columnconfigure(1, weight=1)
+
+            checkbox = ctk.CTkCheckBox(
+                row,
+                text=f"{slot['label']} • {slot['time_text']}",
+                fg_color=DESKTOP_ACCENT,
+                hover_color="#0d6b63",
+                border_color=DESKTOP_BORDER,
+                text_color=DESKTOP_TEXT,
+                font=ctk.CTkFont(size=14, weight="bold"),
+            )
+            checkbox.grid(row=0, column=0, sticky="w", padx=(4, 10))
+            if slot.get("status") == "taken":
+                checkbox.select()
+                checkbox.configure(state="disabled")
+            elif slot.get("status") == "missed":
+                checkbox.deselect()
+                checkbox.configure(state="disabled")
+            else:
+                checkbox.deselect()
+                checkbox.configure(
+                    command=lambda med_id=str(med.get("id")), slot_label=str(slot.get("label")): self.on_checklist_take_dose(med_id, slot_label)
+                )
+
+            if slot.get("status") == "missed":
+                status_color = DESKTOP_DANGER
+                status_text = f"X {slot['status_text']}"
+            elif slot.get("status") == "due":
+                status_color = DESKTOP_WARNING
+                status_text = f"! {slot['status_text']}"
+            elif slot.get("status") == "taken":
+                status_color = DESKTOP_SUCCESS
+                status_text = slot["status_text"]
+            else:
+                status_color = DESKTOP_MUTED
+                status_text = slot["status_text"]
+
+            ctk.CTkLabel(
+                row,
+                text=status_text,
+                anchor="w",
+                justify="left",
+                wraplength=260,
+                text_color=status_color,
+                font=ctk.CTkFont(size=13),
+            ).grid(row=0, column=1, sticky="ew")
+
+            if slot.get("status") == "missed":
+                self._button(
+                    row,
+                    text="Take Now",
+                    command=lambda med_id=str(med.get("id")), slot_label=str(slot.get("label")): self.on_checklist_take_dose(med_id, slot_label),
+                    tone="warning",
+                ).grid(row=0, column=2, sticky="e", padx=(10, 0))
+
+    def _log_dose_for_med(self, med: Dict[str, Any], *, source_label: str = "dose") -> None:
+        dose_value = max(0.0, safe_float(self.ids.dose_mg.text) or safe_float(med.get("dose_mg")))
+        now = time.time()
+        label, message = dose_safety_level(med, dose_value, now)
+        med["history"] = list(med.get("history") or []) + [[now, dose_value]]
+        med["history"] = med["history"][-240:]
+        med["last_taken_ts"] = now
+        if dose_value > 0:
+            med["dose_mg"] = dose_value
+        self.save_data()
+        self.last_check_level = label
+        self.last_check_display = label
+        source_suffix = f" Logged for {source_label}." if source_label else ""
+        self.last_check_message = message + source_suffix
+        self.refresh_ui()
+        self.set_status(self.last_check_message)
+        if label == "High":
+            self.show_dialog("High Safety Flag", self.last_check_message)
+
+    def on_checklist_take_dose(self, med_id: str, slot_label: str) -> None:
+        self.selected_med_id = med_id
+        med = self.current_selected_med()
+        if not med:
+            return
+        self._log_dose_for_med(med, source_label=slot_label)
+
+    def refresh_dashboard(self) -> None:
+        now = time.time()
+        meds = list(self.data_cache.get("meds") or [])
+        med_statuses = [(medication_due_status(med, now), med) for med in meds]
+        due_now = [med for status, med in med_statuses if status["due_now"] and not status["overdue"]]
+        overdue = [med for status, med in med_statuses if status["overdue"]]
+        next_due_items = [
+            (status["next_ts"], med)
+            for status, med in med_statuses
+            if status["next_ts"] is not None
+        ]
+        next_due_items.sort(key=lambda item: item[0] or float("inf"))
+        next_due_text = "Nothing scheduled yet"
+        if next_due_items:
+            next_due_ts, med = next_due_items[0]
+            next_due_text = f"{sanitize_text(med.get('name'), max_chars=120)} • {format_relative_due(next_due_ts, now)}"
+
+        selected = self.current_selected_med()
+        selection_text = "Select a medication to log doses."
+        summary_text = "No medication selected."
+        if selected:
+            status = medication_due_status(selected, now)
+            selection_text = f"Focused med: {sanitize_text(selected.get('name'), max_chars=120)}"
+            summary_text = (
+                f"{sanitize_text(selected.get('name'), max_chars=120)}\n"
+                f"{medication_card_line(selected, now)}\n"
+                f"Last taken: {format_timestamp(safe_float(selected.get('last_taken_ts')))}\n"
+                f"Directions: {sanitize_text(selected.get('schedule_text') or 'No bottle directions saved yet.', max_chars=260)}"
+            )
+
+        self.root.ids.dose_wheel.set_level(self.last_check_level)
+        self.root.ids.dashboard_risk_title.text = self.last_check_display
+        self.root.ids.dashboard_risk_caption.text = self.last_check_message
+        self.root.ids.today_due_count.text = f"{len(due_now)} due • {len(overdue)} overdue"
+        self.root.ids.today_next_due.text = next_due_text
+        self.root.ids.today_timeline.text = build_timeline_text(meds, now)
+        self.root.ids.dashboard_selection.text = selection_text
+        self.root.ids.selected_med_summary.text = summary_text
+        self.root.ids.selected_med_history.text = build_med_history_text(selected)
+
+    def refresh_med_list(self) -> None:
+        med_list = self.root.ids.med_list
+        med_list.clear_widgets()
+        meds = list(self.data_cache.get("meds") or [])
+        now = time.time()
+        for med in sorted(
+            meds,
+            key=lambda item: (
+                0 if medication_due_status(item, now)["overdue"] else 1 if medication_due_status(item, now)["due_now"] else 2,
+                medication_due_status(item, now)["next_ts"] or float("inf"),
+                sanitize_text(item.get("name"), max_chars=120).lower(),
+            ),
+        ):
+            title = sanitize_text(med.get("name"), max_chars=120)
+            prefix = "Selected • " if str(med.get("id")) == self.selected_med_id else ""
+            item = TwoLineListItem(
+                text=prefix + title,
+                secondary_text=medication_card_line(med, now),
+                on_release=lambda _widget, med_id=str(med.get("id")): self.select_med(med_id),
+            )
+            med_list.add_widget(item)
+
+    def refresh_form(self) -> None:
+        med = self.current_selected_med()
+        if not med:
+            self.last_form_med_id = None
+            self.root.ids.form_selection.text = "Creating a new medication"
+            self.root.ids.form_schedule_preview.text = "Saved schedules appear below."
+            return
+        med_id = str(med.get("id"))
+        force_sync = med_id != self.last_form_med_id
+        self.root.ids.form_selection.text = f"Editing: {sanitize_text(med.get('name'), max_chars=120)}"
+        self.set_field_text("med_name", sanitize_text(med.get("name") or "", max_chars=120), force=force_sync)
+        self.set_field_text("dose_mg", f"{safe_float(med.get('dose_mg')):g}" if safe_float(med.get("dose_mg")) else "", force=force_sync)
+        self.set_field_text("interval_h", f"{safe_float(med.get('interval_hours')):g}" if safe_float(med.get("interval_hours")) else "", force=force_sync)
+        self.set_field_text("max_daily", f"{safe_float(med.get('max_daily_mg')):g}" if safe_float(med.get("max_daily_mg")) else "", force=force_sync)
+        self.set_field_text("schedule_text", sanitize_text(med.get("schedule_text") or "", max_chars=240), force=force_sync)
+        self.set_field_text("med_notes", sanitize_text(med.get("notes") or "", max_chars=500), force=force_sync)
+        self.root.ids.form_schedule_preview.text = medication_card_line(med)
+        self.last_form_med_id = med_id
+
+    def refresh_assistant_history(self) -> None:
+        history = list(self.data_cache.get("assistant_history") or [])
+        if not history:
+            self.root.ids.assistant_history.text = "No assistant messages yet."
+            return
+        lines = []
+        for item in history[-12:]:
+            speaker = "You" if item.get("role") == "user" else "MedSafe"
+            lines.append(f"{speaker}\n{sanitize_text(item.get('content') or '', max_chars=1200)}")
+        self.root.ids.assistant_history.text = "\n\n".join(lines)
+
+    def refresh_vision_summary(self) -> None:
+        imports = list(self.data_cache.get("vision_imports") or [])
+        if not imports:
+            self.root.ids.vision_result.text = "No bottle photo processed yet."
+            return
+        latest = imports[-1]
+        risk_score = max(0.0, min(100.0, safe_float(latest.get("risk_score"))))
+        risk_level = normalized_risk_level_text(latest.get("risk_level") or "", risk_score)
+        risk_summary = sanitize_text(latest.get("risk_summary") or "", max_chars=220)
+        lines = [
+            f"Imported from: {sanitize_text(latest.get('image_name') or 'photo', max_chars=120)}",
+            sanitize_text(latest.get("summary") or "Schedule imported.", max_chars=300),
+        ]
+        if risk_score > 0 or risk_summary:
+            lines.append(f"Review risk: {risk_level} • {risk_score:.0f}/100")
+            if risk_summary:
+                lines.append(f"Risk note: {risk_summary}")
+        lines.append(format_timestamp(safe_float(latest.get("timestamp"))))
+        self.root.ids.vision_result.text = "\n".join(lines)
+
+    def refresh_dental_ui(self) -> None:
+        now = time.time()
+        hygiene = dict(self.data_cache.get("dental_hygiene") or dental_hygiene_defaults())
+        brush = habit_due_status(safe_float(hygiene.get("last_brush_ts")), safe_float(hygiene.get("brush_interval_hours")) or 12.0, now)
+        floss = habit_due_status(safe_float(hygiene.get("last_floss_ts")), safe_float(hygiene.get("floss_interval_hours")) or 24.0, now)
+        rinse = habit_due_status(safe_float(hygiene.get("last_rinse_ts")), safe_float(hygiene.get("rinse_interval_hours")) or 24.0, now)
+        overview_title, overview_body = build_dental_overview(
+            hygiene,
+            dict(self.data_cache.get("dental_recovery") or dental_recovery_defaults()),
+            now,
+        )
+        self.root.ids.dental_overview_title.text = overview_title
+        self.root.ids.dental_overview_body.text = overview_body
+        for prefix, status, interval in (
+            ("brush", brush, safe_float(hygiene.get("brush_interval_hours")) or 12.0),
+            ("floss", floss, safe_float(hygiene.get("floss_interval_hours")) or 24.0),
+            ("rinse", rinse, safe_float(hygiene.get("rinse_interval_hours")) or 24.0),
+        ):
+            title_color, caption_color = habit_palette(status)
+            self.root.ids[f"dental_{prefix}_status"].text = status["state"]
+            self.root.ids[f"dental_{prefix}_status"].text_color = title_color
+            self.root.ids[f"dental_{prefix}_caption"].text = f"{status['text']} • every {interval:g}h"
+            self.root.ids[f"dental_{prefix}_caption"].text_color = caption_color
+        self.set_field_text("dental_brush_interval", f"{safe_float(hygiene.get('brush_interval_hours')):g}")
+        self.set_field_text("dental_floss_interval", f"{safe_float(hygiene.get('floss_interval_hours')):g}")
+        self.set_field_text("dental_rinse_interval", f"{safe_float(hygiene.get('rinse_interval_hours')):g}")
+        self.root.ids.dental_hygiene_photo.text = f"Last hygiene photo: {sanitize_text(hygiene.get('latest_photo') or 'none', max_chars=120)}"
+        if hygiene.get("latest_rating"):
+            rating_color = score_palette(safe_float(hygiene.get("latest_score")))
+            hygiene_history = list(hygiene.get("history") or [])
+            latest_hygiene_review = hygiene_history[-1] if hygiene_history else {}
+            self.root.ids.dental_hygiene_rating.text = (
+                f"{sanitize_text(hygiene.get('latest_rating') or '', max_chars=80)} • {safe_float(hygiene.get('latest_score')):.0f}/100"
+            )
+            self.root.ids.dental_hygiene_rating.text_color = rating_color
+            warning = sanitize_text(hygiene.get("latest_warning_flags") or "None flagged", max_chars=220)
+            confidence = max(0.0, min(1.0, safe_float(latest_hygiene_review.get("confidence"))))
+            risk_score = max(0.0, min(100.0, safe_float(hygiene.get("latest_risk_score"))))
+            risk_level = normalized_risk_level_text(hygiene.get("latest_risk_level") or "", risk_score)
+            risk_summary = sanitize_text(hygiene.get("latest_risk_summary") or "", max_chars=220)
+            trend_text = f"Trend: {score_change_text(hygiene_history)} AI confidence {confidence:.2f}."
+            if risk_score > 0 or risk_summary:
+                trend_text += f" Risk: {risk_level} {risk_score:.0f}/100."
+            self.root.ids.dental_hygiene_trend.text = trend_text
+            summary_lines = [
+                sanitize_text(hygiene.get("latest_summary") or "", max_chars=280),
+                f"Suggestions: {sanitize_text(hygiene.get('latest_suggestions') or '', max_chars=320)}",
+            ]
+            if risk_score > 0 or risk_summary:
+                summary_lines.append(
+                    f"Risk: {risk_level} • {risk_score:.0f}/100 • "
+                    f"{risk_summary or 'Use the photo and your symptoms together before acting.'}"
+                )
+            summary_lines.extend(
+                [
+                    f"Warnings: {warning}",
+                    build_dental_hygiene_history_text(hygiene),
+                ]
+            )
+            self.root.ids.dental_hygiene_summary.text = "\n".join(summary_lines)
+        else:
+            self.root.ids.dental_hygiene_rating.text = "No hygiene rating yet."
+            self.root.ids.dental_hygiene_rating.text_color = (0.96, 0.99, 0.98, 1)
+            self.root.ids.dental_hygiene_trend.text = "Trend: take two AI reviews over time to compare your hygiene rhythm."
+            self.root.ids.dental_hygiene_summary.text = "Take a photo for a cleanliness score, visible-sign review, and gentle brushing/flossing suggestions."
+        if hygiene.get("latest_timestamp") and hygiene.get("latest_rating"):
+            self.root.ids.dental_hygiene_status.text = (
+                f"Latest review: {sanitize_text(hygiene.get('latest_rating') or '', max_chars=80)} • "
+                f"{format_timestamp(safe_float(hygiene.get('latest_timestamp')))}"
+            )
+        else:
+            self.root.ids.dental_hygiene_status.text = "Ready for a teeth photo."
+
+        recovery = dict(self.data_cache.get("dental_recovery") or dental_recovery_defaults())
+        self.set_field_text("recovery_procedure_type", sanitize_text(recovery.get("procedure_type") or "", max_chars=120))
+        self.set_field_text("recovery_procedure_date", sanitize_text(recovery.get("procedure_date") or "", max_chars=20))
+        self.set_field_text("recovery_symptom_notes", sanitize_text(recovery.get("symptom_notes") or "", max_chars=600))
+        self.set_field_text("recovery_care_notes", sanitize_text(recovery.get("care_notes") or "", max_chars=600))
+        self.root.ids.recovery_last_photo.text = f"Last recovery photo: {sanitize_text(recovery.get('latest_photo') or 'none', max_chars=120)}"
+        day_count = days_since_date_string(str(recovery.get("procedure_date") or ""))
+        if recovery.get("enabled"):
+            day_text = f"Day {day_count + 1}" if day_count is not None else "Day unknown"
+            self.root.ids.recovery_mode_status.text = (
+                f"{sanitize_text(recovery.get('procedure_type') or 'Recovery mode', max_chars=120)} • {day_text}"
+            )
+            self.root.ids.recovery_mode_status.text_color = score_palette(safe_float(recovery.get("latest_score") or 70.0))
+            score_hint = f" Latest AI recovery score: {safe_float(recovery.get('latest_score')):.0f}/100." if safe_float(recovery.get("latest_score")) else ""
+            self.root.ids.recovery_snapshot.text = (
+                f"Daily journal active. {score_change_text(list(recovery.get('daily_logs') or []))}{score_hint}"
+            )
+        else:
+            self.root.ids.recovery_mode_status.text = "Recovery mode is off."
+            self.root.ids.recovery_mode_status.text_color = (0.67, 0.80, 0.78, 1)
+            self.root.ids.recovery_snapshot.text = "Set a procedure type and date to start a daily recovery journal."
+        if recovery.get("latest_status"):
+            recovery_logs = list(recovery.get("daily_logs") or [])
+            latest_recovery_log = recovery_logs[-1] if recovery_logs else {}
+            warning = sanitize_text(recovery.get("latest_warning_flags") or "None flagged", max_chars=260)
+            confidence = max(0.0, min(1.0, safe_float(latest_recovery_log.get("confidence"))))
+            risk_score = max(0.0, min(100.0, safe_float(recovery.get("latest_risk_score"))))
+            risk_level = normalized_risk_level_text(recovery.get("latest_risk_level") or "", risk_score)
+            risk_summary = sanitize_text(recovery.get("latest_risk_summary") or "", max_chars=240)
+            result_lines = [
+                f"{sanitize_text(recovery.get('latest_status') or '', max_chars=120)} • {safe_float(recovery.get('latest_score')):.0f}/100",
+                sanitize_text(recovery.get("latest_summary") or "", max_chars=320),
+                f"Suggestions: {sanitize_text(recovery.get('latest_advice') or '', max_chars=360)}",
+            ]
+            if risk_score > 0 or risk_summary:
+                result_lines.append(
+                    f"Risk: {risk_level} • {risk_score:.0f}/100 • "
+                    f"{risk_summary or 'Use the image and symptoms together before deciding next steps.'}"
+                )
+            result_lines.extend(
+                [
+                    f"Warnings: {warning}",
+                    f"AI confidence: {confidence:.2f}",
+                    build_recovery_history_text(recovery),
+                ]
+            )
+            self.root.ids.recovery_result.text = "\n".join(result_lines)
+        else:
+            self.root.ids.recovery_result.text = "Recovery suggestions here stay general and should never replace your dentist's instructions."
+
+    def model_state_summary(self) -> str:
+        if not self.paths:
+            return "Storage not ready."
+        plain_exists = self.paths.plain_model_path.exists()
+        encrypted_exists = self.paths.encrypted_model_path.exists()
+        encrypted_size = human_size(self.paths.encrypted_model_path.stat().st_size) if encrypted_exists else "0B"
+        plain_size = human_size(self.paths.plain_model_path.stat().st_size) if plain_exists else "0B"
+        return (
+            f"Encrypted model: {'yes' if encrypted_exists else 'no'} ({encrypted_size})\n"
+            f"Plain copy: {'yes' if plain_exists else 'no'} ({plain_size})\n"
+            f"Model file: {MODEL_FILE}"
+        )
+
+    def refresh_model_status(self) -> None:
+        settings = load_settings(self.paths) if self.paths else dict(DEFAULT_SETTINGS)
+        self.settings_data = settings
+        backend = settings.get("inference_backend", "Auto")
+        auto_selected = settings.get("auto_selected_inference_backend", "")
+        if backend != "Auto":
+            backend_note = backend
+        else:
+            auto_hint = auto_selected
+            if not auto_hint:
+                try:
+                    auto_hint = choose_auto_inference_backend_name()
+                except Exception:
+                    auto_hint = "pending"
+            backend_note = f"Auto ({auto_hint})"
+        image_state = "on" if settings.get("enable_native_image_input", True) else "off"
+        self.root.ids.model_status.text = self.model_state_summary()
+        self.root.ids.model_backend_label.text = f"Backend: {backend_note} • Native image input: {image_state}"
+        self.root.ids.dashboard_model_state.text = f"Model: {'ready' if self.paths and self.paths.encrypted_model_path.exists() else 'not downloaded'} • Vision {image_state}"
+
+    def reset_form_fields(self) -> None:
+        self.root.ids.med_name.text = ""
+        self.root.ids.dose_mg.text = ""
+        self.root.ids.interval_h.text = ""
+        self.root.ids.max_daily.text = ""
+        self.root.ids.schedule_text.text = ""
+        self.root.ids.med_notes.text = ""
+        self.root.ids.form_selection.text = "Creating a new medication"
+        self.root.ids.form_schedule_preview.text = "Saved schedules appear below."
+
+    def select_med(self, med_id: str) -> None:
+        self.selected_med_id = med_id
+        self.refresh_ui()
+
+    def on_new_med(self) -> None:
+        self.selected_med_id = None
+        self.reset_form_fields()
+        self.set_status("Ready to add a new medication.")
+        self.refresh_dashboard()
+
+    def on_save_med(self) -> None:
+        name = sanitize_text(self.root.ids.med_name.text, max_chars=120)
+        if not name:
+            self.set_status("Enter a medication name first.")
+            return
+        dose_mg = max(0.0, safe_float(self.root.ids.dose_mg.text))
+        interval_hours = max(0.0, safe_float(self.root.ids.interval_h.text))
+        max_daily_mg = max(0.0, safe_float(self.root.ids.max_daily.text))
+        schedule_text = sanitize_text(self.root.ids.schedule_text.text, max_chars=240)
+        notes = sanitize_text(self.root.ids.med_notes.text, max_chars=500)
+
+        meds = list(self.data_cache.get("meds") or [])
+        med = self.current_selected_med()
+        if med is None:
+            med = {
+                "id": uuid.uuid4().hex[:12],
+                "name": name,
+                "dose_mg": dose_mg,
+                "interval_hours": interval_hours,
+                "max_daily_mg": max_daily_mg,
+                "schedule_text": schedule_text,
+                "notes": notes,
+                "source": "manual",
+                "source_photo": "",
+                "last_taken_ts": 0.0,
+                "history": [],
+            }
+            meds.append(med)
+            self.selected_med_id = med["id"]
+        else:
+            med["name"] = name
+            med["dose_mg"] = dose_mg
+            med["interval_hours"] = interval_hours
+            med["max_daily_mg"] = max_daily_mg
+            med["schedule_text"] = schedule_text
+            med["notes"] = notes
+
+        self.data_cache["meds"] = meds
+        self.save_data()
+        self.last_check_level = "Medium"
+        self.last_check_display = "Schedule saved"
+        self.last_check_message = f"{name} was saved to the encrypted schedule vault."
+        self.refresh_ui()
+        self.set_status(f"Saved {name}.")
+
+    def on_delete_med(self) -> None:
+        med = self.current_selected_med()
+        if not med:
+            self.set_status("Select a medication first.")
+            return
+        name = sanitize_text(med.get("name"), max_chars=120)
+        self.data_cache["meds"] = [item for item in self.data_cache.get("meds", []) or [] if str(item.get("id")) != self.selected_med_id]
+        self.selected_med_id = None
+        self.save_data()
+        self.reset_form_fields()
+        self.last_check_level = "Medium"
+        self.last_check_display = "Medication removed"
+        self.last_check_message = f"{name} was removed from the local schedule."
+        self.refresh_ui()
+        self.set_status(f"Deleted {name}.")
+
+    def on_log_dose(self) -> None:
+        med = self.current_selected_med()
+        if not med:
+            self.set_status("Select a medication before logging a dose.")
+            return
+        dose_value = max(0.0, safe_float(self.root.ids.dose_mg.text) or safe_float(med.get("dose_mg")))
+        now = time.time()
+        label, message = dose_safety_level(med, dose_value, now)
+        med["history"] = list(med.get("history") or []) + [[now, dose_value]]
+        med["history"] = med["history"][-240:]
+        med["last_taken_ts"] = now
+        if dose_value > 0:
+            med["dose_mg"] = dose_value
+        self.save_data()
+        self.last_check_level = label
+        self.last_check_display = label
+        self.last_check_message = message
+        self.refresh_ui()
+        self.set_status(message)
+        if label == "High":
+            self.show_dialog("High Safety Flag", message)
+
+    def on_log_dental_habit(self, habit: str) -> None:
+        hygiene = dict(self.data_cache.get("dental_hygiene") or dental_hygiene_defaults())
+        now = time.time()
+        habit_key = {
+            "brush": "last_brush_ts",
+            "floss": "last_floss_ts",
+            "rinse": "last_rinse_ts",
+        }.get(habit)
+        if not habit_key:
+            return
+        hygiene[habit_key] = now
+        self.data_cache["dental_hygiene"] = hygiene
+        self.save_data()
+        self.refresh_dental_ui()
+        self.set_status(f"Logged dental {habit} routine.")
+
+    def on_save_dental_intervals(self) -> None:
+        hygiene = dict(self.data_cache.get("dental_hygiene") or dental_hygiene_defaults())
+        values = {
+            "brush_interval_hours": max(1.0, safe_float(self.root.ids.dental_brush_interval.text) or safe_float(hygiene.get("brush_interval_hours")) or 12.0),
+            "floss_interval_hours": max(1.0, safe_float(self.root.ids.dental_floss_interval.text) or safe_float(hygiene.get("floss_interval_hours")) or 24.0),
+            "rinse_interval_hours": max(1.0, safe_float(self.root.ids.dental_rinse_interval.text) or safe_float(hygiene.get("rinse_interval_hours")) or 24.0),
+        }
+        hygiene.update(values)
+        self.data_cache["dental_hygiene"] = hygiene
+        self.save_data()
+        self.set_field_text("dental_brush_interval", f"{values['brush_interval_hours']:g}", force=True)
+        self.set_field_text("dental_floss_interval", f"{values['floss_interval_hours']:g}", force=True)
+        self.set_field_text("dental_rinse_interval", f"{values['rinse_interval_hours']:g}", force=True)
+        self.refresh_dental_ui()
+        self.set_status("Dental reminder rhythm saved.")
+
+    def on_reset_dental_intervals(self) -> None:
+        hygiene = dict(self.data_cache.get("dental_hygiene") or dental_hygiene_defaults())
+        defaults = dental_hygiene_defaults()
+        hygiene["brush_interval_hours"] = defaults["brush_interval_hours"]
+        hygiene["floss_interval_hours"] = defaults["floss_interval_hours"]
+        hygiene["rinse_interval_hours"] = defaults["rinse_interval_hours"]
+        self.data_cache["dental_hygiene"] = hygiene
+        self.save_data()
+        self.set_field_text("dental_brush_interval", f"{defaults['brush_interval_hours']:g}", force=True)
+        self.set_field_text("dental_floss_interval", f"{defaults['floss_interval_hours']:g}", force=True)
+        self.set_field_text("dental_rinse_interval", f"{defaults['rinse_interval_hours']:g}", force=True)
+        self.refresh_dental_ui()
+        self.set_status("Dental reminder rhythm reset to defaults.")
+
+    def recovery_state_from_form(self) -> Dict[str, Any]:
+        return {
+            "enabled": True,
+            "procedure_type": sanitize_text(self.root.ids.recovery_procedure_type.text, max_chars=120),
+            "procedure_date": sanitize_text(self.root.ids.recovery_procedure_date.text, max_chars=20),
+            "symptom_notes": sanitize_text(self.root.ids.recovery_symptom_notes.text, max_chars=600),
+            "care_notes": sanitize_text(self.root.ids.recovery_care_notes.text, max_chars=600),
+        }
+
+    def on_save_recovery_mode(self) -> None:
+        recovery = dict(self.data_cache.get("dental_recovery") or dental_recovery_defaults())
+        form_state = self.recovery_state_from_form()
+        if not form_state["procedure_type"]:
+            self.set_status("Enter the dental procedure before enabling recovery mode.")
+            return
+        if form_state["procedure_date"] and parse_date_string(form_state["procedure_date"]) is None:
+            self.set_status("Use YYYY-MM-DD for the procedure date.")
+            return
+        recovery.update(form_state)
+        self.data_cache["dental_recovery"] = recovery
+        self.save_data()
+        self.refresh_dental_ui()
+        self.set_status("Dental recovery mode saved.")
+
+    def on_pause_recovery_mode(self) -> None:
+        recovery = dict(self.data_cache.get("dental_recovery") or dental_recovery_defaults())
+        recovery["enabled"] = False
+        self.data_cache["dental_recovery"] = recovery
+        self.save_data()
+        self.refresh_dental_ui()
+        self.set_status("Dental recovery mode paused.")
+
+    def _capture_photo(
+        self,
+        prefix: str,
+        opening_status: str,
+        on_ready: Callable[[Path], None],
+        on_failure: Callable[[str], None],
+    ) -> None:
+        if not self.paths:
+            return
+        if plyer_camera is None:
+            on_failure("Camera support is unavailable on this platform. Use an existing photo on a device build.")
+            return
+        target = self.paths.media_dir / f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}.jpg"
+        self.set_status(opening_status)
+
+        def on_complete(path_text: str) -> None:
+            if not path_text:
+                Clock.schedule_once(lambda _dt: on_failure("Camera did not return a saved image."), 0)
+                return
+            Clock.schedule_once(lambda _dt: on_ready(Path(path_text)), 0)
+
+        try:
+            plyer_camera.take_picture(filename=str(target), on_complete=on_complete)
+        except Exception as exc:
+            on_failure(str(exc))
+
+    def _pick_photo(
+        self,
+        choose_status: str,
+        on_ready: Callable[[Path], None],
+        on_failure: Callable[[str], None],
+    ) -> None:
+        if plyer_filechooser is None:
+            on_failure("File chooser support is unavailable on this platform.")
+            return
+        self.set_status(choose_status)
+
+        def on_selection(selection: List[str]) -> None:
+            if not selection:
+                Clock.schedule_once(lambda _dt: self.set_status("Photo selection cancelled."), 0)
+                return
+            Clock.schedule_once(lambda _dt: on_ready(Path(selection[0])), 0)
+
+        try:
+            plyer_filechooser.open_file(
+                on_selection=on_selection,
+                filters=[("Images", "*.jpg;*.jpeg;*.png;*.webp")],
+            )
+        except Exception as exc:
+            on_failure(str(exc))
+
+    def append_assistant_message(self, role: str, content: str) -> None:
+        history = list(self.data_cache.get("assistant_history") or [])
+        history.append({"role": role, "content": sanitize_text(content, max_chars=3000), "timestamp": time.time()})
+        self.data_cache["assistant_history"] = history[-24:]
+        self.save_data()
+        self.refresh_assistant_history()
+
+    def on_assistant_send(self) -> None:
+        prompt = sanitize_text(self.root.ids.assistant_input.text, max_chars=1600)
+        if not prompt:
+            return
+        if not self.vault:
+            return
+        self.root.ids.assistant_input.text = ""
+        self.append_assistant_message("user", prompt)
+        self.set_status("Thinking with Gemma 4...")
+
+        snapshot = ensure_vault_shape(json.loads(json.dumps(self.data_cache)))
+        settings = dict(self.settings_data)
+        key = self.vault.get_or_create_key()
+
+        def worker():
+            try:
+                reply = run_assistant_request(key, snapshot, prompt, self.selected_med_id, settings)
+            except Exception as exc:
+                reply = f"Assistant unavailable: {exc}"
+            Clock.schedule_once(lambda _dt: self._assistant_done(reply), 0)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _assistant_done(self, reply: str) -> None:
+        self.append_assistant_message("assistant", reply)
+        self.set_status("Assistant reply ready.")
+
+    def on_assistant_clear(self) -> None:
+        self.data_cache["assistant_history"] = []
+        self.save_data()
+        self.refresh_assistant_history()
+        self.set_status("Assistant chat cleared.")
+
+    def _start_image_analysis(self, image_path: Path) -> None:
+        if not self.vault:
+            return
+        self.root.ids.vision_last_file.text = f"Last image: {image_path.name}"
+        self.root.ids.vision_status.text = "Reading bottle photo with Gemma 4..."
+        self.set_status("Importing medication from photo...")
+        key = self.vault.get_or_create_key()
+        settings = dict(self.settings_data)
+
+        def worker():
+            try:
+                payload, raw = analyze_medication_image(key, image_path, settings)
+                updated, med_id, created = apply_vision_payload(self.data_cache, payload, selected_med_id=self.selected_med_id)
+                Clock.schedule_once(lambda _dt: self._vision_done(updated, med_id, payload, created, raw), 0)
+            except Exception as exc:
+                Clock.schedule_once(lambda _dt: self._vision_failed(str(exc)), 0)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _vision_done(self, updated: Dict[str, Any], med_id: str, payload: Dict[str, Any], created: bool, raw: str) -> None:
+        self.data_cache = ensure_vault_shape(updated)
+        self.selected_med_id = med_id
+        self.save_data()
+        action = "Added" if created else "Updated"
+        confidence = payload.get("confidence", 0.0)
+        self.root.ids.vision_status.text = f"{action} {payload['name']} from the bottle photo."
+        self.root.ids.vision_result.text = (
+            f"{action} {payload['name']}\n"
+            f"Dose: {payload['dose_mg']:g} mg\n"
+            f"Interval: {payload['interval_hours']:g} hours\n"
+            f"Max daily: {payload['max_daily_mg']:g} mg\n"
+            f"Directions: {payload['schedule_text']}\n"
+            f"Notes: {payload['notes'] or 'None'}\n"
+            f"Review risk: {payload['risk_level']} • {payload['risk_score']:.0f}/100\n"
+            f"Risk note: {payload['risk_summary'] or 'Review the label manually before relying on the import.'}\n"
+            f"Confidence: {confidence:.2f}\n"
+            f"Model raw: {sanitize_text(raw, max_chars=420)}"
+        )
+        self.last_check_level = payload["risk_level"]
+        self.last_check_display = f"Bottle review risk: {payload['risk_level']}"
+        self.last_check_message = payload["risk_summary"] or f"{payload['name']} was saved from the bottle photo."
+        self.refresh_ui()
+        self.set_status(f"{action} {payload['name']} from the bottle photo.")
+        if payload["risk_level"] == "High":
+            self.show_dialog(
+                "Bottle Photo Needs Review",
+                "The quantum-assisted bottle import marked this photo as high review risk.\n\n"
+                + sanitize_text(payload.get("risk_summary") or "", max_chars=320),
+            )
+
+    def _vision_failed(self, message: str) -> None:
+        self.root.ids.vision_status.text = f"Import failed: {sanitize_text(message, max_chars=200)}"
+        self.set_status("Bottle photo import failed.")
+        self.show_dialog("Bottle Photo Import Failed", message)
+
+    def on_take_bottle_photo(self) -> None:
+        self.root.ids.vision_status.text = "Opening camera..."
+        self._capture_photo(
+            "pill",
+            "Opening camera for bottle photo...",
+            self._start_image_analysis,
+            self._vision_failed,
+        )
+
+    def on_pick_bottle_photo(self) -> None:
+        self.root.ids.vision_status.text = "Waiting for image selection..."
+        self._pick_photo(
+            "Choose a medicine bottle photo...",
+            self._start_image_analysis,
+            self._vision_failed,
+        )
+
+    def _dental_hygiene_failed(self, message: str) -> None:
+        self.root.ids.dental_hygiene_status.text = f"Review failed: {sanitize_text(message, max_chars=220)}"
+        self.set_status("Dental hygiene review failed.")
+        self.show_dialog("Dental Hygiene Review Failed", message)
+
+    def _start_dental_hygiene_analysis(self, image_path: Path) -> None:
+        if not self.vault:
+            return
+        self.root.ids.dental_hygiene_photo.text = f"Last hygiene photo: {image_path.name}"
+        self.root.ids.dental_hygiene_status.text = "Reviewing hygiene photo with Gemma 4..."
+        self.set_status("Reviewing dental hygiene photo...")
+        key = self.vault.get_or_create_key()
+        settings = dict(self.settings_data)
+
+        def worker():
+            try:
+                payload, raw = analyze_dental_hygiene_image(key, image_path, settings)
+                updated = apply_dental_hygiene_payload(self.data_cache, payload)
+                Clock.schedule_once(lambda _dt: self._dental_hygiene_done(updated, payload, raw), 0)
+            except Exception as exc:
+                Clock.schedule_once(lambda _dt: self._dental_hygiene_failed(str(exc)), 0)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _dental_hygiene_done(self, updated: Dict[str, Any], payload: Dict[str, Any], raw: str) -> None:
+        self.data_cache = ensure_vault_shape(updated)
+        self.save_data()
+        _ = raw
+        self.last_check_level = payload["risk_level"]
+        self.last_check_display = f"Dental hygiene risk: {payload['risk_level']}"
+        self.last_check_message = payload["risk_summary"] or f"{payload['rating']} hygiene rating saved in the encrypted dental journal."
+        self.refresh_dental_ui()
+        self.set_status("Dental hygiene review saved.")
+        if payload["risk_level"] == "High" or warning_text_needs_attention(payload.get("warning_flags", "")):
+            self.show_dialog(
+                "Dental Hygiene Attention Flag",
+                "The vision review noticed something worth checking more closely.\n\n"
+                + sanitize_text(
+                    payload.get("risk_summary") or payload.get("warning_flags") or "",
+                    max_chars=320,
+                ),
+            )
+
+    def on_take_dental_hygiene_photo(self) -> None:
+        self.root.ids.dental_hygiene_status.text = "Opening camera..."
+        self._capture_photo(
+            "dental_hygiene",
+            "Opening camera for a dental hygiene photo...",
+            self._start_dental_hygiene_analysis,
+            self._dental_hygiene_failed,
+        )
+
+    def on_pick_dental_hygiene_photo(self) -> None:
+        self.root.ids.dental_hygiene_status.text = "Waiting for image selection..."
+        self._pick_photo(
+            "Choose a teeth or mouth photo...",
+            self._start_dental_hygiene_analysis,
+            self._dental_hygiene_failed,
+        )
+
+    def _recovery_failed(self, message: str) -> None:
+        self.root.ids.recovery_mode_status.text = f"Review failed: {sanitize_text(message, max_chars=220)}"
+        self.set_status("Dental recovery review failed.")
+        self.show_dialog("Dental Recovery Review Failed", message)
+
+    def _start_recovery_analysis(self, image_path: Path) -> None:
+        if not self.vault:
+            return
+        recovery_state = self.recovery_state_from_form()
+        if not recovery_state["procedure_type"]:
+            self._recovery_failed("Enter the procedure type before running recovery mode.")
+            return
+        if recovery_state["procedure_date"] and parse_date_string(recovery_state["procedure_date"]) is None:
+            self._recovery_failed("Use YYYY-MM-DD for the procedure date before running recovery mode.")
+            return
+        self.root.ids.recovery_last_photo.text = f"Last recovery photo: {image_path.name}"
+        self.root.ids.recovery_mode_status.text = "Reviewing recovery photo with Gemma 4..."
+        self.set_status("Reviewing dental recovery photo...")
+        key = self.vault.get_or_create_key()
+        settings = dict(self.settings_data)
+
+        def worker():
+            try:
+                payload, raw = analyze_dental_recovery_image(key, image_path, settings, recovery_state)
+                updated = apply_dental_recovery_payload(self.data_cache, payload, recovery_state)
+                Clock.schedule_once(lambda _dt: self._recovery_done(updated, payload, raw), 0)
+            except Exception as exc:
+                Clock.schedule_once(lambda _dt: self._recovery_failed(str(exc)), 0)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _recovery_done(self, updated: Dict[str, Any], payload: Dict[str, Any], raw: str) -> None:
+        self.data_cache = ensure_vault_shape(updated)
+        self.save_data()
+        _ = raw
+        self.last_check_level = payload["risk_level"]
+        self.last_check_display = f"Recovery risk: {payload['risk_level']}"
+        self.last_check_message = payload["risk_summary"] or (
+            "General aftercare suggestions were saved. This is not a diagnosis and does not replace your dentist."
+        )
+        self.refresh_dental_ui()
+        self.set_status("Dental recovery review saved.")
+        if payload["risk_level"] == "High" or warning_text_needs_attention(payload.get("warning_flags", "")):
+            self.show_dialog(
+                "Dental Recovery Attention Flag",
+                "The vision review noticed a recovery warning that may deserve a dentist check.\n\n"
+                + sanitize_text(
+                    payload.get("risk_summary") or payload.get("warning_flags") or "",
+                    max_chars=320,
+                ),
+            )
+
+    def on_take_recovery_photo(self) -> None:
+        self.root.ids.recovery_mode_status.text = "Opening camera..."
+        self._capture_photo(
+            "dental_recovery",
+            "Opening camera for a dental recovery check-in...",
+            self._start_recovery_analysis,
+            self._recovery_failed,
+        )
+
+    def on_pick_recovery_photo(self) -> None:
+        self.root.ids.recovery_mode_status.text = "Waiting for image selection..."
+        self._pick_photo(
+            "Choose a recovery check-in photo...",
+            self._start_recovery_analysis,
+            self._recovery_failed,
+        )
+
+    def _run_model_task(self, worker: Callable[[], Any], on_done: Callable[[Any], None], failure_title: str) -> None:
+        def runner():
+            try:
+                result = worker()
+                Clock.schedule_once(lambda _dt: on_done(result), 0)
+            except Exception as exc:
+                Clock.schedule_once(lambda _dt: self._model_task_failed(failure_title, str(exc)), 0)
+
+        threading.Thread(target=runner, daemon=True).start()
+
+    def _model_task_failed(self, title: str, message: str) -> None:
+        self.root.ids.model_progress.value = 0
+        self.set_status(message)
+        self.show_dialog(title, message)
+        self.refresh_model_status()
+
+    def on_model_download(self) -> None:
+        if not self.vault:
+            return
+        self.root.ids.model_progress.value = 0
+        self.set_status("Downloading Gemma 4...")
+        key = self.vault.get_or_create_key()
+
+        def worker():
+            def reporter(kind: str, payload: Any) -> None:
+                if kind == "progress":
+                    Clock.schedule_once(lambda _dt, value=float(payload): setattr(self.root.ids.model_progress, "value", int(value * 100)), 0)
+                elif kind == "status":
+                    Clock.schedule_once(lambda _dt, value=sanitize_text(payload, max_chars=180): self.set_status(value), 0)
+
+            return download_and_encrypt_model(key, reporter)
+
+        self._run_model_task(worker, self._model_download_done, "Model Download Failed")
+
+    def _model_download_done(self, sha: str) -> None:
+        self.root.ids.model_progress.value = 100
+        self.set_status("Gemma 4 downloaded and sealed.")
+        self.refresh_model_status()
+        self.show_dialog("Gemma 4 Ready", f"Model sealed successfully.\nSHA-256: {sha}")
+
+    def on_model_verify(self) -> None:
+        if not self.vault:
+            return
+        self.root.ids.model_progress.value = 15
+        self.set_status("Verifying model hash...")
+        key = self.vault.get_or_create_key()
+        self._run_model_task(lambda: verify_model_hash(key), self._model_verify_done, "Model Verification Failed")
+
+    def _model_verify_done(self, result: Tuple[str, bool]) -> None:
+        sha, okay = result
+        self.root.ids.model_progress.value = 100 if okay else 0
+        self.set_status("Model hash verified." if okay else "Model hash mismatch.")
+        self.refresh_model_status()
+        self.show_dialog("Model Verification", f"SHA-256: {sha}\nMatches expected hash: {'yes' if okay else 'no'}")
+
+    def on_cycle_backend(self) -> None:
+        current = self.settings_data.get("inference_backend", "Auto")
+        options = list(INFERENCE_BACKEND_OPTIONS)
+        current_index = options.index(current) if current in options else 0
+        next_value = options[(current_index + 1) % len(options)]
+        save_settings({"inference_backend": next_value}, self.paths)
+        self.settings_data = load_settings(self.paths)
+        self.refresh_model_status()
+        self.set_status(f"Inference backend set to {next_value}.")
+
+    def on_toggle_native_image_input(self) -> None:
+        enabled = not bool(self.settings_data.get("enable_native_image_input", True))
+        save_settings({"enable_native_image_input": enabled}, self.paths)
+        self.settings_data = load_settings(self.paths)
+        self.refresh_model_status()
+        self.set_status(f"Native image input {'enabled' if enabled else 'disabled'}.")
+
+    def on_delete_plain_model(self) -> None:
+        if not self.paths:
+            return
+        safe_cleanup([self.paths.plain_model_path])
+        self.root.ids.model_progress.value = 0
+        self.refresh_model_status()
+        self.set_status("Deleted any leftover plaintext model copy.")
+
+
+DESKTOP_BG = "#0d141b"
+DESKTOP_SURFACE = "#13202a"
+DESKTOP_SURFACE_ALT = "#182633"
+DESKTOP_BORDER = "#243343"
+DESKTOP_TEXT = "#edf3f1"
+DESKTOP_MUTED = "#97abb1"
+DESKTOP_ACCENT = "#11837a"
+DESKTOP_SUCCESS = "#3fb980"
+DESKTOP_WARNING = "#efb54a"
+DESKTOP_DANGER = "#d9646d"
+
+
+def _desktop_hex(color: Union[str, Tuple[float, float, float, float], List[float]]) -> str:
+    if isinstance(color, str):
+        return color
+    if isinstance(color, (tuple, list)) and len(color) >= 3:
+        red = max(0, min(255, int(round(float(color[0]) * 255.0))))
+        green = max(0, min(255, int(round(float(color[1]) * 255.0))))
+        blue = max(0, min(255, int(round(float(color[2]) * 255.0))))
+        return f"#{red:02x}{green:02x}{blue:02x}"
+    return DESKTOP_TEXT
+
+
+class DesktopIdMap(dict):
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        self[name] = value
+
+
+class DesktopWidgetAdapter:
+    def __init__(self, widget: Any, *focus_targets: Any):
+        self.widget = widget
+        self.focus_targets = tuple(target for target in (widget,) + focus_targets if target is not None)
+
+    @property
+    def focus(self) -> bool:
+        focused = self.widget.focus_get()
+        while focused is not None:
+            if focused in self.focus_targets:
+                return True
+            focused = getattr(focused, "master", None)
+        return False
+
+
+class DesktopLabelAdapter(DesktopWidgetAdapter):
+    @property
+    def text(self) -> str:
+        return str(self.widget.cget("text"))
+
+    @text.setter
+    def text(self, value: str) -> None:
+        self.widget.configure(text=sanitize_text(value, max_chars=4000))
+
+    @property
+    def text_color(self) -> str:
+        return str(self.widget.cget("text_color"))
+
+    @text_color.setter
+    def text_color(self, value: Union[str, Tuple[float, float, float, float], List[float]]) -> None:
+        self.widget.configure(text_color=_desktop_hex(value))
+
+
+class DesktopEntryAdapter(DesktopWidgetAdapter):
+    def __init__(self, widget: Any):
+        super().__init__(widget, getattr(widget, "_entry", None))
+
+    @property
+    def text(self) -> str:
+        return str(self.widget.get())
+
+    @text.setter
+    def text(self, value: str) -> None:
+        self.widget.delete(0, tk.END)
+        clean = sanitize_text(value, max_chars=4000)
+        if clean:
+            self.widget.insert(0, clean)
+
+
+class DesktopTextboxAdapter(DesktopWidgetAdapter):
+    def __init__(self, widget: Any, *, readonly: bool = False):
+        super().__init__(widget, getattr(widget, "_textbox", None))
+        self.readonly = readonly
+
+    def _set_state(self, state: str) -> None:
+        try:
+            self.widget.configure(state=state)
+        except Exception:
+            pass
+
+    @property
+    def text(self) -> str:
+        return str(self.widget.get("1.0", "end-1c"))
+
+    @text.setter
+    def text(self, value: str) -> None:
+        if self.readonly:
+            self._set_state("normal")
+        self.widget.delete("1.0", tk.END)
+        clean = sanitize_text(value, max_chars=12000)
+        if clean:
+            self.widget.insert("1.0", clean)
+        if self.readonly:
+            self._set_state("disabled")
+
+
+class DesktopProgressAdapter:
+    def __init__(self, widget: Any):
+        self.widget = widget
+        self._value = 0.0
+
+    @property
+    def value(self) -> float:
+        return self._value
+
+    @value.setter
+    def value(self, value: Union[int, float]) -> None:
+        self._value = max(0.0, min(100.0, float(value)))
+        self.widget.set(self._value / 100.0)
+
+
+class DesktopRiskBadgeAdapter(DesktopLabelAdapter):
+    def set_level(self, level: str) -> None:
+        normalized = sanitize_text(level, max_chars=24).lower()
+        if normalized.startswith("low"):
+            label = "Low"
+            fg = DESKTOP_SUCCESS
+        elif normalized.startswith("high"):
+            label = "High"
+            fg = DESKTOP_DANGER
+        else:
+            label = "Medium"
+            fg = DESKTOP_WARNING
+        self.widget.configure(text=f"Safety {label}", fg_color=fg, text_color="#08110f")
+
+
+@dataclass
+class DesktopListItem:
+    text: str
+    secondary_text: str
+    on_release: Callable[[Any], None]
+
+
+class DesktopListAdapter:
+    def __init__(self, frame: Any):
+        self.frame = frame
+        self.frame.grid_columnconfigure(0, weight=1)
+        self._row = 0
+
+    def clear_widgets(self) -> None:
+        for child in self.frame.winfo_children():
+            child.destroy()
+        self._row = 0
+
+    def add_widget(self, item: DesktopListItem) -> None:
+        card = ctk.CTkFrame(
+            self.frame,
+            fg_color=DESKTOP_SURFACE_ALT,
+            border_width=1,
+            border_color=DESKTOP_BORDER,
+            corner_radius=14,
+        )
+        card.grid(row=self._row, column=0, sticky="ew", pady=(0, 8))
+        card.grid_columnconfigure(0, weight=1)
+
+        button = ctk.CTkButton(
+            card,
+            text=sanitize_text(item.text, max_chars=180),
+            command=lambda callback=item.on_release: callback(None),
+            anchor="w",
+            fg_color="transparent",
+            hover_color="#223443",
+            text_color=DESKTOP_TEXT,
+            corner_radius=10,
+            font=ctk.CTkFont(size=15, weight="bold"),
+            height=36,
+        )
+        button.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 2))
+
+        subtitle = ctk.CTkLabel(
+            card,
+            text=sanitize_text(item.secondary_text, max_chars=280),
+            anchor="w",
+            justify="left",
+            wraplength=420,
+            text_color=DESKTOP_MUTED,
+            font=ctk.CTkFont(size=12),
+        )
+        subtitle.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 10))
+        self._row += 1
+
+
+class DesktopMedSafeApp:
+    def __init__(self) -> None:
+        self.window: Optional[Any] = None
+        self.root = SimpleNamespace(ids=DesktopIdMap())
+        self.ids = self.root.ids
+        self.paths: Optional[AppPaths] = None
+        self.vault: Optional[EncryptedVault] = None
+        self.settings_data: Dict[str, Any] = dict(DEFAULT_SETTINGS)
+        self.data_cache: Dict[str, Any] = vault_defaults()
+        self.selected_med_id: Optional[str] = None
+        self.last_form_med_id: Optional[str] = None
+        self.last_check_level = "Medium"
+        self.last_check_display = "Awaiting check"
+        self.last_check_message = "Log a selected dose to score timing and daily totals."
+        self.main_ui_started = False
+        self.refresh_timer_started = False
+        self.setup_password_var: Optional[tk.BooleanVar] = None
+        self.setup_download_model_var: Optional[tk.BooleanVar] = None
+
+    def build(self) -> None:
+        if ctk is None:
+            detail = f" ({CUSTOMTKINTER_IMPORT_ERROR})" if CUSTOMTKINTER_IMPORT_ERROR else ""
+            raise RuntimeError(f"customtkinter is required for the {desktop_platform_name()} desktop build" + detail)
+
+        ctk.set_appearance_mode("system")
+        ctk.set_default_color_theme("green")
+
+        self.window = ctk.CTk()
+        self.window.title("MedSafe Desktop")
+        screen_width = max(960, int(self.window.winfo_screenwidth() or 1280))
+        screen_height = max(720, int(self.window.winfo_screenheight() or 800))
+        window_width = min(1440, max(960, screen_width - 80))
+        window_height = min(920, max(680, screen_height - 120))
+        origin_x = max(0, (screen_width - window_width) // 2)
+        origin_y = max(0, (screen_height - window_height) // 3)
+        self.window.geometry(f"{window_width}x{window_height}+{origin_x}+{origin_y}")
+        self.window.minsize(min(window_width, 960), min(window_height, 680))
+        self.window.configure(fg_color=DESKTOP_BG)
+        self.window.grid_columnconfigure(0, weight=1)
+        self.window.grid_rowconfigure(1, weight=1)
+        self.window.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        self.paths = set_app_paths(default_storage_root())
+        self.vault = EncryptedVault(self.paths)
+        self.settings_data = load_settings(self.paths)
+        if self.paths and self.vault and existing_app_install(self.paths) and not self.settings_data.get("setup_complete", False):
+            save_settings(
+                {
+                    "setup_complete": True,
+                    "startup_password_enabled": self.vault.is_key_protected(),
+                },
+                self.paths,
+            )
+            self.settings_data = load_settings(self.paths)
+
+        if self.vault and self.vault.is_key_protected():
+            self._build_unlock_flow()
+            return
+        if not self.settings_data.get("setup_complete", False):
+            self._build_first_boot_flow()
+            return
+        self._enter_main_app()
+
+    def run(self) -> None:
+        self.build()
+        if self.window is not None:
+            self.window.mainloop()
+
+    def on_close(self) -> None:
+        if self.vault is not None:
+            self.vault.clear_cached_key()
+        if self.window is not None:
+            self.window.destroy()
+            self.window = None
+
+    def run_on_ui_thread(self, callback: Callable[..., Any], *args: Any, delay_ms: int = 0) -> None:
+        if self.window is None:
+            callback(*args)
+            return
+        self.window.after(max(0, int(delay_ms)), lambda: callback(*args))
+
+    def schedule_interval(self, callback: Callable[[], None], seconds: float) -> None:
+        if self.window is None:
+            return
+        interval_ms = max(1000, int(seconds * 1000))
+
+        def runner() -> None:
+            if self.window is None:
+                return
+            callback()
+            self.window.after(interval_ms, runner)
+
+        self.window.after(interval_ms, runner)
+
+    def _register(self, name: str, adapter: Any) -> Any:
+        self.ids[name] = adapter
+        return adapter
+
+    def _card(self, parent: Any) -> Any:
+        return ctk.CTkFrame(
+            parent,
+            fg_color=DESKTOP_SURFACE,
+            border_width=1,
+            border_color=DESKTOP_BORDER,
+            corner_radius=18,
+        )
+
+    def _readonly_box(self, parent: Any, *, height: int) -> DesktopTextboxAdapter:
+        widget = ctk.CTkTextbox(
+            parent,
+            height=height,
+            fg_color=DESKTOP_SURFACE_ALT,
+            border_width=1,
+            border_color=DESKTOP_BORDER,
+            corner_radius=14,
+            wrap="word",
+            text_color=DESKTOP_TEXT,
+            font=ctk.CTkFont(size=13),
+        )
+        widget.configure(state="disabled")
+        return DesktopTextboxAdapter(widget, readonly=True)
+
+    def _edit_box(self, parent: Any, *, height: int) -> DesktopTextboxAdapter:
+        widget = ctk.CTkTextbox(
+            parent,
+            height=height,
+            fg_color=DESKTOP_SURFACE_ALT,
+            border_width=1,
+            border_color=DESKTOP_BORDER,
+            corner_radius=14,
+            wrap="word",
+            text_color=DESKTOP_TEXT,
+            font=ctk.CTkFont(size=13),
+        )
+        return DesktopTextboxAdapter(widget, readonly=False)
+
+    def _entry(self, parent: Any, *, placeholder: str) -> DesktopEntryAdapter:
+        widget = ctk.CTkEntry(
+            parent,
+            placeholder_text=placeholder,
+            fg_color=DESKTOP_SURFACE_ALT,
+            border_color=DESKTOP_BORDER,
+            text_color=DESKTOP_TEXT,
+            corner_radius=12,
+            height=38,
+        )
+        return DesktopEntryAdapter(widget)
+
+    def _password_entry(self, parent: Any, *, placeholder: str) -> DesktopEntryAdapter:
+        widget = ctk.CTkEntry(
+            parent,
+            placeholder_text=placeholder,
+            show="*",
+            fg_color=DESKTOP_SURFACE_ALT,
+            border_color=DESKTOP_BORDER,
+            text_color=DESKTOP_TEXT,
+            corner_radius=12,
+            height=42,
+        )
+        return DesktopEntryAdapter(widget)
+
+    def _label(self, parent: Any, *, text: str, bold: bool = False, muted: bool = False, wrap: int = 0) -> DesktopLabelAdapter:
+        widget = ctk.CTkLabel(
+            parent,
+            text=text,
+            anchor="w",
+            justify="left",
+            wraplength=wrap,
+            text_color=DESKTOP_MUTED if muted else DESKTOP_TEXT,
+            font=ctk.CTkFont(size=14, weight="bold" if bold else "normal"),
+        )
+        return DesktopLabelAdapter(widget)
+
+    def _button(self, parent: Any, *, text: str, command: Callable[[], None], tone: str = "accent") -> Any:
+        fg_map = {
+            "accent": DESKTOP_ACCENT,
+            "neutral": "#314455",
+            "danger": DESKTOP_DANGER,
+            "warning": "#b8801f",
+        }
+        hover_map = {
+            "accent": "#0d6b63",
+            "neutral": "#42586c",
+            "danger": "#b84e58",
+            "warning": "#936513",
+        }
+        return ctk.CTkButton(
+            parent,
+            text=text,
+            command=command,
+            fg_color=fg_map.get(tone, DESKTOP_ACCENT),
+            hover_color=hover_map.get(tone, "#0d6b63"),
+            corner_radius=12,
+            height=38,
+            text_color=DESKTOP_TEXT,
+        )
+
+    def _reset_ids(self) -> None:
+        self.root = SimpleNamespace(ids=DesktopIdMap())
+        self.ids = self.root.ids
+
+    def _clear_window_content(self) -> None:
+        if self.window is None:
+            return
+        for child in self.window.winfo_children():
+            child.destroy()
+        self._reset_ids()
+        self.window.grid_columnconfigure(0, weight=1)
+
+    def _set_start_screen_status(self, widget_id: str, text: str) -> None:
+        label = self.ids.get(widget_id)
+        if label is not None:
+            label.text = sanitize_text(text, max_chars=260)
+
+    def _save_security_settings(self) -> None:
+        if not self.paths or not self.vault:
+            return
+        save_settings(
+            {
+                "setup_complete": True,
+                "startup_password_enabled": self.vault.is_key_protected(),
+            },
+            self.paths,
+        )
+        self.settings_data = load_settings(self.paths)
+
+    def _sync_setup_password_fields(self) -> None:
+        enabled = bool(self.setup_password_var.get()) if self.setup_password_var is not None else False
+        for widget_id in ("setup_password", "setup_password_confirm"):
+            widget = self.ids.get(widget_id)
+            if widget is None:
+                continue
+            if not enabled:
+                try:
+                    widget.widget.configure(state="normal")
+                except Exception:
+                    pass
+                widget.text = ""
+            try:
+                widget.widget.configure(state="normal" if enabled else "disabled")
+            except Exception:
+                pass
+
+    def _build_first_boot_flow(self) -> None:
+        if self.window is None:
+            return
+        self._clear_window_content()
+        self.window.grid_rowconfigure(0, weight=1)
+        self.window.grid_rowconfigure(1, weight=0)
+
+        shell = ctk.CTkScrollableFrame(
+            self.window,
+            fg_color="transparent",
+            scrollbar_button_color="#314455",
+            scrollbar_button_hover_color="#42586c",
+        )
+        shell.grid(row=0, column=0, sticky="nsew", padx=22, pady=22)
+        shell.grid_columnconfigure(0, weight=1)
+
+        hero = self._card(shell)
+        hero.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        hero.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            hero,
+            text="Welcome to MedSafe Desktop",
+            anchor="w",
+            text_color=DESKTOP_TEXT,
+            font=ctk.CTkFont(size=30, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=22, pady=(22, 8))
+        ctk.CTkLabel(
+            hero,
+            text=(
+                "Let's set up your encrypted medication vault, startup protection, and optional offline Gemma runtime "
+                "before you land in the main dashboard."
+            ),
+            anchor="w",
+            justify="left",
+            wraplength=980,
+            text_color=DESKTOP_MUTED,
+            font=ctk.CTkFont(size=14),
+        ).grid(row=1, column=0, sticky="ew", padx=22, pady=(0, 8))
+        ctk.CTkLabel(
+            hero,
+            text=f"Vault location: {self.paths.root if self.paths else default_storage_root()}",
+            anchor="w",
+            text_color=DESKTOP_MUTED,
+            font=ctk.CTkFont(size=12),
+        ).grid(row=2, column=0, sticky="w", padx=22, pady=(0, 22))
+
+        security = self._card(shell)
+        security.grid(row=1, column=0, sticky="ew", pady=12)
+        security.grid_columnconfigure((0, 1), weight=1)
+        ctk.CTkLabel(
+            security,
+            text="Startup Security",
+            anchor="w",
+            text_color=DESKTOP_TEXT,
+            font=ctk.CTkFont(size=20, weight="bold"),
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=22, pady=(22, 8))
+        ctk.CTkLabel(
+            security,
+            text=(
+                "If you enable a startup password, MedSafe wraps the local encryption key and asks for it "
+                "before opening your vault on future launches."
+            ),
+            anchor="w",
+            justify="left",
+            wraplength=980,
+            text_color=DESKTOP_MUTED,
+            font=ctk.CTkFont(size=13),
+        ).grid(row=1, column=0, columnspan=2, sticky="ew", padx=22, pady=(0, 12))
+
+        self.setup_password_var = tk.BooleanVar(value=False)
+        password_toggle = ctk.CTkCheckBox(
+            security,
+            text="Require a startup password when opening MedSafe",
+            variable=self.setup_password_var,
+            onvalue=True,
+            offvalue=False,
+            command=self._sync_setup_password_fields,
+            fg_color=DESKTOP_ACCENT,
+            hover_color="#0d6b63",
+            border_color=DESKTOP_BORDER,
+            text_color=DESKTOP_TEXT,
+            font=ctk.CTkFont(size=14, weight="bold"),
+        )
+        password_toggle.grid(row=2, column=0, columnspan=2, sticky="w", padx=22, pady=(0, 14))
+
+        password_entry = self._password_entry(security, placeholder="Create startup password")
+        password_entry.widget.grid(row=3, column=0, sticky="ew", padx=(22, 10), pady=(0, 12))
+        self._register("setup_password", password_entry)
+
+        confirm_entry = self._password_entry(security, placeholder="Confirm startup password")
+        confirm_entry.widget.grid(row=3, column=1, sticky="ew", padx=(10, 22), pady=(0, 12))
+        self._register("setup_password_confirm", confirm_entry)
+
+        security_status = self._label(
+            security,
+            text="You can skip the password now and add or rotate security later from the Model tab.",
+            muted=True,
+            wrap=980,
+        )
+        security_status.widget.grid(row=4, column=0, columnspan=2, sticky="ew", padx=22, pady=(0, 22))
+        self._register("setup_status_label", security_status)
+
+        runtime = self._card(shell)
+        runtime.grid(row=2, column=0, sticky="ew", pady=12)
+        runtime.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            runtime,
+            text="Offline Gemma Runtime",
+            anchor="w",
+            text_color=DESKTOP_TEXT,
+            font=ctk.CTkFont(size=20, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=22, pady=(22, 8))
+        ctk.CTkLabel(
+            runtime,
+            text=(
+                "You can download and seal the local LLM during setup so bottle-photo review and assistant tools "
+                "are ready right away, or skip it and do it later."
+            ),
+            anchor="w",
+            justify="left",
+            wraplength=980,
+            text_color=DESKTOP_MUTED,
+            font=ctk.CTkFont(size=13),
+        ).grid(row=1, column=0, sticky="ew", padx=22, pady=(0, 12))
+        self.setup_download_model_var = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            runtime,
+            text="Download Gemma 4 now after setup completes",
+            variable=self.setup_download_model_var,
+            onvalue=True,
+            offvalue=False,
+            fg_color=DESKTOP_ACCENT,
+            hover_color="#0d6b63",
+            border_color=DESKTOP_BORDER,
+            text_color=DESKTOP_TEXT,
+            font=ctk.CTkFont(size=14, weight="bold"),
+        ).grid(row=2, column=0, sticky="w", padx=22, pady=(0, 10))
+        ctk.CTkLabel(
+            runtime,
+            text="The model stays sealed on disk and can still be verified or re-downloaded later from the Model tab.",
+            anchor="w",
+            justify="left",
+            wraplength=980,
+            text_color=DESKTOP_MUTED,
+            font=ctk.CTkFont(size=12),
+        ).grid(row=3, column=0, sticky="ew", padx=22, pady=(0, 22))
+
+        actions = ctk.CTkFrame(shell, fg_color="transparent")
+        actions.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        actions.grid_columnconfigure((0, 1), weight=1)
+        self._button(actions, text="Create Secure Vault", command=self._complete_first_boot).grid(
+            row=0, column=0, sticky="ew", padx=(0, 8)
+        )
+        self._button(actions, text="Open With Defaults", command=lambda: self._complete_first_boot(force_skip_password=True), tone="neutral").grid(
+            row=0, column=1, sticky="ew", padx=(8, 0)
+        )
+
+        self._sync_setup_password_fields()
+
+    def _complete_first_boot(self, force_skip_password: bool = False) -> None:
+        if not self.vault:
+            return
+        use_password = bool(self.setup_password_var.get()) if self.setup_password_var is not None else False
+        if force_skip_password:
+            use_password = False
+        try:
+            if use_password:
+                password = sanitize_text(self.ids.setup_password.text, max_chars=256)
+                confirm = sanitize_text(self.ids.setup_password_confirm.text, max_chars=256)
+                if len(password) < 6:
+                    self._set_start_screen_status("setup_status_label", "Choose a startup password with at least 6 characters.")
+                    return
+                if password != confirm:
+                    self._set_start_screen_status("setup_status_label", "Startup password and confirmation do not match yet.")
+                    return
+                self.vault.get_or_create_key(password=password)
+            else:
+                self.vault.get_or_create_key()
+            self._save_security_settings()
+            download_now = bool(self.setup_download_model_var.get()) if self.setup_download_model_var is not None else False
+            self._enter_main_app(start_model_download=download_now)
+            self.set_status(
+                "Setup complete. Starting Gemma 4 download..." if download_now else "Setup complete. Your local vault is ready."
+            )
+        except Exception as exc:
+            self._set_start_screen_status("setup_status_label", str(exc))
+
+    def _build_unlock_flow(self) -> None:
+        if self.window is None:
+            return
+        self._clear_window_content()
+        self.window.grid_rowconfigure(0, weight=1)
+        self.window.grid_rowconfigure(1, weight=0)
+
+        shell = ctk.CTkFrame(self.window, fg_color="transparent")
+        shell.grid(row=0, column=0, sticky="nsew", padx=24, pady=24)
+        shell.grid_columnconfigure(0, weight=1)
+        shell.grid_rowconfigure(0, weight=1)
+
+        card = self._card(shell)
+        card.grid(row=0, column=0, sticky="n", pady=40)
+        card.grid_columnconfigure(0, weight=1)
+        card.configure(width=720)
+
+        ctk.CTkLabel(
+            card,
+            text="Unlock MedSafe",
+            anchor="w",
+            text_color=DESKTOP_TEXT,
+            font=ctk.CTkFont(size=28, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=24, pady=(24, 8))
+        ctk.CTkLabel(
+            card,
+            text=(
+                "This vault is protected by a startup password. Enter it to unlock your encrypted medication data, "
+                "assistant history, and sealed model tools for this session."
+            ),
+            anchor="w",
+            justify="left",
+            wraplength=620,
+            text_color=DESKTOP_MUTED,
+            font=ctk.CTkFont(size=14),
+        ).grid(row=1, column=0, sticky="ew", padx=24, pady=(0, 10))
+        ctk.CTkLabel(
+            card,
+            text=f"Vault location: {self.paths.root if self.paths else default_storage_root()}",
+            anchor="w",
+            text_color=DESKTOP_MUTED,
+            font=ctk.CTkFont(size=12),
+        ).grid(row=2, column=0, sticky="w", padx=24, pady=(0, 18))
+
+        unlock_entry = self._password_entry(card, placeholder="Enter startup password")
+        unlock_entry.widget.grid(row=3, column=0, sticky="ew", padx=24, pady=(0, 12))
+        self._register("unlock_password", unlock_entry)
+
+        unlock_status = self._label(
+            card,
+            text="Unlock the vault to continue.",
+            muted=True,
+            wrap=620,
+        )
+        unlock_status.widget.grid(row=4, column=0, sticky="ew", padx=24, pady=(0, 18))
+        self._register("unlock_status_label", unlock_status)
+
+        self._button(card, text="Unlock And Open Dashboard", command=self._unlock_startup_password).grid(
+            row=5, column=0, sticky="ew", padx=24, pady=(0, 24)
+        )
+
+    def _unlock_startup_password(self) -> None:
+        if not self.vault:
+            return
+        password = sanitize_text(self.ids.unlock_password.text, max_chars=256)
+        if not password:
+            self._set_start_screen_status("unlock_status_label", "Enter the startup password to unlock this vault.")
+            return
+        try:
+            self.vault.get_or_create_key(password=password, allow_create=False)
+            self._save_security_settings()
+            self._enter_main_app()
+            self.set_status("Vault unlocked for this session.")
+        except Exception:
+            self.ids.unlock_password.text = ""
+            self._set_start_screen_status("unlock_status_label", "That password did not unlock the encrypted vault. Please try again.")
+
+    def _enter_main_app(self, *, start_model_download: bool = False) -> None:
+        if self.window is None:
+            return
+        self._clear_window_content()
+        self.window.grid_rowconfigure(0, weight=0)
+        self.window.grid_rowconfigure(1, weight=1)
+        self._build_layout()
+        self.main_ui_started = True
+        self.refresh_from_disk()
+        if not self.refresh_timer_started:
+            self.schedule_interval(self.refresh_time_sensitive_labels, 60.0)
+            self.refresh_timer_started = True
+        if start_model_download:
+            self.run_on_ui_thread(self.on_model_download, delay_ms=250)
+
+    def _prompt_password(self, title: str, prompt: str) -> Optional[str]:
+        if self.window is None:
+            return None
+        value = simpledialog.askstring(title, prompt, parent=self.window, show="*")
+        if value is None:
+            return None
+        return sanitize_text(value, max_chars=256)
+
+    def _prompt_new_password(self, title: str) -> Optional[str]:
+        first = self._prompt_password(title, "Enter the new startup password:")
+        if first is None:
+            return None
+        second = self._prompt_password(title, "Confirm the new startup password:")
+        if second is None:
+            return None
+        if len(first) < 6:
+            self.show_dialog("Password Too Short", "Use at least 6 characters for the startup password.")
+            return None
+        if first != second:
+            self.show_dialog("Password Mismatch", "The startup password confirmation did not match.")
+            return None
+        return first
+
+    def _build_layout(self) -> None:
+        if self.window is None:
+            return
+
+        header = self._card(self.window)
+        header.grid(row=0, column=0, sticky="ew", padx=18, pady=(18, 10))
+        header.grid_columnconfigure(0, weight=1)
+        header.grid_columnconfigure(1, weight=0)
+
+        title_block = ctk.CTkFrame(header, fg_color="transparent")
+        title_block.grid(row=0, column=0, sticky="ew", padx=18, pady=18)
+        title_block.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            title_block,
+            text="MedSafe Desktop",
+            anchor="w",
+            text_color=DESKTOP_TEXT,
+            font=ctk.CTkFont(size=28, weight="bold"),
+        ).grid(row=0, column=0, sticky="w")
+
+        ctk.CTkLabel(
+            title_block,
+            text=f"Encrypted local vault: {self.paths.root if self.paths else default_storage_root()}",
+            anchor="w",
+            text_color=DESKTOP_MUTED,
+            font=ctk.CTkFont(size=13),
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+
+        status_label = ctk.CTkLabel(
+            title_block,
+            text="Encrypted local scheduler ready.",
+            anchor="w",
+            justify="left",
+            wraplength=860,
+            text_color=DESKTOP_MUTED,
+            font=ctk.CTkFont(size=13),
+        )
+        status_label.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        self._register("status_label", DesktopLabelAdapter(status_label))
+
+        self._button(header, text="Refresh Vault", command=self.refresh_from_disk, tone="neutral").grid(
+            row=0, column=1, sticky="e", padx=18, pady=18
+        )
+
+        tabview = ctk.CTkTabview(
+            self.window,
+            fg_color=DESKTOP_SURFACE,
+            border_width=1,
+            border_color=DESKTOP_BORDER,
+            corner_radius=18,
+            segmented_button_fg_color=DESKTOP_SURFACE_ALT,
+            segmented_button_selected_color=DESKTOP_ACCENT,
+            segmented_button_selected_hover_color="#0d6b63",
+            segmented_button_unselected_hover_color="#223443",
+        )
+        tabview.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 18))
+
+        for tab_name in ("Dashboard", "Medications", "Vision", "Dental", "Exercise", "Assistant", "Settings"):
+            tabview.add(tab_name)
+
+        self._build_dashboard_tab(tabview.tab("Dashboard"))
+        self._build_medications_tab(tabview.tab("Medications"))
+        self._build_vision_tab(tabview.tab("Vision"))
+        self._build_dental_tab(tabview.tab("Dental"))
+        self._build_exercise_tab(tabview.tab("Exercise"))
+        self._build_assistant_tab(tabview.tab("Assistant"))
+        self._build_model_tab(tabview.tab("Settings"))
+
+    def _build_dashboard_tab(self, tab: Any) -> None:
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+
+        scroll = ctk.CTkScrollableFrame(
+            tab,
+            fg_color="transparent",
+            scrollbar_button_color="#314455",
+            scrollbar_button_hover_color="#42586c",
+        )
+        scroll.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
+        scroll.grid_columnconfigure((0, 1), weight=1)
+
+        left = ctk.CTkFrame(scroll, fg_color="transparent")
+        left.grid(row=0, column=0, sticky="nsew", padx=(14, 7), pady=14)
+        left.grid_columnconfigure(0, weight=1)
+
+        risk_card = self._card(left)
+        risk_card.grid(row=0, column=0, sticky="nsew", pady=(0, 7))
+        risk_card.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            risk_card,
+            text="Dose Safety",
+            anchor="w",
+            text_color=DESKTOP_MUTED,
+            font=ctk.CTkFont(size=13),
+        ).grid(row=0, column=0, sticky="w", padx=18, pady=(18, 6))
+
+        risk_badge_widget = ctk.CTkLabel(
+            risk_card,
+            text="Safety Medium",
+            fg_color=DESKTOP_WARNING,
+            text_color="#08110f",
+            corner_radius=18,
+            width=170,
+            height=44,
+            font=ctk.CTkFont(size=17, weight="bold"),
+        )
+        risk_badge_widget.grid(row=1, column=0, sticky="w", padx=18, pady=(0, 12))
+        self._register("dose_wheel", DesktopRiskBadgeAdapter(risk_badge_widget))
+
+        risk_title = self._label(risk_card, text="Awaiting check", bold=True, wrap=420)
+        risk_title.widget.grid(row=2, column=0, sticky="ew", padx=18)
+        self._register("dashboard_risk_title", risk_title)
+
+        risk_caption = self._label(
+            risk_card,
+            text="Log a selected dose to score timing and daily totals.",
+            muted=True,
+            wrap=420,
+        )
+        risk_caption.widget.grid(row=3, column=0, sticky="ew", padx=18, pady=(8, 18))
+        self._register("dashboard_risk_caption", risk_caption)
+
+        summary_card = self._card(left)
+        summary_card.grid(row=1, column=0, sticky="nsew", pady=7)
+        summary_card.grid_columnconfigure(0, weight=1)
+
+        today_due = self._label(summary_card, text="0 due", bold=True, wrap=420)
+        today_due.widget.grid(row=0, column=0, sticky="ew", padx=18, pady=(18, 6))
+        self._register("today_due_count", today_due)
+
+        today_next = self._label(summary_card, text="Nothing scheduled yet", muted=True, wrap=420)
+        today_next.widget.grid(row=1, column=0, sticky="ew", padx=18)
+        self._register("today_next_due", today_next)
+
+        model_state = self._label(summary_card, text="Model: not downloaded", muted=True, wrap=420)
+        model_state.widget.grid(row=2, column=0, sticky="ew", padx=18, pady=(8, 18))
+        self._register("dashboard_model_state", model_state)
+
+        nudge_card = self._card(left)
+        nudge_card.grid(row=2, column=0, sticky="nsew", pady=(7, 0))
+        nudge_card.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(nudge_card, text="Gentle Nudge", anchor="w", text_color=DESKTOP_TEXT, font=ctk.CTkFont(size=18, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=18, pady=(18, 10)
+        )
+        nudge_box = self._readonly_box(nudge_card, height=150)
+        nudge_box.widget.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 18))
+        self._register("dashboard_nudge", nudge_box)
+
+        right = ctk.CTkFrame(scroll, fg_color="transparent")
+        right.grid(row=0, column=1, sticky="nsew", padx=(7, 14), pady=14)
+        right.grid_columnconfigure(0, weight=1)
+
+        timeline_card = self._card(right)
+        timeline_card.grid(row=0, column=0, sticky="nsew", pady=(0, 7))
+        timeline_card.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(timeline_card, text="Today's Timeline", anchor="w", text_color=DESKTOP_TEXT, font=ctk.CTkFont(size=18, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=18, pady=(18, 10)
+        )
+        timeline_box = self._readonly_box(timeline_card, height=150)
+        timeline_box.widget.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 18))
+        self._register("today_timeline", timeline_box)
+
+        selection_card = self._card(right)
+        selection_card.grid(row=1, column=0, sticky="nsew", pady=7)
+        selection_card.grid_columnconfigure(0, weight=1)
+        dashboard_selection = self._label(selection_card, text="Select a medication to log doses.", bold=True, wrap=520)
+        dashboard_selection.widget.grid(row=0, column=0, sticky="ew", padx=18, pady=(18, 10))
+        self._register("dashboard_selection", dashboard_selection)
+        selected_summary = self._readonly_box(selection_card, height=135)
+        selected_summary.widget.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 12))
+        self._register("selected_med_summary", selected_summary)
+        ctk.CTkLabel(selection_card, text="Today's Dose Plan", anchor="w", text_color=DESKTOP_MUTED).grid(
+            row=2, column=0, sticky="w", padx=18
+        )
+        selected_schedule = self._readonly_box(selection_card, height=160)
+        selected_schedule.widget.grid(row=3, column=0, sticky="nsew", padx=18, pady=(6, 18))
+        self._register("selected_med_schedule", selected_schedule)
+
+        checklist_card = self._card(right)
+        checklist_card.grid(row=2, column=0, sticky="nsew", pady=7)
+        checklist_card.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(checklist_card, text="Meds Daily Checklist", anchor="w", text_color=DESKTOP_TEXT, font=ctk.CTkFont(size=18, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=18, pady=(18, 10)
+        )
+        checklist_hint = self._label(checklist_card, text="Check a slot when you take it. Missed slots get an X and elapsed time.", muted=True, wrap=520)
+        checklist_hint.widget.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 10))
+        self._register("daily_checklist_hint", checklist_hint)
+        checklist_frame = ctk.CTkScrollableFrame(
+            checklist_card,
+            fg_color=DESKTOP_SURFACE_ALT,
+            border_width=1,
+            border_color=DESKTOP_BORDER,
+            corner_radius=14,
+            height=210,
+            scrollbar_button_color="#314455",
+            scrollbar_button_hover_color="#42586c",
+        )
+        checklist_frame.grid(row=2, column=0, sticky="nsew", padx=18, pady=(0, 18))
+        checklist_frame.grid_columnconfigure(0, weight=1)
+        self._register("daily_checklist_frame", checklist_frame)
+
+        history_card = self._card(right)
+        history_card.grid(row=3, column=0, sticky="nsew", pady=(7, 0))
+        history_card.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(history_card, text="Recent Dose History", anchor="w", text_color=DESKTOP_TEXT, font=ctk.CTkFont(size=18, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=18, pady=(18, 10)
+        )
+        history_box = self._readonly_box(history_card, height=145)
+        history_box.widget.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 18))
+        self._register("selected_med_history", history_box)
+
+    def _build_medications_tab(self, tab: Any) -> None:
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+
+        scroll = ctk.CTkScrollableFrame(
+            tab,
+            fg_color="transparent",
+            scrollbar_button_color="#314455",
+            scrollbar_button_hover_color="#42586c",
+        )
+        scroll.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
+        scroll.grid_columnconfigure(0, weight=1)
+        scroll.grid_columnconfigure(1, weight=2)
+
+        list_card = self._card(scroll)
+        list_card.grid(row=0, column=0, sticky="nsew", padx=(14, 7), pady=14)
+        list_card.grid_rowconfigure(1, weight=1)
+        list_card.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(list_card, text="Medication List", anchor="w", text_color=DESKTOP_TEXT, font=ctk.CTkFont(size=18, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=18, pady=(18, 10)
+        )
+        med_list_frame = ctk.CTkScrollableFrame(
+            list_card,
+            fg_color="transparent",
+            scrollbar_button_color="#314455",
+            scrollbar_button_hover_color="#42586c",
+            height=620,
+        )
+        med_list_frame.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 18))
+        self._register("med_list", DesktopListAdapter(med_list_frame))
+
+        form_card = ctk.CTkScrollableFrame(
+            scroll,
+            fg_color=DESKTOP_SURFACE,
+            border_width=1,
+            border_color=DESKTOP_BORDER,
+            corner_radius=18,
+            scrollbar_button_color="#314455",
+            scrollbar_button_hover_color="#42586c",
+        )
+        form_card.grid(row=0, column=1, sticky="nsew", padx=(7, 14), pady=14)
+        form_card.grid_columnconfigure((0, 1, 2), weight=1)
+
+        form_selection = self._label(form_card, text="Creating a new medication", bold=True, wrap=720)
+        form_selection.widget.grid(row=0, column=0, columnspan=3, sticky="ew", padx=18, pady=(18, 10))
+        self._register("form_selection", form_selection)
+
+        ctk.CTkLabel(form_card, text="Medication name", anchor="w", text_color=DESKTOP_MUTED).grid(row=1, column=0, columnspan=3, sticky="w", padx=18)
+        med_name = self._entry(form_card, placeholder="Medication name")
+        med_name.widget.grid(row=2, column=0, columnspan=3, sticky="ew", padx=18, pady=(6, 12))
+        self._register("med_name", med_name)
+
+        ctk.CTkLabel(form_card, text="Dose (mg)", anchor="w", text_color=DESKTOP_MUTED).grid(row=3, column=0, sticky="w", padx=(18, 8))
+        ctk.CTkLabel(form_card, text="Interval (hours)", anchor="w", text_color=DESKTOP_MUTED).grid(row=3, column=1, sticky="w", padx=8)
+        ctk.CTkLabel(form_card, text="Max daily (mg)", anchor="w", text_color=DESKTOP_MUTED).grid(row=3, column=2, sticky="w", padx=(8, 18))
+        dose_mg = self._entry(form_card, placeholder="Dose mg")
+        interval_h = self._entry(form_card, placeholder="Interval h")
+        max_daily = self._entry(form_card, placeholder="Max daily mg")
+        dose_mg.widget.grid(row=4, column=0, sticky="ew", padx=(18, 8), pady=(6, 12))
+        interval_h.widget.grid(row=4, column=1, sticky="ew", padx=8, pady=(6, 12))
+        max_daily.widget.grid(row=4, column=2, sticky="ew", padx=(8, 18), pady=(6, 12))
+        self._register("dose_mg", dose_mg)
+        self._register("interval_h", interval_h)
+        self._register("max_daily", max_daily)
+
+        ctk.CTkLabel(form_card, text="First planned dose time (HH:MM)", anchor="w", text_color=DESKTOP_MUTED).grid(row=5, column=0, sticky="w", padx=(18, 8))
+        ctk.CTkLabel(form_card, text="Optional custom daily dose times", anchor="w", text_color=DESKTOP_MUTED).grid(row=5, column=1, columnspan=2, sticky="w", padx=(8, 18))
+        first_dose_time = self._entry(form_card, placeholder="06:00 or 08:00")
+        first_dose_time.widget.grid(row=6, column=0, sticky="ew", padx=(18, 8), pady=(6, 12))
+        self._register("first_dose_time", first_dose_time)
+        custom_times = self._edit_box(form_card, height=100)
+        custom_times.widget.grid(row=6, column=1, columnspan=2, sticky="ew", padx=(8, 18), pady=(6, 12))
+        self._register("custom_times_text", custom_times)
+
+        planner_hint = self._label(
+            form_card,
+            text="Examples: Breakfast, Lunch, Dinner or Breakfast 08:00, Mid day 12:00, Nighttime 21:00. Leave blank for automatic interval-based times.",
+            muted=True,
+            wrap=720,
+        )
+        planner_hint.widget.grid(row=7, column=0, columnspan=3, sticky="ew", padx=18, pady=(0, 12))
+
+        ctk.CTkLabel(form_card, text="Bottle directions", anchor="w", text_color=DESKTOP_MUTED).grid(row=8, column=0, columnspan=3, sticky="w", padx=18)
+        schedule_text = self._edit_box(form_card, height=110)
+        schedule_text.widget.grid(row=9, column=0, columnspan=3, sticky="ew", padx=18, pady=(6, 12))
+        self._register("schedule_text", schedule_text)
+
+        ctk.CTkLabel(form_card, text="Notes", anchor="w", text_color=DESKTOP_MUTED).grid(row=10, column=0, columnspan=3, sticky="w", padx=18)
+        med_notes = self._edit_box(form_card, height=120)
+        med_notes.widget.grid(row=11, column=0, columnspan=3, sticky="ew", padx=18, pady=(6, 12))
+        self._register("med_notes", med_notes)
+
+        ctk.CTkLabel(form_card, text="Saved schedule preview", anchor="w", text_color=DESKTOP_MUTED).grid(row=12, column=0, columnspan=3, sticky="w", padx=18)
+        preview = self._readonly_box(form_card, height=130)
+        preview.widget.grid(row=13, column=0, columnspan=3, sticky="ew", padx=18, pady=(6, 12))
+        self._register("form_schedule_preview", preview)
+
+        buttons = ctk.CTkFrame(form_card, fg_color="transparent")
+        buttons.grid(row=14, column=0, columnspan=3, sticky="ew", padx=18, pady=(0, 18))
+        buttons.grid_columnconfigure((0, 1, 2, 3), weight=1)
+        self._button(buttons, text="New", command=self.on_new_med, tone="neutral").grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self._button(buttons, text="Save", command=self.on_save_med).grid(row=0, column=1, sticky="ew", padx=6)
+        self._button(buttons, text="Delete", command=self.on_delete_med, tone="danger").grid(row=0, column=2, sticky="ew", padx=6)
+        self._button(buttons, text="Log Dose", command=self.on_log_dose, tone="warning").grid(row=0, column=3, sticky="ew", padx=(6, 0))
+
+    def _build_vision_tab(self, tab: Any) -> None:
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+        scroll = ctk.CTkScrollableFrame(
+            tab,
+            fg_color="transparent",
+            scrollbar_button_color="#314455",
+            scrollbar_button_hover_color="#42586c",
+        )
+        scroll.grid(row=0, column=0, sticky="nsew", padx=14, pady=14)
+        scroll.grid_columnconfigure(0, weight=1)
+
+        card = self._card(scroll)
+        card.grid(row=0, column=0, sticky="ew")
+        card.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(card, text="Bottle Photo Import", anchor="w", text_color=DESKTOP_TEXT, font=ctk.CTkFont(size=18, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=18, pady=(18, 10)
+        )
+        vision_last = self._label(card, text="Last image: none", muted=True, wrap=980)
+        vision_last.widget.grid(row=1, column=0, sticky="ew", padx=18)
+        self._register("vision_last_file", vision_last)
+        vision_status = self._label(card, text="Ready to review a medication bottle photo.", muted=True, wrap=980)
+        vision_status.widget.grid(row=2, column=0, sticky="ew", padx=18, pady=(8, 12))
+        self._register("vision_status", vision_status)
+
+        button_row = ctk.CTkFrame(card, fg_color="transparent")
+        button_row.grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 12))
+        button_row.grid_columnconfigure((0, 1), weight=1)
+        self._button(button_row, text="Choose Bottle Photo", command=self.on_pick_bottle_photo).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self._button(button_row, text="Import From Computer", command=self.on_take_bottle_photo, tone="neutral").grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+        ctk.CTkLabel(
+            card,
+            text="Scroll if the analysis result runs longer than your current window height.",
+            anchor="w",
+            justify="left",
+            wraplength=980,
+            text_color=DESKTOP_MUTED,
+            font=ctk.CTkFont(size=12),
+        ).grid(row=4, column=0, sticky="ew", padx=18, pady=(0, 10))
+
+        vision_result = self._readonly_box(card, height=420)
+        vision_result.widget.grid(row=5, column=0, sticky="nsew", padx=18, pady=(0, 18))
+        self._register("vision_result", vision_result)
+
+    def _build_dental_tab(self, tab: Any) -> None:
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+        scroll = ctk.CTkScrollableFrame(
+            tab,
+            fg_color="transparent",
+            scrollbar_button_color="#314455",
+            scrollbar_button_hover_color="#42586c",
+        )
+        scroll.grid(row=0, column=0, sticky="nsew", padx=14, pady=14)
+        scroll.grid_columnconfigure(0, weight=1)
+
+        overview = self._card(scroll)
+        overview.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        overview.grid_columnconfigure(0, weight=1)
+        overview_title = self._label(overview, text="Dental studio ready", bold=True, wrap=980)
+        overview_title.widget.grid(row=0, column=0, sticky="ew", padx=18, pady=(18, 8))
+        self._register("dental_overview_title", overview_title)
+        overview_body = self._label(
+            overview,
+            text="Brush, floss, rinse, and AI hygiene reviews all stay local.",
+            muted=True,
+            wrap=980,
+        )
+        overview_body.widget.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 18))
+        self._register("dental_overview_body", overview_body)
+
+        habits = self._card(scroll)
+        habits.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+        habits.grid_columnconfigure((0, 1, 2), weight=1)
+        for column, (prefix, title, command) in enumerate(
+            (
+                ("brush", "Brush", lambda: self.on_log_dental_habit("brush")),
+                ("floss", "Floss", lambda: self.on_log_dental_habit("floss")),
+                ("rinse", "Rinse", lambda: self.on_log_dental_habit("rinse")),
+            )
+        ):
+            habit_card = ctk.CTkFrame(habits, fg_color=DESKTOP_SURFACE_ALT, border_width=1, border_color=DESKTOP_BORDER, corner_radius=14)
+            habit_card.grid(row=0, column=column, sticky="nsew", padx=(18 if column == 0 else 8, 18 if column == 2 else 8), pady=18)
+            habit_card.grid_columnconfigure(0, weight=1)
+            ctk.CTkLabel(habit_card, text=title, anchor="w", text_color=DESKTOP_TEXT, font=ctk.CTkFont(size=17, weight="bold")).grid(
+                row=0, column=0, sticky="w", padx=14, pady=(14, 6)
+            )
+            status = self._label(habit_card, text="Ready", bold=True, wrap=240)
+            status.widget.grid(row=1, column=0, sticky="ew", padx=14)
+            self._register(f"dental_{prefix}_status", status)
+            caption = self._label(habit_card, text="Ready now", muted=True, wrap=240)
+            caption.widget.grid(row=2, column=0, sticky="ew", padx=14, pady=(6, 12))
+            self._register(f"dental_{prefix}_caption", caption)
+            self._button(habit_card, text=f"Log {title}", command=command, tone="neutral").grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 14))
+
+        intervals = self._card(scroll)
+        intervals.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+        intervals.grid_columnconfigure((0, 1, 2), weight=1)
+        ctk.CTkLabel(intervals, text="Brush interval (h)", anchor="w", text_color=DESKTOP_MUTED).grid(row=0, column=0, sticky="w", padx=(18, 8), pady=(18, 0))
+        ctk.CTkLabel(intervals, text="Floss interval (h)", anchor="w", text_color=DESKTOP_MUTED).grid(row=0, column=1, sticky="w", padx=8, pady=(18, 0))
+        ctk.CTkLabel(intervals, text="Rinse interval (h)", anchor="w", text_color=DESKTOP_MUTED).grid(row=0, column=2, sticky="w", padx=(8, 18), pady=(18, 0))
+        brush_interval = self._entry(intervals, placeholder="Brush interval h")
+        floss_interval = self._entry(intervals, placeholder="Floss interval h")
+        rinse_interval = self._entry(intervals, placeholder="Rinse interval h")
+        brush_interval.widget.grid(row=1, column=0, sticky="ew", padx=(18, 8), pady=(6, 12))
+        floss_interval.widget.grid(row=1, column=1, sticky="ew", padx=8, pady=(6, 12))
+        rinse_interval.widget.grid(row=1, column=2, sticky="ew", padx=(8, 18), pady=(6, 12))
+        self._register("dental_brush_interval", brush_interval)
+        self._register("dental_floss_interval", floss_interval)
+        self._register("dental_rinse_interval", rinse_interval)
+        interval_buttons = ctk.CTkFrame(intervals, fg_color="transparent")
+        interval_buttons.grid(row=2, column=0, columnspan=3, sticky="ew", padx=18, pady=(0, 18))
+        interval_buttons.grid_columnconfigure((0, 1), weight=1)
+        self._button(interval_buttons, text="Save Rhythm", command=self.on_save_dental_intervals).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self._button(interval_buttons, text="Reset Defaults", command=self.on_reset_dental_intervals, tone="neutral").grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+        hygiene = self._card(scroll)
+        hygiene.grid(row=3, column=0, sticky="ew", pady=(0, 12))
+        hygiene.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(hygiene, text="Hygiene Review", anchor="w", text_color=DESKTOP_TEXT, font=ctk.CTkFont(size=18, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=18, pady=(18, 10)
+        )
+        hygiene_photo = self._label(hygiene, text="Last hygiene photo: none", muted=True, wrap=980)
+        hygiene_photo.widget.grid(row=1, column=0, sticky="ew", padx=18)
+        self._register("dental_hygiene_photo", hygiene_photo)
+        hygiene_rating = self._label(hygiene, text="No hygiene rating yet.", bold=True, wrap=980)
+        hygiene_rating.widget.grid(row=2, column=0, sticky="ew", padx=18, pady=(8, 0))
+        self._register("dental_hygiene_rating", hygiene_rating)
+        hygiene_status = self._label(hygiene, text="Ready for a teeth photo.", muted=True, wrap=980)
+        hygiene_status.widget.grid(row=3, column=0, sticky="ew", padx=18, pady=(8, 0))
+        self._register("dental_hygiene_status", hygiene_status)
+        hygiene_trend = self._label(
+            hygiene,
+            text="Trend: take two AI reviews over time to compare your hygiene rhythm.",
+            muted=True,
+            wrap=980,
+        )
+        hygiene_trend.widget.grid(row=4, column=0, sticky="ew", padx=18, pady=(8, 12))
+        self._register("dental_hygiene_trend", hygiene_trend)
+        hygiene_buttons = ctk.CTkFrame(hygiene, fg_color="transparent")
+        hygiene_buttons.grid(row=5, column=0, sticky="ew", padx=18, pady=(0, 12))
+        hygiene_buttons.grid_columnconfigure((0, 1), weight=1)
+        self._button(hygiene_buttons, text="Choose Hygiene Photo", command=self.on_pick_dental_hygiene_photo).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self._button(hygiene_buttons, text="Import From Computer", command=self.on_take_dental_hygiene_photo, tone="neutral").grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        hygiene_summary = self._readonly_box(hygiene, height=220)
+        hygiene_summary.widget.grid(row=6, column=0, sticky="ew", padx=18, pady=(0, 18))
+        self._register("dental_hygiene_summary", hygiene_summary)
+
+        recovery = self._card(scroll)
+        recovery.grid(row=4, column=0, sticky="ew", pady=(0, 12))
+        recovery.grid_columnconfigure((0, 1), weight=1)
+        ctk.CTkLabel(recovery, text="Recovery Mode", anchor="w", text_color=DESKTOP_TEXT, font=ctk.CTkFont(size=18, weight="bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=18, pady=(18, 10)
+        )
+        recovery_mode = self._label(recovery, text="Recovery mode is off.", bold=True, wrap=980)
+        recovery_mode.widget.grid(row=1, column=0, columnspan=2, sticky="ew", padx=18)
+        self._register("recovery_mode_status", recovery_mode)
+        recovery_snapshot = self._label(
+            recovery,
+            text="Set a procedure type and date to start a daily recovery journal.",
+            muted=True,
+            wrap=980,
+        )
+        recovery_snapshot.widget.grid(row=2, column=0, columnspan=2, sticky="ew", padx=18, pady=(8, 12))
+        self._register("recovery_snapshot", recovery_snapshot)
+        ctk.CTkLabel(recovery, text="Procedure type", anchor="w", text_color=DESKTOP_MUTED).grid(row=3, column=0, sticky="w", padx=(18, 8))
+        ctk.CTkLabel(recovery, text="Procedure date (YYYY-MM-DD)", anchor="w", text_color=DESKTOP_MUTED).grid(row=3, column=1, sticky="w", padx=(8, 18))
+        procedure_type = self._entry(recovery, placeholder="Procedure type")
+        procedure_date = self._entry(recovery, placeholder="YYYY-MM-DD")
+        procedure_type.widget.grid(row=4, column=0, sticky="ew", padx=(18, 8), pady=(6, 12))
+        procedure_date.widget.grid(row=4, column=1, sticky="ew", padx=(8, 18), pady=(6, 12))
+        self._register("recovery_procedure_type", procedure_type)
+        self._register("recovery_procedure_date", procedure_date)
+        ctk.CTkLabel(recovery, text="Symptom notes", anchor="w", text_color=DESKTOP_MUTED).grid(row=5, column=0, sticky="w", padx=(18, 8))
+        ctk.CTkLabel(recovery, text="Aftercare notes", anchor="w", text_color=DESKTOP_MUTED).grid(row=5, column=1, sticky="w", padx=(8, 18))
+        symptom_notes = self._edit_box(recovery, height=120)
+        care_notes = self._edit_box(recovery, height=120)
+        symptom_notes.widget.grid(row=6, column=0, sticky="ew", padx=(18, 8), pady=(6, 12))
+        care_notes.widget.grid(row=6, column=1, sticky="ew", padx=(8, 18), pady=(6, 12))
+        self._register("recovery_symptom_notes", symptom_notes)
+        self._register("recovery_care_notes", care_notes)
+        recovery_buttons = ctk.CTkFrame(recovery, fg_color="transparent")
+        recovery_buttons.grid(row=7, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 12))
+        recovery_buttons.grid_columnconfigure((0, 1, 2), weight=1)
+        self._button(recovery_buttons, text="Save Recovery", command=self.on_save_recovery_mode, tone="warning").grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self._button(recovery_buttons, text="Pause Recovery", command=self.on_pause_recovery_mode, tone="neutral").grid(row=0, column=1, sticky="ew", padx=6)
+        self._button(recovery_buttons, text="Choose Recovery Photo", command=self.on_pick_recovery_photo).grid(row=0, column=2, sticky="ew", padx=(6, 0))
+        recovery_last = self._label(recovery, text="Last recovery photo: none", muted=True, wrap=980)
+        recovery_last.widget.grid(row=8, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 8))
+        self._register("recovery_last_photo", recovery_last)
+        recovery_result = self._readonly_box(recovery, height=240)
+        recovery_result.widget.grid(row=9, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 18))
+        self._register("recovery_result", recovery_result)
+
+    def _build_assistant_tab(self, tab: Any) -> None:
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+        scroll = ctk.CTkScrollableFrame(
+            tab,
+            fg_color="transparent",
+            scrollbar_button_color="#314455",
+            scrollbar_button_hover_color="#42586c",
+        )
+        scroll.grid(row=0, column=0, sticky="nsew", padx=14, pady=14)
+        scroll.grid_columnconfigure(0, weight=1)
+
+        card = self._card(scroll)
+        card.grid(row=0, column=0, sticky="ew")
+        card.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(card, text="Local Gemma Assistant", anchor="w", text_color=DESKTOP_TEXT, font=ctk.CTkFont(size=18, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=18, pady=(18, 8)
+        )
+        ctk.CTkLabel(
+            card,
+            text="Ask about doses, schedule consistency, dental hygiene reminders, or recovery notes stored in the encrypted vault.",
+            anchor="w",
+            justify="left",
+            wraplength=980,
+            text_color=DESKTOP_MUTED,
+            font=ctk.CTkFont(size=13),
+        ).grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 12))
+        ctk.CTkLabel(
+            card,
+            text="This panel scrolls too, so the chat controls stay reachable on smaller displays.",
+            anchor="w",
+            justify="left",
+            wraplength=980,
+            text_color=DESKTOP_MUTED,
+            font=ctk.CTkFont(size=12),
+        ).grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 10))
+        assistant_history = self._readonly_box(card, height=340)
+        assistant_history.widget.grid(row=3, column=0, sticky="nsew", padx=18, pady=(0, 12))
+        self._register("assistant_history", assistant_history)
+        assistant_input = self._edit_box(card, height=110)
+        assistant_input.widget.grid(row=4, column=0, sticky="ew", padx=18, pady=(0, 12))
+        self._register("assistant_input", assistant_input)
+        buttons = ctk.CTkFrame(card, fg_color="transparent")
+        buttons.grid(row=5, column=0, sticky="ew", padx=18, pady=(0, 18))
+        buttons.grid_columnconfigure((0, 1), weight=1)
+        self._button(buttons, text="Send", command=self.on_assistant_send).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self._button(buttons, text="Clear Chat", command=self.on_assistant_clear, tone="danger").grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+    def _build_model_tab(self, tab: Any) -> None:
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+        scroll = ctk.CTkScrollableFrame(
+            tab,
+            fg_color="transparent",
+            scrollbar_button_color="#314455",
+            scrollbar_button_hover_color="#42586c",
+        )
+        scroll.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
+        scroll.grid_columnconfigure(0, weight=1)
+
+        card = self._card(scroll)
+        card.grid(row=0, column=0, sticky="ew", padx=14, pady=(14, 8))
+        card.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(card, text="Settings & Runtime", anchor="w", text_color=DESKTOP_TEXT, font=ctk.CTkFont(size=18, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=18, pady=(18, 10)
+        )
+        ctk.CTkLabel(
+            card,
+            text="Model download, inference controls, privacy tools, and startup protection now live together here.",
+            anchor="w",
+            justify="left",
+            wraplength=980,
+            text_color=DESKTOP_MUTED,
+            font=ctk.CTkFont(size=13),
+        ).grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 8))
+        backend_label = self._label(card, text="Backend: Auto", muted=True, wrap=980)
+        backend_label.widget.grid(row=2, column=0, sticky="ew", padx=18)
+        self._register("model_backend_label", backend_label)
+        progress_widget = ctk.CTkProgressBar(card, progress_color=DESKTOP_ACCENT, fg_color="#2a3743", height=18, corner_radius=10)
+        progress_widget.grid(row=3, column=0, sticky="ew", padx=18, pady=(12, 12))
+        progress_widget.set(0.0)
+        self._register("model_progress", DesktopProgressAdapter(progress_widget))
+        model_status = self._readonly_box(card, height=165)
+        model_status.widget.grid(row=4, column=0, sticky="nsew", padx=18, pady=(0, 12))
+        self._register("model_status", model_status)
+        buttons_one = ctk.CTkFrame(card, fg_color="transparent")
+        buttons_one.grid(row=5, column=0, sticky="ew", padx=18, pady=(0, 8))
+        buttons_one.grid_columnconfigure((0, 1), weight=1)
+        self._button(buttons_one, text="Download and Seal", command=self.on_model_download).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self._button(buttons_one, text="Verify SHA", command=self.on_model_verify, tone="neutral").grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        buttons_two = ctk.CTkFrame(card, fg_color="transparent")
+        buttons_two.grid(row=6, column=0, sticky="ew", padx=18, pady=(0, 8))
+        buttons_two.grid_columnconfigure((0, 1), weight=1)
+        self._button(buttons_two, text="Cycle Backend", command=self.on_cycle_backend, tone="neutral").grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self._button(buttons_two, text="Toggle Vision", command=self.on_toggle_native_image_input, tone="warning").grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        buttons_three = ctk.CTkFrame(card, fg_color="transparent")
+        buttons_three.grid(row=7, column=0, sticky="ew", padx=18, pady=(0, 18))
+        buttons_three.grid_columnconfigure((0, 1), weight=1)
+        self._button(buttons_three, text="Delete Plain Cache", command=self.on_delete_plain_model, tone="danger").grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self._button(buttons_three, text="Refresh", command=self.refresh_model_status, tone="neutral").grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+        security = self._card(scroll)
+        security.grid(row=1, column=0, sticky="ew", padx=14, pady=(8, 14))
+        security.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            security,
+            text="Security & Startup",
+            anchor="w",
+            text_color=DESKTOP_TEXT,
+            font=ctk.CTkFont(size=18, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=18, pady=(18, 8))
+        ctk.CTkLabel(
+            security,
+            text=(
+                "Control startup password protection, rotate the vault key, and check whether the first-run secure setup "
+                "has been completed on this device."
+            ),
+            anchor="w",
+            justify="left",
+            wraplength=980,
+            text_color=DESKTOP_MUTED,
+            font=ctk.CTkFont(size=13),
+        ).grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 12))
+        security_status = self._readonly_box(security, height=120)
+        security_status.widget.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 12))
+        self._register("model_security_status", security_status)
+        security_buttons = ctk.CTkFrame(security, fg_color="transparent")
+        security_buttons.grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 18))
+        security_buttons.grid_columnconfigure((0, 1, 2), weight=1)
+        self._button(security_buttons, text="Add / Change Password", command=self.on_change_startup_password).grid(
+            row=0, column=0, sticky="ew", padx=(0, 6)
+        )
+        self._button(security_buttons, text="Remove Password", command=self.on_remove_startup_password, tone="neutral").grid(
+            row=0, column=1, sticky="ew", padx=6
+        )
+        self._button(security_buttons, text="Rotate Vault Key", command=self.on_rotate_vault_key, tone="warning").grid(
+            row=0, column=2, sticky="ew", padx=(6, 0)
+        )
+
+    def set_status(self, text: str) -> None:
+        self.ids.status_label.text = sanitize_text(text, max_chars=220)
+
+    def show_dialog(self, title: str, text: str) -> None:
+        if self.window is None:
+            return
+        clean_title = sanitize_text(title, max_chars=80)
+        clean_text = sanitize_text(text, max_chars=3000)
+        lowered = clean_title.lower()
+        if any(token in lowered for token in ("failed", "warning", "flag", "attention")):
+            messagebox.showwarning(clean_title, clean_text, parent=self.window)
+        else:
+            messagebox.showinfo(clean_title, clean_text, parent=self.window)
+
+    def set_field_text(self, widget_id: str, value: str, *, force: bool = False) -> None:
+        widget = self.ids.get(widget_id)
+        if widget is None:
+            return
+        next_text = sanitize_text(value, max_chars=4000)
+        if force or not bool(getattr(widget, "focus", False)):
+            if getattr(widget, "text", None) != next_text:
+                widget.text = next_text
+
+    def refresh_from_disk(self) -> None:
+        if not self.vault:
+            return
+        try:
+            self.data_cache = ensure_vault_shape(self.vault.load())
+        except RuntimeError as exc:
+            self.data_cache = vault_defaults()
+            if self.main_ui_started:
+                self.set_status(str(exc))
+            return
+        if self.selected_med_id and not self.current_selected_med():
+            self.selected_med_id = None
+        if not self.selected_med_id and self.data_cache.get("meds"):
+            ranked = sorted(
+                list(self.data_cache.get("meds") or []),
+                key=lambda med: (
+                    0 if medication_due_status(med)["overdue"] else 1 if medication_due_status(med)["due_now"] else 2,
+                    medication_due_status(med)["next_ts"] or float("inf"),
+                ),
+            )
+            self.selected_med_id = str(ranked[0].get("id"))
+        self.refresh_ui()
+
+    def refresh_time_sensitive_labels(self) -> None:
+        self.refresh_dashboard()
+        self.refresh_med_list()
+        self.refresh_dental_ui()
+        self.refresh_exercise_ui()
+
+    def refresh_ui(self) -> None:
+        self.refresh_dashboard()
+        self.refresh_med_list()
+        self.refresh_form()
+        self.refresh_assistant_history()
+        self.refresh_model_status()
+        self.refresh_vision_summary()
+        self.refresh_dental_ui()
+        self.refresh_exercise_ui()
+
+    def save_data(self) -> None:
+        if self.vault:
+            try:
+                self.vault.save(self.data_cache)
+            except RuntimeError as exc:
+                if self.main_ui_started:
+                    self.set_status(str(exc))
+
+    def current_selected_med(self) -> Optional[Dict[str, Any]]:
+        for med in self.data_cache.get("meds", []) or []:
+            if str(med.get("id")) == self.selected_med_id:
+                return med
+        return None
+
+    def _render_daily_checklist(self, med: Optional[Dict[str, Any]], now: float) -> None:
+        frame = self.ids.daily_checklist_frame
+        for child in frame.winfo_children():
+            child.destroy()
+        frame.grid_columnconfigure(0, weight=1)
+        if not med:
+            ctk.CTkLabel(
+                frame,
+                text="Select a medication to build today's checklist.",
+                anchor="w",
+                justify="left",
+                wraplength=500,
+                text_color=DESKTOP_MUTED,
+                font=ctk.CTkFont(size=13),
+            ).grid(row=0, column=0, sticky="ew", padx=12, pady=12)
+            return
+        slots = build_medication_daily_slots(med, datetime.fromtimestamp(now).date(), now)
+        if not slots:
+            next_slot = next_unchecked_medication_slot(med, now)
+            message = "Add custom times or save an interval to generate a daily checklist."
+            if next_slot is not None:
+                message = f"No remaining slots today. Next planned dose: {next_slot['label']} {next_slot['time_text']}."
+            ctk.CTkLabel(
+                frame,
+                text=message,
+                anchor="w",
+                justify="left",
+                wraplength=500,
+                text_color=DESKTOP_MUTED,
+                font=ctk.CTkFont(size=13),
+            ).grid(row=0, column=0, sticky="ew", padx=12, pady=12)
+            return
+        for row_index, slot in enumerate(slots):
+            row = ctk.CTkFrame(frame, fg_color="transparent")
+            row.grid(row=row_index, column=0, sticky="ew", padx=8, pady=4)
+            row.grid_columnconfigure(1, weight=1)
+
+            checkbox = ctk.CTkCheckBox(
+                row,
+                text=f"{slot['label']} • {slot['time_text']}",
+                fg_color=DESKTOP_ACCENT,
+                hover_color="#0d6b63",
+                border_color=DESKTOP_BORDER,
+                text_color=DESKTOP_TEXT,
+                font=ctk.CTkFont(size=14, weight="bold"),
+            )
+            checkbox.grid(row=0, column=0, sticky="w", padx=(4, 10))
+            if slot.get("status") == "taken":
+                checkbox.select()
+                checkbox.configure(state="disabled")
+            elif slot.get("status") == "missed":
+                checkbox.deselect()
+                checkbox.configure(state="disabled")
+            else:
+                checkbox.deselect()
+                checkbox.configure(
+                    command=lambda med_id=str(med.get("id")), slot_label=str(slot.get("label")): self.on_checklist_take_dose(med_id, slot_label)
+                )
+
+            if slot.get("status") == "missed":
+                status_color = DESKTOP_DANGER
+                status_text = f"X {slot['status_text']}"
+            elif slot.get("status") == "due":
+                status_color = DESKTOP_WARNING
+                status_text = f"! {slot['status_text']}"
+            elif slot.get("status") == "taken":
+                status_color = DESKTOP_SUCCESS
+                status_text = slot["status_text"]
+            else:
+                status_color = DESKTOP_MUTED
+                status_text = slot["status_text"]
+
+            ctk.CTkLabel(
+                row,
+                text=status_text,
+                anchor="w",
+                justify="left",
+                wraplength=260,
+                text_color=status_color,
+                font=ctk.CTkFont(size=13),
+            ).grid(row=0, column=1, sticky="ew")
+
+            if slot.get("status") == "missed":
+                self._button(
+                    row,
+                    text="Take Now",
+                    command=lambda med_id=str(med.get("id")), slot_label=str(slot.get("label")): self.on_checklist_take_dose(med_id, slot_label),
+                    tone="warning",
+                ).grid(row=0, column=2, sticky="e", padx=(10, 0))
+
+    def _log_dose_for_med(self, med: Dict[str, Any], *, source_label: str = "dose") -> None:
+        dose_value = max(0.0, safe_float(self.ids.dose_mg.text) or safe_float(med.get("dose_mg")))
+        now = time.time()
+        label, message = dose_safety_level(med, dose_value, now)
+        med["history"] = list(med.get("history") or []) + [[now, dose_value]]
+        med["history"] = med["history"][-240:]
+        med["last_taken_ts"] = now
+        if dose_value > 0:
+            med["dose_mg"] = dose_value
+        self.save_data()
+        self.last_check_level = label
+        self.last_check_display = label
+        source_suffix = f" Logged for {source_label}." if source_label else ""
+        self.last_check_message = message + source_suffix
+        self.refresh_ui()
+        self.set_status(self.last_check_message)
+        if label == "High":
+            self.show_dialog("High Safety Flag", self.last_check_message)
+
+    def on_checklist_take_dose(self, med_id: str, slot_label: str) -> None:
+        self.selected_med_id = med_id
+        med = self.current_selected_med()
+        if not med:
+            return
+        self._log_dose_for_med(med, source_label=slot_label)
+
+    def refresh_dashboard(self) -> None:
+        now = time.time()
+        meds = list(self.data_cache.get("meds") or [])
+        med_statuses = [(medication_due_status(med, now), med) for med in meds]
+        due_now = [med for status, med in med_statuses if status["due_now"] and not status["overdue"]]
+        overdue = [med for status, med in med_statuses if status["overdue"]]
+        next_due_items = [
+            (status["next_ts"], med)
+            for status, med in med_statuses
+            if status["next_ts"] is not None
+        ]
+        next_due_items.sort(key=lambda item: item[0] or float("inf"))
+        next_due_text = "Nothing scheduled yet"
+        if next_due_items:
+            next_due_ts, med = next_due_items[0]
+            next_due_text = f"{sanitize_text(med.get('name'), max_chars=120)} | {format_relative_due(next_due_ts, now)}"
+
+        selected = self.current_selected_med()
+        selection_text = "Select a medication to log doses."
+        summary_text = "No medication selected."
+        schedule_text = "Today's dose plan will appear here."
+        if selected:
+            selected_slots = build_medication_daily_slots(selected, datetime.fromtimestamp(now).date(), now)
+            remaining_slots = len([slot for slot in selected_slots if slot.get("status") != "taken"])
+            selection_text = f"Focused med: {sanitize_text(selected.get('name'), max_chars=120)}"
+            summary_text = (
+                f"{sanitize_text(selected.get('name'), max_chars=120)}\n"
+                f"{medication_card_line(selected, now)}\n"
+                f"Last taken: {format_timestamp(safe_float(selected.get('last_taken_ts')))}\n"
+                f"Remaining planned slots today: {remaining_slots}\n"
+                f"Directions: {sanitize_text(selected.get('schedule_text') or 'No bottle directions saved yet.', max_chars=260)}"
+            )
+            schedule_text = build_medication_schedule_text(selected, now)
+
+        self.ids.dose_wheel.set_level(self.last_check_level)
+        self.ids.dashboard_risk_title.text = self.last_check_display
+        self.ids.dashboard_risk_caption.text = self.last_check_message
+        self.ids.today_due_count.text = f"{len(due_now)} active | {len(overdue)} missed"
+        self.ids.today_next_due.text = next_due_text
+        self.ids.today_timeline.text = build_timeline_text(meds, now)
+        self.ids.dashboard_selection.text = selection_text
+        self.ids.selected_med_summary.text = summary_text
+        self.ids.selected_med_schedule.text = schedule_text
+        self.ids.selected_med_history.text = build_med_history_text(selected)
+        self.ids.dashboard_nudge.text = build_medication_nudge_text(selected, now)
+        self._render_daily_checklist(selected, now)
+
+    def refresh_med_list(self) -> None:
+        med_list = self.ids.med_list
+        med_list.clear_widgets()
+        meds = list(self.data_cache.get("meds") or [])
+        now = time.time()
+        for med in sorted(
+            meds,
+            key=lambda item: (
+                0 if medication_due_status(item, now)["overdue"] else 1 if medication_due_status(item, now)["due_now"] else 2,
+                medication_due_status(item, now)["next_ts"] or float("inf"),
+                sanitize_text(item.get("name"), max_chars=120).lower(),
+            ),
+        ):
+            title = sanitize_text(med.get("name"), max_chars=120)
+            prefix = "Selected | " if str(med.get("id")) == self.selected_med_id else ""
+            med_list.add_widget(
+                DesktopListItem(
+                    text=prefix + title,
+                    secondary_text=medication_card_line(med, now),
+                    on_release=lambda _widget, med_id=str(med.get("id")): self.select_med(med_id),
+                )
+            )
+
+    def refresh_form(self) -> None:
+        med = self.current_selected_med()
+        if not med:
+            self.last_form_med_id = None
+            self.ids.form_selection.text = "Creating a new medication"
+            self.ids.form_schedule_preview.text = "Saved schedules appear below."
+            self.set_field_text("first_dose_time", "", force=True)
+            self.set_field_text("custom_times_text", "", force=True)
+            return
+        med_id = str(med.get("id"))
+        force_sync = med_id != self.last_form_med_id
+        self.ids.form_selection.text = f"Editing: {sanitize_text(med.get('name'), max_chars=120)}"
+        self.set_field_text("med_name", sanitize_text(med.get("name") or "", max_chars=120), force=force_sync)
+        self.set_field_text("dose_mg", f"{safe_float(med.get('dose_mg')):g}" if safe_float(med.get("dose_mg")) else "", force=force_sync)
+        self.set_field_text("interval_h", f"{safe_float(med.get('interval_hours')):g}" if safe_float(med.get("interval_hours")) else "", force=force_sync)
+        self.set_field_text("max_daily", f"{safe_float(med.get('max_daily_mg')):g}" if safe_float(med.get("max_daily_mg")) else "", force=force_sync)
+        self.set_field_text("first_dose_time", sanitize_text(med.get("first_dose_time") or "", max_chars=20), force=force_sync)
+        self.set_field_text("custom_times_text", sanitize_text(med.get("custom_times_text") or "", max_chars=320), force=force_sync)
+        self.set_field_text("schedule_text", sanitize_text(med.get("schedule_text") or "", max_chars=240), force=force_sync)
+        self.set_field_text("med_notes", sanitize_text(med.get("notes") or "", max_chars=500), force=force_sync)
+        self.ids.form_schedule_preview.text = medication_card_line(med) + "\n" + build_medication_schedule_text(med)
+        self.last_form_med_id = med_id
+
+    def refresh_assistant_history(self) -> None:
+        history = list(self.data_cache.get("assistant_history") or [])
+        if not history:
+            self.ids.assistant_history.text = "No assistant messages yet."
+            return
+        lines = []
+        for item in history[-12:]:
+            speaker = "You" if item.get("role") == "user" else "MedSafe"
+            lines.append(f"{speaker}\n{sanitize_text(item.get('content') or '', max_chars=1200)}")
+        self.ids.assistant_history.text = "\n\n".join(lines)
+
+    def refresh_vision_summary(self) -> None:
+        imports = list(self.data_cache.get("vision_imports") or [])
+        if not imports:
+            self.ids.vision_result.text = "No bottle photo processed yet."
+            return
+        latest = imports[-1]
+        risk_score = max(0.0, min(100.0, safe_float(latest.get("risk_score"))))
+        risk_level = normalized_risk_level_text(latest.get("risk_level") or "", risk_score)
+        risk_summary = sanitize_text(latest.get("risk_summary") or "", max_chars=220)
+        lines = [
+            f"Imported from: {sanitize_text(latest.get('image_name') or 'photo', max_chars=120)}",
+            sanitize_text(latest.get("summary") or "Schedule imported.", max_chars=300),
+        ]
+        if risk_score > 0 or risk_summary:
+            lines.append(f"Review risk: {risk_level} | {risk_score:.0f}/100")
+            if risk_summary:
+                lines.append(f"Risk note: {risk_summary}")
+        lines.append(format_timestamp(safe_float(latest.get("timestamp"))))
+        self.ids.vision_result.text = "\n".join(lines)
+
+    def refresh_dental_ui(self) -> None:
+        now = time.time()
+        hygiene = dict(self.data_cache.get("dental_hygiene") or dental_hygiene_defaults())
+        brush = habit_due_status(safe_float(hygiene.get("last_brush_ts")), safe_float(hygiene.get("brush_interval_hours")) or 12.0, now)
+        floss = habit_due_status(safe_float(hygiene.get("last_floss_ts")), safe_float(hygiene.get("floss_interval_hours")) or 24.0, now)
+        rinse = habit_due_status(safe_float(hygiene.get("last_rinse_ts")), safe_float(hygiene.get("rinse_interval_hours")) or 24.0, now)
+        overview_title, overview_body = build_dental_overview(
+            hygiene,
+            dict(self.data_cache.get("dental_recovery") or dental_recovery_defaults()),
+            now,
+        )
+        self.ids.dental_overview_title.text = overview_title
+        self.ids.dental_overview_body.text = overview_body
+        for prefix, status, interval in (
+            ("brush", brush, safe_float(hygiene.get("brush_interval_hours")) or 12.0),
+            ("floss", floss, safe_float(hygiene.get("floss_interval_hours")) or 24.0),
+            ("rinse", rinse, safe_float(hygiene.get("rinse_interval_hours")) or 24.0),
+        ):
+            title_color, caption_color = habit_palette(status)
+            self.ids[f"dental_{prefix}_status"].text = status["state"]
+            self.ids[f"dental_{prefix}_status"].text_color = title_color
+            self.ids[f"dental_{prefix}_caption"].text = f"{status['text']} | every {interval:g}h"
+            self.ids[f"dental_{prefix}_caption"].text_color = caption_color
+        self.set_field_text("dental_brush_interval", f"{safe_float(hygiene.get('brush_interval_hours')):g}")
+        self.set_field_text("dental_floss_interval", f"{safe_float(hygiene.get('floss_interval_hours')):g}")
+        self.set_field_text("dental_rinse_interval", f"{safe_float(hygiene.get('rinse_interval_hours')):g}")
+        self.ids.dental_hygiene_photo.text = f"Last hygiene photo: {sanitize_text(hygiene.get('latest_photo') or 'none', max_chars=120)}"
+        if hygiene.get("latest_rating"):
+            rating_color = score_palette(safe_float(hygiene.get("latest_score")))
+            hygiene_history = list(hygiene.get("history") or [])
+            latest_hygiene_review = hygiene_history[-1] if hygiene_history else {}
+            self.ids.dental_hygiene_rating.text = (
+                f"{sanitize_text(hygiene.get('latest_rating') or '', max_chars=80)} | {safe_float(hygiene.get('latest_score')):.0f}/100"
+            )
+            self.ids.dental_hygiene_rating.text_color = rating_color
+            warning = sanitize_text(hygiene.get("latest_warning_flags") or "None flagged", max_chars=220)
+            confidence = max(0.0, min(1.0, safe_float(latest_hygiene_review.get("confidence"))))
+            risk_score = max(0.0, min(100.0, safe_float(hygiene.get("latest_risk_score"))))
+            risk_level = normalized_risk_level_text(hygiene.get("latest_risk_level") or "", risk_score)
+            risk_summary = sanitize_text(hygiene.get("latest_risk_summary") or "", max_chars=220)
+            trend_text = f"Trend: {score_change_text(hygiene_history)} AI confidence {confidence:.2f}."
+            if risk_score > 0 or risk_summary:
+                trend_text += f" Risk: {risk_level} {risk_score:.0f}/100."
+            self.ids.dental_hygiene_trend.text = trend_text
+            summary_lines = [
+                sanitize_text(hygiene.get("latest_summary") or "", max_chars=280),
+                f"Suggestions: {sanitize_text(hygiene.get('latest_suggestions') or '', max_chars=320)}",
+            ]
+            if risk_score > 0 or risk_summary:
+                summary_lines.append(
+                    f"Risk: {risk_level} | {risk_score:.0f}/100 | "
+                    f"{risk_summary or 'Use the photo and your symptoms together before acting.'}"
+                )
+            summary_lines.extend(
+                [
+                    f"Warnings: {warning}",
+                    build_dental_hygiene_history_text(hygiene),
+                ]
+            )
+            self.ids.dental_hygiene_summary.text = "\n".join(summary_lines)
+        else:
+            self.ids.dental_hygiene_rating.text = "No hygiene rating yet."
+            self.ids.dental_hygiene_rating.text_color = DESKTOP_TEXT
+            self.ids.dental_hygiene_trend.text = "Trend: take two AI reviews over time to compare your hygiene rhythm."
+            self.ids.dental_hygiene_summary.text = "Take a photo for a cleanliness score, visible-sign review, and gentle brushing/flossing suggestions."
+        if hygiene.get("latest_timestamp") and hygiene.get("latest_rating"):
+            self.ids.dental_hygiene_status.text = (
+                f"Latest review: {sanitize_text(hygiene.get('latest_rating') or '', max_chars=80)} | "
+                f"{format_timestamp(safe_float(hygiene.get('latest_timestamp')))}"
+            )
+        else:
+            self.ids.dental_hygiene_status.text = "Ready for a teeth photo."
+
+        recovery = dict(self.data_cache.get("dental_recovery") or dental_recovery_defaults())
+        self.set_field_text("recovery_procedure_type", sanitize_text(recovery.get("procedure_type") or "", max_chars=120))
+        self.set_field_text("recovery_procedure_date", sanitize_text(recovery.get("procedure_date") or "", max_chars=20))
+        self.set_field_text("recovery_symptom_notes", sanitize_text(recovery.get("symptom_notes") or "", max_chars=600))
+        self.set_field_text("recovery_care_notes", sanitize_text(recovery.get("care_notes") or "", max_chars=600))
+        self.ids.recovery_last_photo.text = f"Last recovery photo: {sanitize_text(recovery.get('latest_photo') or 'none', max_chars=120)}"
+        day_count = days_since_date_string(str(recovery.get("procedure_date") or ""))
+        if recovery.get("enabled"):
+            day_text = f"Day {day_count + 1}" if day_count is not None else "Day unknown"
+            self.ids.recovery_mode_status.text = f"{sanitize_text(recovery.get('procedure_type') or 'Recovery mode', max_chars=120)} | {day_text}"
+            self.ids.recovery_mode_status.text_color = score_palette(safe_float(recovery.get("latest_score") or 70.0))
+            score_hint = f" Latest AI recovery score: {safe_float(recovery.get('latest_score')):.0f}/100." if safe_float(recovery.get("latest_score")) else ""
+            self.ids.recovery_snapshot.text = f"Daily journal active. {score_change_text(list(recovery.get('daily_logs') or []))}{score_hint}"
+        else:
+            self.ids.recovery_mode_status.text = "Recovery mode is off."
+            self.ids.recovery_mode_status.text_color = DESKTOP_MUTED
+            self.ids.recovery_snapshot.text = "Set a procedure type and date to start a daily recovery journal."
+        if recovery.get("latest_status"):
+            recovery_logs = list(recovery.get("daily_logs") or [])
+            latest_recovery_log = recovery_logs[-1] if recovery_logs else {}
+            warning = sanitize_text(recovery.get("latest_warning_flags") or "None flagged", max_chars=260)
+            confidence = max(0.0, min(1.0, safe_float(latest_recovery_log.get("confidence"))))
+            risk_score = max(0.0, min(100.0, safe_float(recovery.get("latest_risk_score"))))
+            risk_level = normalized_risk_level_text(recovery.get("latest_risk_level") or "", risk_score)
+            risk_summary = sanitize_text(recovery.get("latest_risk_summary") or "", max_chars=240)
+            result_lines = [
+                f"{sanitize_text(recovery.get('latest_status') or '', max_chars=120)} | {safe_float(recovery.get('latest_score')):.0f}/100",
+                sanitize_text(recovery.get("latest_summary") or "", max_chars=320),
+                f"Suggestions: {sanitize_text(recovery.get('latest_advice') or '', max_chars=360)}",
+            ]
+            if risk_score > 0 or risk_summary:
+                result_lines.append(
+                    f"Risk: {risk_level} | {risk_score:.0f}/100 | "
+                    f"{risk_summary or 'Use the image and symptoms together before deciding next steps.'}"
+                )
+            result_lines.extend(
+                [
+                    f"Warnings: {warning}",
+                    f"AI confidence: {confidence:.2f}",
+                    build_recovery_history_text(recovery),
+                ]
+            )
+            self.ids.recovery_result.text = "\n".join(result_lines)
+        else:
+            self.ids.recovery_result.text = "Recovery suggestions here stay general and should never replace your dentist's instructions."
+
+    def model_state_summary(self) -> str:
+        if not self.paths:
+            return "Storage not ready."
+        plain_exists = self.paths.plain_model_path.exists()
+        encrypted_exists = self.paths.encrypted_model_path.exists()
+        encrypted_size = human_size(self.paths.encrypted_model_path.stat().st_size) if encrypted_exists else "0B"
+        plain_size = human_size(self.paths.plain_model_path.stat().st_size) if plain_exists else "0B"
+        return (
+            f"Encrypted model: {'yes' if encrypted_exists else 'no'} ({encrypted_size})\n"
+            f"Plain copy: {'yes' if plain_exists else 'no'} ({plain_size})\n"
+            f"Model file: {MODEL_FILE}"
+        )
+
+    def security_state_summary(self) -> str:
+        if not self.paths or not self.vault:
+            return "Security state is not ready."
+        password_enabled = self.vault.is_key_protected()
+        unlocked = self.vault.is_unlocked()
+        setup_complete = bool(self.settings_data.get("setup_complete", False))
+        return (
+            f"Startup password: {'enabled' if password_enabled else 'off'}\n"
+            f"Vault session: {'unlocked for this session' if unlocked else 'locked'}\n"
+            f"First-start setup: {'complete' if setup_complete else 'pending'}\n"
+            f"Key rotation: ready\n"
+            f"Vault root: {self.paths.root}"
+        )
+
+    def refresh_model_status(self) -> None:
+        settings = load_settings(self.paths) if self.paths else dict(DEFAULT_SETTINGS)
+        self.settings_data = settings
+        backend = settings.get("inference_backend", "Auto")
+        auto_selected = settings.get("auto_selected_inference_backend", "")
+        if backend != "Auto":
+            backend_note = backend
+        else:
+            auto_hint = auto_selected
+            if not auto_hint:
+                try:
+                    auto_hint = choose_auto_inference_backend_name()
+                except Exception:
+                    auto_hint = "pending"
+            backend_note = f"Auto ({auto_hint})"
+        image_state = "on" if settings.get("enable_native_image_input", True) else "off"
+        password_state = "on" if self.vault and self.vault.is_key_protected() else "off"
+        self.ids.model_status.text = self.model_state_summary()
+        self.ids.model_security_status.text = self.security_state_summary()
+        self.ids.model_backend_label.text = f"Backend: {backend_note} | Native image input: {image_state}"
+        self.ids.dashboard_model_state.text = (
+            f"Model: {'ready' if self.paths and self.paths.encrypted_model_path.exists() else 'not downloaded'}"
+            f" | Vision {image_state} | Password {password_state}"
+        )
+
+    def reset_form_fields(self) -> None:
+        self.ids.med_name.text = ""
+        self.ids.dose_mg.text = ""
+        self.ids.interval_h.text = ""
+        self.ids.max_daily.text = ""
+        self.ids.first_dose_time.text = ""
+        self.ids.custom_times_text.text = ""
+        self.ids.schedule_text.text = ""
+        self.ids.med_notes.text = ""
+        self.ids.form_selection.text = "Creating a new medication"
+        self.ids.form_schedule_preview.text = "Saved schedules appear below."
+
+    def select_med(self, med_id: str) -> None:
+        self.selected_med_id = med_id
+        self.refresh_ui()
+
+    def on_new_med(self) -> None:
+        self.selected_med_id = None
+        self.reset_form_fields()
+        self.set_status("Ready to add a new medication.")
+        self.refresh_dashboard()
+
+    def on_save_med(self) -> None:
+        name = sanitize_text(self.ids.med_name.text, max_chars=120)
+        if not name:
+            self.set_status("Enter a medication name first.")
+            return
+        dose_mg = max(0.0, safe_float(self.ids.dose_mg.text))
+        interval_hours = max(0.0, safe_float(self.ids.interval_h.text))
+        max_daily_mg = max(0.0, safe_float(self.ids.max_daily.text))
+        first_dose_time = sanitize_text(self.ids.first_dose_time.text, max_chars=20)
+        custom_times_text = sanitize_text(self.ids.custom_times_text.text, max_chars=320)
+        schedule_text = sanitize_text(self.ids.schedule_text.text, max_chars=240)
+        notes = sanitize_text(self.ids.med_notes.text, max_chars=500)
+        if first_dose_time and parse_clock_minutes(first_dose_time) is None:
+            self.set_status("Use HH:MM or am/pm format for the first planned dose time.")
+            return
+        if custom_times_text and not parse_custom_dose_times_text(custom_times_text):
+            self.set_status("Use times like Breakfast 08:00, Lunch 13:00, Dinner 18:00 in the custom plan.")
+            return
+
+        meds = list(self.data_cache.get("meds") or [])
+        med = self.current_selected_med()
+        if med is None:
+            med = {
+                "id": uuid.uuid4().hex[:12],
+                "name": name,
+                "dose_mg": dose_mg,
+                "interval_hours": interval_hours,
+                "max_daily_mg": max_daily_mg,
+                "created_ts": time.time(),
+                "first_dose_time": first_dose_time,
+                "custom_times_text": custom_times_text,
+                "schedule_text": schedule_text,
+                "notes": notes,
+                "source": "manual",
+                "source_photo": "",
+                "last_taken_ts": 0.0,
+                "history": [],
+            }
+            meds.append(med)
+            self.selected_med_id = med["id"]
+        else:
+            med["name"] = name
+            med["dose_mg"] = dose_mg
+            med["interval_hours"] = interval_hours
+            med["max_daily_mg"] = max_daily_mg
+            med["first_dose_time"] = first_dose_time
+            med["custom_times_text"] = custom_times_text
+            med["schedule_text"] = schedule_text
+            med["notes"] = notes
+
+        self.data_cache["meds"] = meds
+        self.save_data()
+        self.last_check_level = "Medium"
+        self.last_check_display = "Schedule saved"
+        self.last_check_message = f"{name} was saved to the encrypted schedule vault."
+        self.refresh_ui()
+        self.set_status(f"Saved {name}.")
+
+    def on_delete_med(self) -> None:
+        med = self.current_selected_med()
+        if not med:
+            self.set_status("Select a medication first.")
+            return
+        name = sanitize_text(med.get("name"), max_chars=120)
+        self.data_cache["meds"] = [item for item in self.data_cache.get("meds", []) or [] if str(item.get("id")) != self.selected_med_id]
+        self.selected_med_id = None
+        self.save_data()
+        self.reset_form_fields()
+        self.last_check_level = "Medium"
+        self.last_check_display = "Medication removed"
+        self.last_check_message = f"{name} was removed from the local schedule."
+        self.refresh_ui()
+        self.set_status(f"Deleted {name}.")
+
+    def on_log_dose(self) -> None:
+        med = self.current_selected_med()
+        if not med:
+            self.set_status("Select a medication before logging a dose.")
+            return
+        self._log_dose_for_med(med)
+
+    def on_log_dental_habit(self, habit: str) -> None:
+        hygiene = dict(self.data_cache.get("dental_hygiene") or dental_hygiene_defaults())
+        now = time.time()
+        habit_key = {
+            "brush": "last_brush_ts",
+            "floss": "last_floss_ts",
+            "rinse": "last_rinse_ts",
+        }.get(habit)
+        if not habit_key:
+            return
+        hygiene[habit_key] = now
+        self.data_cache["dental_hygiene"] = hygiene
+        self.save_data()
+        self.refresh_dental_ui()
+        self.set_status(f"Logged dental {habit} routine.")
+
+    def on_save_dental_intervals(self) -> None:
+        hygiene = dict(self.data_cache.get("dental_hygiene") or dental_hygiene_defaults())
+        values = {
+            "brush_interval_hours": max(1.0, safe_float(self.ids.dental_brush_interval.text) or safe_float(hygiene.get("brush_interval_hours")) or 12.0),
+            "floss_interval_hours": max(1.0, safe_float(self.ids.dental_floss_interval.text) or safe_float(hygiene.get("floss_interval_hours")) or 24.0),
+            "rinse_interval_hours": max(1.0, safe_float(self.ids.dental_rinse_interval.text) or safe_float(hygiene.get("rinse_interval_hours")) or 24.0),
+        }
+        hygiene.update(values)
+        self.data_cache["dental_hygiene"] = hygiene
+        self.save_data()
+        self.set_field_text("dental_brush_interval", f"{values['brush_interval_hours']:g}", force=True)
+        self.set_field_text("dental_floss_interval", f"{values['floss_interval_hours']:g}", force=True)
+        self.set_field_text("dental_rinse_interval", f"{values['rinse_interval_hours']:g}", force=True)
+        self.refresh_dental_ui()
+        self.set_status("Dental reminder rhythm saved.")
+
+    def on_reset_dental_intervals(self) -> None:
+        hygiene = dict(self.data_cache.get("dental_hygiene") or dental_hygiene_defaults())
+        defaults = dental_hygiene_defaults()
+        hygiene["brush_interval_hours"] = defaults["brush_interval_hours"]
+        hygiene["floss_interval_hours"] = defaults["floss_interval_hours"]
+        hygiene["rinse_interval_hours"] = defaults["rinse_interval_hours"]
+        self.data_cache["dental_hygiene"] = hygiene
+        self.save_data()
+        self.set_field_text("dental_brush_interval", f"{defaults['brush_interval_hours']:g}", force=True)
+        self.set_field_text("dental_floss_interval", f"{defaults['floss_interval_hours']:g}", force=True)
+        self.set_field_text("dental_rinse_interval", f"{defaults['rinse_interval_hours']:g}", force=True)
+        self.refresh_dental_ui()
+        self.set_status("Dental reminder rhythm reset to defaults.")
+
+    def recovery_state_from_form(self) -> Dict[str, Any]:
+        return {
+            "enabled": True,
+            "procedure_type": sanitize_text(self.ids.recovery_procedure_type.text, max_chars=120),
+            "procedure_date": sanitize_text(self.ids.recovery_procedure_date.text, max_chars=20),
+            "symptom_notes": sanitize_text(self.ids.recovery_symptom_notes.text, max_chars=600),
+            "care_notes": sanitize_text(self.ids.recovery_care_notes.text, max_chars=600),
+        }
+
+    def on_save_recovery_mode(self) -> None:
+        recovery = dict(self.data_cache.get("dental_recovery") or dental_recovery_defaults())
+        form_state = self.recovery_state_from_form()
+        if not form_state["procedure_type"]:
+            self.set_status("Enter the dental procedure before enabling recovery mode.")
+            return
+        if form_state["procedure_date"] and parse_date_string(form_state["procedure_date"]) is None:
+            self.set_status("Use YYYY-MM-DD for the procedure date.")
+            return
+        recovery.update(form_state)
+        self.data_cache["dental_recovery"] = recovery
+        self.save_data()
+        self.refresh_dental_ui()
+        self.set_status("Dental recovery mode saved.")
+
+    def on_pause_recovery_mode(self) -> None:
+        recovery = dict(self.data_cache.get("dental_recovery") or dental_recovery_defaults())
+        recovery["enabled"] = False
+        self.data_cache["dental_recovery"] = recovery
+        self.save_data()
+        self.refresh_dental_ui()
+        self.set_status("Dental recovery mode paused.")
+
+    def _stage_desktop_image(self, source: Path) -> Path:
+        if not self.paths:
+            return source
+        suffix = source.suffix.lower() if source.suffix.lower() in ALLOWED_IMAGE_EXTENSIONS else ".jpg"
+        target = self.paths.media_dir / f"desktop_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}{suffix}"
+        try:
+            shutil.copy2(source, target)
+            _set_owner_only_permissions(target)
+            return target
+        except Exception:
+            return source
+
+    def _capture_photo(
+        self,
+        prefix: str,
+        opening_status: str,
+        on_ready: Callable[[Path], None],
+        on_failure: Callable[[str], None],
+    ) -> None:
+        _ = prefix
+        self.set_status(opening_status)
+        self._pick_photo("Choose an image from your computer...", on_ready, on_failure)
+
+    def _pick_photo(
+        self,
+        choose_status: str,
+        on_ready: Callable[[Path], None],
+        on_failure: Callable[[str], None],
+    ) -> None:
+        if self.window is None:
+            on_failure("Desktop window is not available.")
+            return
+        self.set_status(choose_status)
+        try:
+            selection = filedialog.askopenfilename(
+                parent=self.window,
+                title="Select an image",
+                initialdir=str(self.paths.media_dir if self.paths else Path.home()),
+                filetypes=[("Image files", "*.jpg *.jpeg *.png *.webp"), ("All files", "*.*")],
+            )
+        except Exception as exc:
+            on_failure(str(exc))
+            return
+        if not selection:
+            self.set_status("Photo selection cancelled.")
+            return
+        try:
+            chosen = self._stage_desktop_image(Path(selection))
+        except Exception as exc:
+            on_failure(str(exc))
+            return
+        on_ready(chosen)
+
+    def append_assistant_message(self, role: str, content: str) -> None:
+        history = list(self.data_cache.get("assistant_history") or [])
+        history.append({"role": role, "content": sanitize_text(content, max_chars=3000), "timestamp": time.time()})
+        self.data_cache["assistant_history"] = history[-24:]
+        self.save_data()
+        self.refresh_assistant_history()
+
+    def on_assistant_send(self) -> None:
+        prompt = sanitize_text(self.ids.assistant_input.text, max_chars=1600)
+        if not prompt or not self.vault:
+            return
+        self.ids.assistant_input.text = ""
+        self.append_assistant_message("user", prompt)
+        self.set_status("Thinking with Gemma 4...")
+
+        snapshot = ensure_vault_shape(json.loads(json.dumps(self.data_cache)))
+        settings = dict(self.settings_data)
+        key = self.vault.get_or_create_key()
+
+        def worker() -> None:
+            try:
+                reply = run_assistant_request(key, snapshot, prompt, self.selected_med_id, settings)
+            except Exception as exc:
+                reply = f"Assistant unavailable: {exc}"
+            self.run_on_ui_thread(self._assistant_done, reply)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _assistant_done(self, reply: str) -> None:
+        self.append_assistant_message("assistant", reply)
+        self.set_status("Assistant reply ready.")
+
+    def on_assistant_clear(self) -> None:
+        self.data_cache["assistant_history"] = []
+        self.save_data()
+        self.refresh_assistant_history()
+        self.set_status("Assistant chat cleared.")
+
+    def _start_image_analysis(self, image_path: Path) -> None:
+        if not self.vault:
+            return
+        self.ids.vision_last_file.text = f"Last image: {image_path.name}"
+        self.ids.vision_status.text = "Reading bottle photo with Gemma 4..."
+        self.set_status("Importing medication from photo...")
+        key = self.vault.get_or_create_key()
+        settings = dict(self.settings_data)
+
+        def worker() -> None:
+            try:
+                payload, raw = analyze_medication_image(key, image_path, settings)
+                updated, med_id, created = apply_vision_payload(self.data_cache, payload, selected_med_id=self.selected_med_id)
+                self.run_on_ui_thread(self._vision_done, updated, med_id, payload, created, raw)
+            except Exception as exc:
+                self.run_on_ui_thread(self._vision_failed, str(exc))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _vision_done(self, updated: Dict[str, Any], med_id: str, payload: Dict[str, Any], created: bool, raw: str) -> None:
+        self.data_cache = ensure_vault_shape(updated)
+        self.selected_med_id = med_id
+        self.save_data()
+        action = "Added" if created else "Updated"
+        confidence = payload.get("confidence", 0.0)
+        self.ids.vision_status.text = f"{action} {payload['name']} from the bottle photo."
+        self.ids.vision_result.text = (
+            f"{action} {payload['name']}\n"
+            f"Dose: {payload['dose_mg']:g} mg\n"
+            f"Interval: {payload['interval_hours']:g} hours\n"
+            f"Max daily: {payload['max_daily_mg']:g} mg\n"
+            f"Directions: {payload['schedule_text']}\n"
+            f"Notes: {payload['notes'] or 'None'}\n"
+            f"Review risk: {payload['risk_level']} | {payload['risk_score']:.0f}/100\n"
+            f"Risk note: {payload['risk_summary'] or 'Review the label manually before relying on the import.'}\n"
+            f"Confidence: {confidence:.2f}\n"
+            f"Model raw: {sanitize_text(raw, max_chars=420)}"
+        )
+        self.last_check_level = payload["risk_level"]
+        self.last_check_display = f"Bottle review risk: {payload['risk_level']}"
+        self.last_check_message = payload["risk_summary"] or f"{payload['name']} was saved from the bottle photo."
+        self.refresh_ui()
+        self.set_status(f"{action} {payload['name']} from the bottle photo.")
+        if payload["risk_level"] == "High":
+            self.show_dialog(
+                "Bottle Photo Needs Review",
+                "The quantum-assisted bottle import marked this photo as high review risk.\n\n"
+                + sanitize_text(payload.get("risk_summary") or "", max_chars=320),
+            )
+
+    def _vision_failed(self, message: str) -> None:
+        self.ids.vision_status.text = f"Import failed: {sanitize_text(message, max_chars=200)}"
+        self.set_status("Bottle photo import failed.")
+        self.show_dialog("Bottle Photo Import Failed", message)
+
+    def on_take_bottle_photo(self) -> None:
+        self.ids.vision_status.text = "Choose a bottle photo from this computer..."
+        self._capture_photo("pill", "Choose a bottle photo from your computer...", self._start_image_analysis, self._vision_failed)
+
+    def on_pick_bottle_photo(self) -> None:
+        self.ids.vision_status.text = "Waiting for image selection..."
+        self._pick_photo("Choose a medicine bottle photo...", self._start_image_analysis, self._vision_failed)
+
+    def _dental_hygiene_failed(self, message: str) -> None:
+        self.ids.dental_hygiene_status.text = f"Review failed: {sanitize_text(message, max_chars=220)}"
+        self.set_status("Dental hygiene review failed.")
+        self.show_dialog("Dental Hygiene Review Failed", message)
+
+    def _start_dental_hygiene_analysis(self, image_path: Path) -> None:
+        if not self.vault:
+            return
+        self.ids.dental_hygiene_photo.text = f"Last hygiene photo: {image_path.name}"
+        self.ids.dental_hygiene_status.text = "Reviewing hygiene photo with Gemma 4..."
+        self.set_status("Reviewing dental hygiene photo...")
+        key = self.vault.get_or_create_key()
+        settings = dict(self.settings_data)
+
+        def worker() -> None:
+            try:
+                payload, raw = analyze_dental_hygiene_image(key, image_path, settings)
+                updated = apply_dental_hygiene_payload(self.data_cache, payload)
+                self.run_on_ui_thread(self._dental_hygiene_done, updated, payload, raw)
+            except Exception as exc:
+                self.run_on_ui_thread(self._dental_hygiene_failed, str(exc))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _dental_hygiene_done(self, updated: Dict[str, Any], payload: Dict[str, Any], raw: str) -> None:
+        self.data_cache = ensure_vault_shape(updated)
+        self.save_data()
+        _ = raw
+        self.last_check_level = payload["risk_level"]
+        self.last_check_display = f"Dental hygiene risk: {payload['risk_level']}"
+        self.last_check_message = payload["risk_summary"] or f"{payload['rating']} hygiene rating saved in the encrypted dental journal."
+        self.refresh_dental_ui()
+        self.set_status("Dental hygiene review saved.")
+        if payload["risk_level"] == "High" or warning_text_needs_attention(payload.get("warning_flags", "")):
+            self.show_dialog(
+                "Dental Hygiene Attention Flag",
+                "The vision review noticed something worth checking more closely.\n\n"
+                + sanitize_text(payload.get("risk_summary") or payload.get("warning_flags") or "", max_chars=320),
+            )
+
+    def on_take_dental_hygiene_photo(self) -> None:
+        self.ids.dental_hygiene_status.text = "Choose a hygiene photo from this computer..."
+        self._capture_photo("dental_hygiene", "Choose a dental hygiene photo...", self._start_dental_hygiene_analysis, self._dental_hygiene_failed)
+
+    def on_pick_dental_hygiene_photo(self) -> None:
+        self.ids.dental_hygiene_status.text = "Waiting for image selection..."
+        self._pick_photo("Choose a teeth or mouth photo...", self._start_dental_hygiene_analysis, self._dental_hygiene_failed)
+
+    def _recovery_failed(self, message: str) -> None:
+        self.ids.recovery_mode_status.text = f"Review failed: {sanitize_text(message, max_chars=220)}"
+        self.set_status("Dental recovery review failed.")
+        self.show_dialog("Dental Recovery Review Failed", message)
+
+    def _start_recovery_analysis(self, image_path: Path) -> None:
+        if not self.vault:
+            return
+        recovery_state = self.recovery_state_from_form()
+        if not recovery_state["procedure_type"]:
+            self._recovery_failed("Enter the procedure type before running recovery mode.")
+            return
+        if recovery_state["procedure_date"] and parse_date_string(recovery_state["procedure_date"]) is None:
+            self._recovery_failed("Use YYYY-MM-DD for the procedure date before running recovery mode.")
+            return
+        self.ids.recovery_last_photo.text = f"Last recovery photo: {image_path.name}"
+        self.ids.recovery_mode_status.text = "Reviewing recovery photo with Gemma 4..."
+        self.set_status("Reviewing dental recovery photo...")
+        key = self.vault.get_or_create_key()
+        settings = dict(self.settings_data)
+
+        def worker() -> None:
+            try:
+                payload, raw = analyze_dental_recovery_image(key, image_path, settings, recovery_state)
+                updated = apply_dental_recovery_payload(self.data_cache, payload, recovery_state)
+                self.run_on_ui_thread(self._recovery_done, updated, payload, raw)
+            except Exception as exc:
+                self.run_on_ui_thread(self._recovery_failed, str(exc))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _recovery_done(self, updated: Dict[str, Any], payload: Dict[str, Any], raw: str) -> None:
+        self.data_cache = ensure_vault_shape(updated)
+        self.save_data()
+        _ = raw
+        self.last_check_level = payload["risk_level"]
+        self.last_check_display = f"Recovery risk: {payload['risk_level']}"
+        self.last_check_message = payload["risk_summary"] or (
+            "General aftercare suggestions were saved. This is not a diagnosis and does not replace your dentist."
+        )
+        self.refresh_dental_ui()
+        self.set_status("Dental recovery review saved.")
+        if payload["risk_level"] == "High" or warning_text_needs_attention(payload.get("warning_flags", "")):
+            self.show_dialog(
+                "Dental Recovery Attention Flag",
+                "The vision review noticed a recovery warning that may deserve a dentist check.\n\n"
+                + sanitize_text(payload.get("risk_summary") or payload.get("warning_flags") or "", max_chars=320),
+            )
+
+    def on_take_recovery_photo(self) -> None:
+        self.ids.recovery_mode_status.text = "Choose a recovery photo from this computer..."
+        self._capture_photo("dental_recovery", "Choose a recovery check-in photo...", self._start_recovery_analysis, self._recovery_failed)
+
+    def on_pick_recovery_photo(self) -> None:
+        self.ids.recovery_mode_status.text = "Waiting for image selection..."
+        self._pick_photo("Choose a recovery check-in photo...", self._start_recovery_analysis, self._recovery_failed)
+
+    def _run_model_task(self, worker: Callable[[], Any], on_done: Callable[[Any], None], failure_title: str) -> None:
+        def runner() -> None:
+            try:
+                result = worker()
+                self.run_on_ui_thread(on_done, result)
+            except Exception as exc:
+                self.run_on_ui_thread(self._model_task_failed, failure_title, str(exc))
+
+        threading.Thread(target=runner, daemon=True).start()
+
+    def _model_task_failed(self, title: str, message: str) -> None:
+        self.ids.model_progress.value = 0
+        self.set_status(message)
+        self.show_dialog(title, message)
+        self.refresh_model_status()
+
+    def on_model_download(self) -> None:
+        if not self.vault:
+            return
+        self.ids.model_progress.value = 0
+        self.set_status("Downloading Gemma 4...")
+        key = self.vault.get_or_create_key()
+
+        def worker() -> str:
+            def reporter(kind: str, payload: Any) -> None:
+                if kind == "progress":
+                    self.run_on_ui_thread(setattr, self.ids.model_progress, "value", int(float(payload) * 100))
+                elif kind == "status":
+                    self.run_on_ui_thread(self.set_status, sanitize_text(payload, max_chars=180))
+
+            return download_and_encrypt_model(key, reporter)
+
+        self._run_model_task(worker, self._model_download_done, "Model Download Failed")
+
+    def _model_download_done(self, sha: str) -> None:
+        self.ids.model_progress.value = 100
+        self.set_status("Gemma 4 downloaded and sealed.")
+        self.refresh_model_status()
+        self.show_dialog("Gemma 4 Ready", f"Model sealed successfully.\nSHA-256: {sha}")
+
+    def on_model_verify(self) -> None:
+        if not self.vault:
+            return
+        self.ids.model_progress.value = 15
+        self.set_status("Verifying model hash...")
+        key = self.vault.get_or_create_key()
+        self._run_model_task(lambda: verify_model_hash(key), self._model_verify_done, "Model Verification Failed")
+
+    def _model_verify_done(self, result: Tuple[str, bool]) -> None:
+        sha, okay = result
+        self.ids.model_progress.value = 100 if okay else 0
+        self.set_status("Model hash verified." if okay else "Model hash mismatch.")
+        self.refresh_model_status()
+        self.show_dialog("Model Verification", f"SHA-256: {sha}\nMatches expected hash: {'yes' if okay else 'no'}")
+
+    def on_cycle_backend(self) -> None:
+        current = self.settings_data.get("inference_backend", "Auto")
+        options = list(INFERENCE_BACKEND_OPTIONS)
+        current_index = options.index(current) if current in options else 0
+        next_value = options[(current_index + 1) % len(options)]
+        save_settings({"inference_backend": next_value}, self.paths)
+        self.settings_data = load_settings(self.paths)
+        self.refresh_model_status()
+        self.set_status(f"Inference backend set to {next_value}.")
+
+    def on_toggle_native_image_input(self) -> None:
+        enabled = not bool(self.settings_data.get("enable_native_image_input", True))
+        save_settings({"enable_native_image_input": enabled}, self.paths)
+        self.settings_data = load_settings(self.paths)
+        self.refresh_model_status()
+        self.set_status(f"Native image input {'enabled' if enabled else 'disabled'}.")
+
+    def on_change_startup_password(self) -> None:
+        if not self.vault:
+            return
+        password = self._prompt_new_password("Startup Password")
+        if password is None:
+            return
+        try:
+            self.vault.enable_password(password)
+            self._save_security_settings()
+            self.refresh_model_status()
+            self.set_status("Startup password saved. MedSafe will ask for it on the next launch.")
+        except Exception as exc:
+            self.show_dialog("Password Update Failed", str(exc))
+            self.set_status("Startup password update failed.")
+
+    def on_remove_startup_password(self) -> None:
+        if not self.vault:
+            return
+        if not self.vault.is_key_protected():
+            self.set_status("Startup password is already off.")
+            return
+        if self.window is not None and not messagebox.askyesno(
+            "Remove Startup Password",
+            "Turn off the startup password for future launches?\n\nThe vault will stay encrypted, but the local key will no longer be password-wrapped.",
+            parent=self.window,
+        ):
+            return
+        try:
+            self.vault.disable_password()
+            self._save_security_settings()
+            self.refresh_model_status()
+            self.set_status("Startup password removed. The vault key now opens without a boot password.")
+        except Exception as exc:
+            self.show_dialog("Remove Password Failed", str(exc))
+            self.set_status("Could not remove the startup password.")
+
+    def on_rotate_vault_key(self) -> None:
+        if not self.vault:
+            return
+        if self.window is not None and not messagebox.askyesno(
+            "Rotate Vault Key",
+            "Rotate the local encryption key and reseal the vault and model with a fresh key now?\n\nThis can take a little longer if the model is installed.",
+            parent=self.window,
+        ):
+            return
+        self.ids.model_progress.value = 12
+        self.set_status("Rotating the encrypted vault key...")
+        self._run_model_task(lambda: self.vault.rotate_key(), self._rotate_vault_key_done, "Key Rotation Failed")
+
+    def _rotate_vault_key_done(self, _result: Any) -> None:
+        self.ids.model_progress.value = 100
+        self._save_security_settings()
+        self.refresh_model_status()
+        self.set_status("Vault key rotated and resealed successfully.")
+        self.show_dialog("Key Rotation Complete", "MedSafe rotated the local encryption key and re-sealed protected files.")
+
+    def on_delete_plain_model(self) -> None:
+        if not self.paths:
+            return
+        safe_cleanup([self.paths.plain_model_path])
+        self.ids.model_progress.value = 0
+        self.refresh_model_status()
+        self.set_status("Deleted any leftover plaintext model copy.")
+
+
+def _desktop_render_daily_checklist(self: DesktopMedSafeApp, meds: List[Dict[str, Any]], selected_med: Optional[Dict[str, Any]], now: float) -> None:
+    frame = self.ids.daily_checklist_frame
+    for child in frame.winfo_children():
+        child.destroy()
+    frame.grid_columnconfigure(0, weight=1)
+    if not meds:
+        ctk.CTkLabel(
+            frame,
+            text="Add a medication with planned times to build today's checklist.",
+            anchor="w",
+            justify="left",
+            wraplength=560,
+            text_color=DESKTOP_MUTED,
+            font=ctk.CTkFont(size=13),
+        ).grid(row=0, column=0, sticky="ew", padx=12, pady=12)
+        return
+
+    entries = build_dashboard_daily_checklist_entries(meds, datetime.fromtimestamp(now).date(), now)
+    if not entries:
+        next_rows = []
+        for med in meds:
+            next_slot = next_unchecked_medication_slot(med, now)
+            if next_slot is not None:
+                next_rows.append((safe_float(next_slot.get("scheduled_ts")) or float("inf"), med, next_slot))
+        next_rows.sort(key=lambda item: item[0])
+        message = "No planned medication slots for today yet. Add custom times or intervals to generate the checklist."
+        if next_rows:
+            _next_ts, med, next_slot = next_rows[0]
+            message = (
+                f"Nothing left for today. Next planned dose: "
+                f"{sanitize_text(med.get('name') or 'Medication', max_chars=120)} at {next_slot['time_text']} ({next_slot['label']})."
+            )
+        ctk.CTkLabel(
+            frame,
+            text=message,
+            anchor="w",
+            justify="left",
+            wraplength=560,
+            text_color=DESKTOP_MUTED,
+            font=ctk.CTkFont(size=13),
+        ).grid(row=0, column=0, sticky="ew", padx=12, pady=12)
+        return
+
+    for row_index, entry in enumerate(entries):
+        row = ctk.CTkFrame(frame, fg_color="transparent")
+        row.grid(row=row_index, column=0, sticky="ew", padx=8, pady=4)
+        row.grid_columnconfigure(1, weight=1)
+
+        checkbox = ctk.CTkCheckBox(
+            row,
+            text=entry["time_text"],
+            fg_color=DESKTOP_ACCENT,
+            hover_color="#0d6b63",
+            border_color=DESKTOP_BORDER,
+            text_color=DESKTOP_TEXT,
+            font=ctk.CTkFont(size=14, weight="bold"),
+        )
+        checkbox.grid(row=0, column=0, sticky="w", padx=(4, 10))
+        if entry.get("status") == "taken":
+            checkbox.select()
+            checkbox.configure(state="disabled")
+        elif entry.get("status") == "missed":
+            checkbox.deselect()
+            checkbox.configure(state="disabled")
+        else:
+            checkbox.deselect()
+            checkbox.configure(
+                command=lambda med_id=str(entry.get("med_id")), slot_label=str(entry.get("label")): self.on_checklist_take_dose(med_id, slot_label)
+            )
+
+        details_text = f"{entry['med_name']} • {entry['dose_text']} • {entry['label']}"
+        if selected_med and str(selected_med.get("id")) == str(entry.get("med_id")):
+            details_text += " • Focused"
+        ctk.CTkLabel(
+            row,
+            text=details_text,
+            anchor="w",
+            justify="left",
+            wraplength=360,
+            text_color=DESKTOP_TEXT,
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).grid(row=0, column=1, sticky="ew")
+
+        if entry.get("status") == "missed":
+            status_color = DESKTOP_DANGER
+            status_text = f"X {entry['status_text']}"
+        elif entry.get("status") == "due":
+            status_color = DESKTOP_WARNING
+            status_text = f"! {entry['status_text']}"
+        elif entry.get("status") == "taken":
+            status_color = DESKTOP_SUCCESS
+            status_text = entry["status_text"]
+        else:
+            status_color = DESKTOP_MUTED
+            status_text = entry["status_text"]
+
+        ctk.CTkLabel(
+            row,
+            text=status_text,
+            anchor="w",
+            justify="left",
+            wraplength=250,
+            text_color=status_color,
+            font=ctk.CTkFont(size=13),
+        ).grid(row=0, column=2, sticky="ew", padx=(10, 0))
+
+        if entry.get("status") == "missed":
+            self._button(
+                row,
+                text="Take Now",
+                command=lambda med_id=str(entry.get("med_id")), slot_label=str(entry.get("label")): self.on_checklist_take_dose(med_id, slot_label),
+                tone="warning",
+            ).grid(row=0, column=3, sticky="e", padx=(10, 0))
+
+
+def _desktop_on_checklist_take_dose(self: DesktopMedSafeApp, med_id: str, slot_label: str) -> None:
+    self.selected_med_id = med_id
+    self.refresh_form()
+    med = self.current_selected_med()
+    if not med:
+        return
+    self._log_dose_for_med(med, source_label=slot_label)
+
+
+def _desktop_refresh_dashboard(self: DesktopMedSafeApp) -> None:
+    now = time.time()
+    meds = list(self.data_cache.get("meds") or [])
+    med_statuses = [(medication_due_status(med, now), med) for med in meds]
+    due_now = [med for status, med in med_statuses if status["due_now"] and not status["overdue"]]
+    overdue = [med for status, med in med_statuses if status["overdue"]]
+    next_due_items = [
+        (status["next_ts"], med)
+        for status, med in med_statuses
+        if status["next_ts"] is not None
+    ]
+    next_due_items.sort(key=lambda item: item[0] or float("inf"))
+    next_due_text = "Nothing scheduled yet"
+    if next_due_items:
+        next_due_ts, med = next_due_items[0]
+        next_due_text = f"{sanitize_text(med.get('name'), max_chars=120)} | {format_relative_due(next_due_ts, now)}"
+
+    selected = self.current_selected_med()
+    selection_text = "Select a medication to log doses."
+    summary_text = "No medication selected."
+    schedule_text = "Today's dose plan will appear here."
+    if selected:
+        selected_slots = build_medication_daily_slots(selected, datetime.fromtimestamp(now).date(), now)
+        remaining_slots = len([slot for slot in selected_slots if slot.get("status") != "taken"])
+        selection_text = f"Focused med: {sanitize_text(selected.get('name'), max_chars=120)}"
+        summary_text = (
+            f"{sanitize_text(selected.get('name'), max_chars=120)}\n"
+            f"{medication_card_line(selected, now)}\n"
+            f"Last taken: {format_timestamp(safe_float(selected.get('last_taken_ts')))}\n"
+            f"Remaining planned slots today: {remaining_slots}\n"
+            f"Directions: {sanitize_text(selected.get('schedule_text') or 'No bottle directions saved yet.', max_chars=260)}"
+        )
+        schedule_text = build_medication_schedule_text(selected, now)
+
+    self.ids.dose_wheel.set_level(self.last_check_level)
+    self.ids.dashboard_risk_title.text = self.last_check_display
+    self.ids.dashboard_risk_caption.text = self.last_check_message
+    self.ids.today_due_count.text = f"{len(due_now)} active | {len(overdue)} missed"
+    self.ids.today_next_due.text = next_due_text
+    self.ids.today_timeline.text = build_timeline_text(meds, now)
+    self.ids.dashboard_selection.text = selection_text
+    self.ids.selected_med_summary.text = summary_text
+    self.ids.selected_med_schedule.text = schedule_text
+    self.ids.selected_med_history.text = build_med_history_text(selected)
+    self.ids.dashboard_nudge.text = build_medication_nudge_text(selected, now)
+    self.ids.daily_checklist_hint.text = (
+        "Each row shows the time, medication, and planned dose. Check it when you take it; "
+        "missed slots get an X and elapsed time."
+    )
+    self._render_daily_checklist(meds, selected, now)
+
+
+def _desktop_build_exercise_tab(self: DesktopMedSafeApp, tab: Any) -> None:
+    tab.grid_columnconfigure(0, weight=1)
+    tab.grid_rowconfigure(0, weight=1)
+    scroll = ctk.CTkScrollableFrame(
+        tab,
+        fg_color="transparent",
+        scrollbar_button_color="#314455",
+        scrollbar_button_hover_color="#42586c",
+    )
+    scroll.grid(row=0, column=0, sticky="nsew", padx=14, pady=14)
+    scroll.grid_columnconfigure(0, weight=1)
+
+    overview = self._card(scroll)
+    overview.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+    overview.grid_columnconfigure(0, weight=1)
+    overview_title = self._label(overview, text="Movement studio ready", bold=True, wrap=980)
+    overview_title.widget.grid(row=0, column=0, sticky="ew", padx=18, pady=(18, 8))
+    self._register("exercise_overview_title", overview_title)
+    overview_body = self._label(
+        overview,
+        text="Walking, gentle exercise, and stretch reminders all stay local and follow your computer clock.",
+        muted=True,
+        wrap=980,
+    )
+    overview_body.widget.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 10))
+    self._register("exercise_overview_body", overview_body)
+    goal_summary = self._label(
+        overview,
+        text="Today's movement totals will appear here.",
+        muted=True,
+        wrap=980,
+    )
+    goal_summary.widget.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 18))
+    self._register("exercise_goal_summary", goal_summary)
+
+    habits = self._card(scroll)
+    habits.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+    habits.grid_columnconfigure((0, 1, 2), weight=1)
+    for column, (prefix, title, default_minutes) in enumerate(EXERCISE_HABITS):
+        habit_card = ctk.CTkFrame(habits, fg_color=DESKTOP_SURFACE_ALT, border_width=1, border_color=DESKTOP_BORDER, corner_radius=14)
+        habit_card.grid(row=0, column=column, sticky="nsew", padx=(18 if column == 0 else 8, 18 if column == 2 else 8), pady=18)
+        habit_card.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(habit_card, text=title, anchor="w", text_color=DESKTOP_TEXT, font=ctk.CTkFont(size=17, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=14, pady=(14, 6)
+        )
+        status = self._label(habit_card, text="Ready", bold=True, wrap=240)
+        status.widget.grid(row=1, column=0, sticky="ew", padx=14)
+        self._register(f"exercise_{prefix}_status", status)
+        caption = self._label(habit_card, text="Ready now", muted=True, wrap=240)
+        caption.widget.grid(row=2, column=0, sticky="ew", padx=14, pady=(6, 12))
+        self._register(f"exercise_{prefix}_caption", caption)
+        self._button(
+            habit_card,
+            text=f"Log {title} ({default_minutes:g}m)",
+            command=lambda habit_name=prefix: self.on_log_exercise_habit(habit_name),
+            tone="neutral" if prefix != "light" else "warning",
+        ).grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 14))
+
+    settings = self._card(scroll)
+    settings.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+    settings.grid_columnconfigure((0, 1, 2), weight=1)
+    ctk.CTkLabel(settings, text="Walk interval (h)", anchor="w", text_color=DESKTOP_MUTED).grid(row=0, column=0, sticky="w", padx=(18, 8), pady=(18, 0))
+    ctk.CTkLabel(settings, text="Light exercise interval (h)", anchor="w", text_color=DESKTOP_MUTED).grid(row=0, column=1, sticky="w", padx=8, pady=(18, 0))
+    ctk.CTkLabel(settings, text="Stretch interval (h)", anchor="w", text_color=DESKTOP_MUTED).grid(row=0, column=2, sticky="w", padx=(8, 18), pady=(18, 0))
+    walk_interval = self._entry(settings, placeholder="Walk every 4h")
+    light_interval = self._entry(settings, placeholder="Light exercise every 8h")
+    stretch_interval = self._entry(settings, placeholder="Stretch every 2h")
+    walk_interval.widget.grid(row=1, column=0, sticky="ew", padx=(18, 8), pady=(6, 12))
+    light_interval.widget.grid(row=1, column=1, sticky="ew", padx=8, pady=(6, 12))
+    stretch_interval.widget.grid(row=1, column=2, sticky="ew", padx=(8, 18), pady=(6, 12))
+    self._register("exercise_walk_interval", walk_interval)
+    self._register("exercise_light_interval", light_interval)
+    self._register("exercise_stretch_interval", stretch_interval)
+
+    ctk.CTkLabel(settings, text="Walk goal (min/day)", anchor="w", text_color=DESKTOP_MUTED).grid(row=2, column=0, sticky="w", padx=(18, 8))
+    ctk.CTkLabel(settings, text="Light exercise goal (min/day)", anchor="w", text_color=DESKTOP_MUTED).grid(row=2, column=1, sticky="w", padx=8)
+    ctk.CTkLabel(settings, text="Stretch goal (min/day)", anchor="w", text_color=DESKTOP_MUTED).grid(row=2, column=2, sticky="w", padx=(8, 18))
+    walk_goal = self._entry(settings, placeholder="30")
+    light_goal = self._entry(settings, placeholder="20")
+    stretch_goal = self._entry(settings, placeholder="10")
+    walk_goal.widget.grid(row=3, column=0, sticky="ew", padx=(18, 8), pady=(6, 12))
+    light_goal.widget.grid(row=3, column=1, sticky="ew", padx=8, pady=(6, 12))
+    stretch_goal.widget.grid(row=3, column=2, sticky="ew", padx=(8, 18), pady=(6, 12))
+    self._register("exercise_walk_goal", walk_goal)
+    self._register("exercise_light_goal", light_goal)
+    self._register("exercise_stretch_goal", stretch_goal)
+
+    ctk.CTkLabel(settings, text="Movement notes", anchor="w", text_color=DESKTOP_MUTED).grid(row=4, column=0, columnspan=3, sticky="w", padx=18)
+    notes = self._edit_box(settings, height=110)
+    notes.widget.grid(row=5, column=0, columnspan=3, sticky="ew", padx=18, pady=(6, 12))
+    self._register("exercise_notes", notes)
+    buttons = ctk.CTkFrame(settings, fg_color="transparent")
+    buttons.grid(row=6, column=0, columnspan=3, sticky="ew", padx=18, pady=(0, 18))
+    buttons.grid_columnconfigure((0, 1), weight=1)
+    self._button(buttons, text="Save Movement Settings", command=self.on_save_exercise_settings).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+    self._button(buttons, text="Reset Defaults", command=self.on_reset_exercise_settings, tone="neutral").grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+    history = self._card(scroll)
+    history.grid(row=3, column=0, sticky="ew")
+    history.grid_columnconfigure(0, weight=1)
+    ctk.CTkLabel(history, text="Movement History", anchor="w", text_color=DESKTOP_TEXT, font=ctk.CTkFont(size=18, weight="bold")).grid(
+        row=0, column=0, sticky="w", padx=18, pady=(18, 10)
+    )
+    history_box = self._readonly_box(history, height=220)
+    history_box.widget.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 18))
+    self._register("exercise_history", history_box)
+
+
+def _desktop_refresh_exercise_ui(self: DesktopMedSafeApp) -> None:
+    now = time.time()
+    state = dict(self.data_cache.get("exercise") or exercise_defaults())
+    overview_title, overview_body = build_exercise_overview(state, now)
+    totals = build_exercise_daily_totals(state, now)
+    self.ids.exercise_overview_title.text = overview_title
+    self.ids.exercise_overview_body.text = overview_body
+    self.ids.exercise_goal_summary.text = (
+        f"Walk {totals['walk']:.0f}/{max(1.0, safe_float(state.get('daily_walk_goal_minutes')) or 30.0):.0f} min | "
+        f"Light {totals['light']:.0f}/{max(1.0, safe_float(state.get('daily_light_goal_minutes')) or 20.0):.0f} min | "
+        f"Stretch {totals['stretch']:.0f}/{max(1.0, safe_float(state.get('daily_stretch_goal_minutes')) or 10.0):.0f} min"
+    )
+
+    for prefix, last_key, interval_key in (
+        ("walk", "last_walk_ts", "walk_interval_hours"),
+        ("light", "last_light_ts", "light_interval_hours"),
+        ("stretch", "last_stretch_ts", "stretch_interval_hours"),
+    ):
+        status = habit_due_status(safe_float(state.get(last_key)), safe_float(state.get(interval_key)) or 1.0, now)
+        title_color, caption_color = habit_palette(status)
+        self.ids[f"exercise_{prefix}_status"].text = status["state"]
+        self.ids[f"exercise_{prefix}_status"].text_color = title_color
+        self.ids[f"exercise_{prefix}_caption"].text = f"{status['text']} | every {max(0.5, safe_float(state.get(interval_key))):g}h"
+        self.ids[f"exercise_{prefix}_caption"].text_color = caption_color
+
+    self.set_field_text("exercise_walk_interval", f"{max(0.5, safe_float(state.get('walk_interval_hours'))):g}")
+    self.set_field_text("exercise_light_interval", f"{max(0.5, safe_float(state.get('light_interval_hours'))):g}")
+    self.set_field_text("exercise_stretch_interval", f"{max(0.5, safe_float(state.get('stretch_interval_hours'))):g}")
+    self.set_field_text("exercise_walk_goal", f"{max(1.0, safe_float(state.get('daily_walk_goal_minutes'))):g}")
+    self.set_field_text("exercise_light_goal", f"{max(1.0, safe_float(state.get('daily_light_goal_minutes'))):g}")
+    self.set_field_text("exercise_stretch_goal", f"{max(1.0, safe_float(state.get('daily_stretch_goal_minutes'))):g}")
+    self.set_field_text("exercise_notes", sanitize_text(state.get("notes") or "", max_chars=800))
+    self.ids.exercise_history.text = build_exercise_history_text(state)
+
+
+def _desktop_on_log_exercise_habit(self: DesktopMedSafeApp, habit: str) -> None:
+    config = {
+        "walk": ("Walk", "last_walk_ts", 15.0),
+        "light": ("Light exercise", "last_light_ts", 10.0),
+        "stretch": ("Stretch", "last_stretch_ts", 5.0),
+    }
+    if habit not in config:
+        return
+    label, last_key, minutes = config[habit]
+    state = dict(self.data_cache.get("exercise") or exercise_defaults())
+    now = time.time()
+    state[last_key] = now
+    state["history"] = list(state.get("history") or []) + [{"timestamp": now, "habit": habit, "minutes": minutes}]
+    state["history"] = state["history"][-240:]
+    self.data_cache["exercise"] = state
+    self.save_data()
+    self.refresh_exercise_ui()
+    self.set_status(f"Logged {label.lower()} session ({minutes:g} min).")
+
+
+def _desktop_on_save_exercise_settings(self: DesktopMedSafeApp) -> None:
+    state = dict(self.data_cache.get("exercise") or exercise_defaults())
+    walk_interval = max(0.5, safe_float(self.ids.exercise_walk_interval.text) or safe_float(state.get("walk_interval_hours")) or 4.0)
+    light_interval = max(0.5, safe_float(self.ids.exercise_light_interval.text) or safe_float(state.get("light_interval_hours")) or 8.0)
+    stretch_interval = max(0.5, safe_float(self.ids.exercise_stretch_interval.text) or safe_float(state.get("stretch_interval_hours")) or 2.0)
+    walk_goal = max(1.0, safe_float(self.ids.exercise_walk_goal.text) or safe_float(state.get("daily_walk_goal_minutes")) or 30.0)
+    light_goal = max(1.0, safe_float(self.ids.exercise_light_goal.text) or safe_float(state.get("daily_light_goal_minutes")) or 20.0)
+    stretch_goal = max(1.0, safe_float(self.ids.exercise_stretch_goal.text) or safe_float(state.get("daily_stretch_goal_minutes")) or 10.0)
+    state.update(
+        {
+            "walk_interval_hours": walk_interval,
+            "light_interval_hours": light_interval,
+            "stretch_interval_hours": stretch_interval,
+            "daily_walk_goal_minutes": walk_goal,
+            "daily_light_goal_minutes": light_goal,
+            "daily_stretch_goal_minutes": stretch_goal,
+            "notes": sanitize_text(self.ids.exercise_notes.text, max_chars=800),
+        }
+    )
+    self.data_cache["exercise"] = state
+    self.save_data()
+    self.refresh_exercise_ui()
+    self.set_status("Exercise reminder rhythm saved.")
+
+
+def _desktop_on_reset_exercise_settings(self: DesktopMedSafeApp) -> None:
+    defaults = exercise_defaults()
+    state = dict(self.data_cache.get("exercise") or exercise_defaults())
+    state.update(
+        {
+            "walk_interval_hours": defaults["walk_interval_hours"],
+            "light_interval_hours": defaults["light_interval_hours"],
+            "stretch_interval_hours": defaults["stretch_interval_hours"],
+            "daily_walk_goal_minutes": defaults["daily_walk_goal_minutes"],
+            "daily_light_goal_minutes": defaults["daily_light_goal_minutes"],
+            "daily_stretch_goal_minutes": defaults["daily_stretch_goal_minutes"],
+            "notes": defaults["notes"],
+        }
+    )
+    self.data_cache["exercise"] = state
+    self.save_data()
+    self.refresh_exercise_ui()
+    self.set_status("Exercise reminder defaults restored.")
+
+
+DesktopMedSafeApp._build_exercise_tab = _desktop_build_exercise_tab
+DesktopMedSafeApp.refresh_exercise_ui = _desktop_refresh_exercise_ui
+DesktopMedSafeApp.on_log_exercise_habit = _desktop_on_log_exercise_habit
+DesktopMedSafeApp.on_save_exercise_settings = _desktop_on_save_exercise_settings
+DesktopMedSafeApp.on_reset_exercise_settings = _desktop_on_reset_exercise_settings
+
+
+DesktopMedSafeApp._render_daily_checklist = _desktop_render_daily_checklist
+DesktopMedSafeApp.on_checklist_take_dose = _desktop_on_checklist_take_dose
+DesktopMedSafeApp.refresh_dashboard = _desktop_refresh_dashboard
+
+
+MedSafeApp = DesktopMedSafeApp
+
+
+if __name__ == "__main__":
+    MedSafeApp().run()
