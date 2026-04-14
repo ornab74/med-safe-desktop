@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import math
+import multiprocessing as mp
 import os
+import queue
 import random
 import re
 import shutil
@@ -195,6 +197,17 @@ EXERCISE_HABITS: Tuple[Tuple[str, str, float], ...] = (
     ("light", "Light Exercise", 10.0),
     ("stretch", "Stretch", 5.0),
 )
+RECOVERY_SUPPORT_MILESTONES: Tuple[Tuple[int, int, str], ...] = (
+    (1, 10, "Day 1 reset"),
+    (3, 15, "3-day foothold"),
+    (7, 25, "1-week streak"),
+    (14, 40, "2-week streak"),
+    (30, 75, "30-day milestone"),
+    (60, 120, "60-day milestone"),
+    (90, 180, "90-day milestone"),
+    (180, 320, "180-day milestone"),
+    (365, 700, "1-year milestone"),
+)
 DEFAULT_SETTINGS = {
     "inference_backend": "Auto",
     "auto_selected_inference_backend": "",
@@ -204,6 +217,7 @@ DEFAULT_SETTINGS = {
 }
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 JSON_BLOCK_RE = re.compile(r"\{.*\}", re.S)
+ACTION_BLOCK_RE = re.compile(r"\[action\]\s*([A-Za-z]+)\s*\[/action\]", re.I | re.S)
 
 APP_PATHS: Optional["AppPaths"] = None
 litert_lm = None
@@ -512,6 +526,47 @@ def format_relative_due(target_ts: Optional[float], now_ts: float) -> str:
     return f"{format_duration(abs(delta))} overdue"
 
 
+def normalize_dose_action_text(value: Any, fallback: str = "Caution") -> str:
+    lowered = sanitize_text(value, max_chars=40).strip().lower()
+    if lowered in {"safe", "low"}:
+        return "Safe"
+    if lowered in {"unsafe", "high"}:
+        return "Unsafe"
+    if lowered in {"caution", "medium", "warn", "warning"}:
+        return "Caution"
+    return fallback
+
+
+def resolve_dose_action_from_context(value: Any, context: Dict[str, Any]) -> str:
+    requested = normalize_dose_action_text(value, "Caution")
+    deterministic = normalize_dose_action_text(context.get("deterministic_level"), "Caution")
+    if deterministic == "Unsafe":
+        return "Unsafe"
+    if deterministic == "Caution":
+        return "Caution"
+    if deterministic == "Safe" and context.get("duplicate_ts") is None:
+        return "Safe"
+    return requested
+
+
+def extract_action_tag(text: str, fallback: str = "Caution") -> str:
+    clean = sanitize_text(text, max_chars=400).strip()
+    match = ACTION_BLOCK_RE.search(clean)
+    if match:
+        return normalize_dose_action_text(match.group(1), fallback)
+    first_token = clean.split(None, 1)[0] if clean else ""
+    return normalize_dose_action_text(first_token, fallback)
+
+
+def normalize_assistant_mode(value: Any) -> str:
+    lowered = sanitize_text(value or "", max_chars=40).strip().lower()
+    if lowered in {"therapy", "therapist", "support"}:
+        return "Therapy"
+    if lowered in {"recovery", "recovery coach", "recoverycoach", "coach", "sobriety", "clean"}:
+        return "Recovery Coach"
+    return "General"
+
+
 def mg_from_text(text: str) -> float:
     match = re.search(r"(\d+(?:\.\d+)?)\s*mg\b", text, re.I)
     return safe_float(match.group(1)) if match else 0.0
@@ -690,6 +745,14 @@ def keyword_risk_pressure(domain: str, context_text: str) -> float:
             ("as needed", 0.06),
             ("with food", 0.04),
         ),
+        "medication_dose_safety": (
+            ("exceed", 0.12),
+            ("too soon", 0.12),
+            ("duplicate", 0.10),
+            ("missed", 0.06),
+            ("overdue", 0.06),
+            ("limit", 0.10),
+        ),
         "dental_hygiene": (
             ("bleeding", 0.10),
             ("swelling", 0.10),
@@ -723,6 +786,14 @@ def build_quantum_risk_packet(domain: str, context_text: str) -> Dict[str, Any]:
             "summary_low": "Low review risk prior. Still confirm the label before relying on the imported schedule.",
             "summary_medium": "Medium review risk prior. Re-check the medication name, dose, interval, and max daily limit before relying on the import.",
             "summary_high": "High review risk prior. Verify every key label detail manually before saving or using this medication schedule.",
+        },
+        "medication_dose_safety": {
+            "domain_label": "medication_dose_safety",
+            "base_bias": 0.36,
+            "prior_rule": "Use the local prior as a tie-breaker only after the stored dose, interval, and last-24-hour total are checked. Hard numeric contradictions win over the prior.",
+            "summary_low": "Low dose-safety prior. The stored schedule looks internally consistent, but still respect the bottle and personal care instructions.",
+            "summary_medium": "Medium dose-safety prior. The local schedule may be close to a limit, early, or missing details, so review carefully before logging.",
+            "summary_high": "High dose-safety prior. The local schedule looks too close to a stored limit, too early, duplicated, or numerically inconsistent.",
         },
         "dental_hygiene": {
             "domain_label": "dental_hygiene",
@@ -905,15 +976,57 @@ def exercise_defaults() -> Dict[str, Any]:
     }
 
 
+def recovery_support_defaults() -> Dict[str, Any]:
+    return {
+        "enabled": False,
+        "goal_name": "Recovery",
+        "clean_start_date": "",
+        "last_relapse_date": "",
+        "relapse_count": 0,
+        "best_streak_days": 0,
+        "points": 0,
+        "cycle": 1,
+        "milestones_claimed": [],
+        "motivation": "",
+        "coping_plan": "",
+        "latest_note": "",
+        "latest_checkin_ts": 0.0,
+        "latest_mood": 5.0,
+        "latest_craving": 0.0,
+        "reminder_time": "8:00 PM",
+        "history": [],
+    }
+
+
+def dose_safety_review_defaults() -> Dict[str, Any]:
+    return {
+        "timestamp": 0.0,
+        "med_id": "",
+        "med_name": "",
+        "dose_mg": 0.0,
+        "source_label": "",
+        "action": "",
+        "display": "",
+        "message": "",
+        "raw": "",
+        "quantum_level": "",
+        "quantum_score": 0.0,
+        "deterministic_level": "",
+        "deterministic_message": "",
+    }
+
+
 def vault_defaults() -> Dict[str, Any]:
     return {
         "version": 2,
         "meds": [],
         "assistant_history": [],
+        "dose_safety_review": dose_safety_review_defaults(),
         "vision_imports": [],
         "dental_hygiene": dental_hygiene_defaults(),
         "dental_recovery": dental_recovery_defaults(),
         "exercise": exercise_defaults(),
+        "recovery_support": recovery_support_defaults(),
         "last_notifications": {},
     }
 
@@ -962,10 +1075,27 @@ def ensure_vault_shape(raw: Any) -> Dict[str, Any]:
         assistant_history.append(
             {
                 "role": sanitize_text(item.get("role") or "assistant", max_chars=16) or "assistant",
+                "mode": normalize_assistant_mode(item.get("mode") or "General"),
                 "content": sanitize_text(item.get("content") or "", max_chars=3000),
                 "timestamp": safe_float(item.get("timestamp") or time.time()),
             }
         )
+
+    dose_safety_raw = raw.get("dose_safety_review") if isinstance(raw.get("dose_safety_review"), dict) else {}
+    dose_safety_review = dose_safety_review_defaults()
+    dose_safety_review["timestamp"] = safe_float(dose_safety_raw.get("timestamp") or 0.0)
+    dose_safety_review["med_id"] = sanitize_text(dose_safety_raw.get("med_id") or "", max_chars=32)
+    dose_safety_review["med_name"] = sanitize_text(dose_safety_raw.get("med_name") or "", max_chars=120)
+    dose_safety_review["dose_mg"] = max(0.0, safe_float(dose_safety_raw.get("dose_mg") or 0.0))
+    dose_safety_review["source_label"] = sanitize_text(dose_safety_raw.get("source_label") or "", max_chars=60)
+    dose_safety_review["action"] = normalize_dose_action_text(dose_safety_raw.get("action") or "", "")
+    dose_safety_review["display"] = sanitize_text(dose_safety_raw.get("display") or "", max_chars=160)
+    dose_safety_review["message"] = sanitize_text(dose_safety_raw.get("message") or "", max_chars=420)
+    dose_safety_review["raw"] = sanitize_text(dose_safety_raw.get("raw") or "", max_chars=400)
+    dose_safety_review["quantum_level"] = sanitize_text(dose_safety_raw.get("quantum_level") or "", max_chars=40)
+    dose_safety_review["quantum_score"] = max(0.0, min(100.0, safe_float(dose_safety_raw.get("quantum_score") or 0.0)))
+    dose_safety_review["deterministic_level"] = sanitize_text(dose_safety_raw.get("deterministic_level") or "", max_chars=40)
+    dose_safety_review["deterministic_message"] = sanitize_text(dose_safety_raw.get("deterministic_message") or "", max_chars=260)
 
     imports = []
     for item in raw.get("vision_imports", []) or []:
@@ -1089,12 +1219,58 @@ def ensure_vault_shape(raw: Any) -> Dict[str, Any]:
         )
     exercise["history"] = exercise_history[-240:]
 
+    recovery_support_raw = raw.get("recovery_support") if isinstance(raw.get("recovery_support"), dict) else {}
+    recovery_support = recovery_support_defaults()
+    recovery_support["enabled"] = bool(recovery_support_raw.get("enabled", False))
+    recovery_support["goal_name"] = sanitize_text(recovery_support_raw.get("goal_name") or recovery_support["goal_name"], max_chars=120) or "Recovery"
+    recovery_support["clean_start_date"] = sanitize_text(recovery_support_raw.get("clean_start_date") or "", max_chars=20)
+    recovery_support["last_relapse_date"] = sanitize_text(recovery_support_raw.get("last_relapse_date") or "", max_chars=20)
+    recovery_support["relapse_count"] = max(0, int(safe_float(recovery_support_raw.get("relapse_count") or 0)))
+    recovery_support["best_streak_days"] = max(0, int(safe_float(recovery_support_raw.get("best_streak_days") or 0)))
+    recovery_support["points"] = max(0, int(safe_float(recovery_support_raw.get("points") or 0)))
+    recovery_support["cycle"] = max(1, int(safe_float(recovery_support_raw.get("cycle") or 1)))
+    recovery_support["milestones_claimed"] = [
+        sanitize_text(item, max_chars=24)
+        for item in list(recovery_support_raw.get("milestones_claimed") or [])
+        if sanitize_text(item, max_chars=24)
+    ][-64:]
+    recovery_support["motivation"] = sanitize_text(recovery_support_raw.get("motivation") or "", max_chars=1200)
+    recovery_support["coping_plan"] = sanitize_text(recovery_support_raw.get("coping_plan") or "", max_chars=1200)
+    recovery_support["latest_note"] = sanitize_text(recovery_support_raw.get("latest_note") or "", max_chars=1200)
+    recovery_support["latest_checkin_ts"] = safe_float(recovery_support_raw.get("latest_checkin_ts"))
+    recovery_support["latest_mood"] = max(0.0, min(10.0, safe_float(recovery_support_raw.get("latest_mood") or recovery_support["latest_mood"])))
+    recovery_support["latest_craving"] = max(0.0, min(10.0, safe_float(recovery_support_raw.get("latest_craving") or recovery_support["latest_craving"])))
+    reminder_time = sanitize_text(recovery_support_raw.get("reminder_time") or recovery_support["reminder_time"], max_chars=20)
+    recovery_support["reminder_time"] = reminder_time if not reminder_time or parse_clock_minutes(reminder_time) is not None else recovery_support_defaults()["reminder_time"]
+    recovery_history = []
+    for item in recovery_support_raw.get("history", []) or []:
+        if not isinstance(item, dict):
+            continue
+        event_type = sanitize_text(item.get("type") or "", max_chars=20).lower()
+        if event_type not in {"checkin", "relapse", "milestone"}:
+            continue
+        recovery_history.append(
+            {
+                "timestamp": safe_float(item.get("timestamp") or time.time()),
+                "type": event_type,
+                "note": sanitize_text(item.get("note") or "", max_chars=1200),
+                "streak_days": max(0, int(safe_float(item.get("streak_days") or 0))),
+                "points_delta": int(safe_float(item.get("points_delta") or 0)),
+                "mood": max(0.0, min(10.0, safe_float(item.get("mood") or 0.0))),
+                "craving": max(0.0, min(10.0, safe_float(item.get("craving") or 0.0))),
+                "label": sanitize_text(item.get("label") or "", max_chars=120),
+            }
+        )
+    recovery_support["history"] = recovery_history[-240:]
+
     base["meds"] = meds
     base["assistant_history"] = assistant_history[-24:]
+    base["dose_safety_review"] = dose_safety_review
     base["vision_imports"] = imports[-16:]
     base["dental_hygiene"] = hygiene
     base["dental_recovery"] = recovery
     base["exercise"] = exercise
+    base["recovery_support"] = recovery_support
     if isinstance(raw.get("last_notifications"), dict):
         base["last_notifications"] = dict(raw["last_notifications"])
     return base
@@ -2176,23 +2352,203 @@ def dose_safety_level(med: Dict[str, Any], dose_mg: float, now_ts: float) -> Tup
         return "High", f"Unsafe: this would exceed the stored 24h limit ({projected:g}/{max_daily:g} mg in the last 24h)."
     if way_too_soon:
         return "High", f"Unsafe: this is much earlier than the stored {interval_hours:g}h interval."
-    if next_slot is not None and next_slot.get("status") == "upcoming":
-        early_by = safe_float(next_slot.get("scheduled_ts")) - now_ts
-        if early_by > medication_due_lead_seconds(med):
-            return "Medium", f"Caution: the next planned dose window is {next_slot['label']} at {next_slot['time_text']}."
     if too_soon:
         return "Medium", f"Caution: this is earlier than the stored {interval_hours:g}h interval."
     if max_daily > 0 and abs(projected - max_daily) <= 1e-6:
         return "Low", f"On schedule. This dose reaches the stored 24h limit at {projected:g} mg."
     if max_daily > 0 and ratio >= 0.90:
         return "Medium", f"Caution: close to the 24h limit ({projected:g}/{max_daily:g} mg in the last 24h after this dose)."
-    if interval_hours <= 0 and max_daily <= 0:
+    if interval_hours <= 0 and max_daily <= 0 and next_slot is None:
         return "Medium", "Schedule has no interval or daily limit stored, so this stays a caution check."
+    if next_slot is not None and next_slot.get("status") == "upcoming":
+        early_by = safe_float(next_slot.get("scheduled_ts")) - now_ts
+        if early_by > medication_due_lead_seconds(med):
+            return "Low", f"Stored limits look okay. The next planned dose window is {next_slot['label']} at {next_slot['time_text']}."
     if next_slot is not None and next_slot.get("status") == "missed":
         return "Low", f"Okay to log now if the bottle directions still fit. Missed slot: {next_slot['label']}."
     if next_slot is not None and next_slot.get("status") == "due":
         return "Low", f"Looks on schedule for {next_slot['label']}. Projected 24h total after this dose: {projected:g} mg."
     return "Low", f"Looks on schedule. Projected 24h total after this dose: {projected:g} mg."
+
+
+def build_dose_safety_model_context(
+    med: Dict[str, Any],
+    dose_mg: float,
+    now_ts: float,
+    *,
+    source_label: str = "dose",
+) -> Dict[str, Any]:
+    dose_value = max(0.0, dose_mg)
+    med_name = sanitize_text(med.get("name") or "Medication", max_chars=120)
+    interval_hours = max(0.0, safe_float(med.get("interval_hours")))
+    max_daily = max(0.0, safe_float(med.get("max_daily_mg")))
+    last_taken = last_effective_taken_ts(med)
+    minutes_since = (now_ts - last_taken) / 60.0 if last_taken > 0 else -1.0
+    taken_last_24h = total_taken_last_24h(med, now_ts)
+    projected = taken_last_24h + dose_value
+    duplicate_ts = recent_duplicate_log_ts(med, dose_value, now_ts)
+    due_status = medication_due_status(med, now_ts)
+    next_slot = due_status.get("slot") or next_unchecked_medication_slot(med, now_ts)
+    deterministic_level, deterministic_message = dose_safety_level(med, dose_value, now_ts)
+    schedule_preview = sanitize_text(build_medication_schedule_text(med, now_ts).replace("\n", " | "), max_chars=420)
+    history_preview = sanitize_text(build_med_history_text(med).replace("\n", " | "), max_chars=360)
+    context_lines = [
+        f"medication={med_name}",
+        f"event={sanitize_text(source_label, max_chars=40)}",
+        f"standard_dose_mg={max(0.0, safe_float(med.get('dose_mg'))):g}",
+        f"candidate_dose_mg={dose_value:g}",
+        f"interval_hours={interval_hours:g}",
+        f"max_daily_mg={max_daily:g}",
+        f"taken_last_24h_mg={taken_last_24h:g}",
+        f"projected_last_24h_mg={projected:g}",
+        f"last_taken={format_timestamp(last_taken)}",
+        f"minutes_since_last_taken={minutes_since:.1f}" if minutes_since >= 0 else "minutes_since_last_taken=unknown",
+        f"next_due_state={due_status.get('state', '')}",
+        f"next_due_text={sanitize_text(due_status.get('text') or '', max_chars=160)}",
+        f"next_slot_label={sanitize_text((next_slot or {}).get('label') or 'none', max_chars=40)}",
+        f"next_slot_time={sanitize_text((next_slot or {}).get('time_text') or 'none', max_chars=20)}",
+        f"next_slot_status={sanitize_text((next_slot or {}).get('status') or 'none', max_chars=20)}",
+        f"duplicate_guard={'yes' if duplicate_ts is not None else 'no'}",
+        f"schedule_text={sanitize_text(med.get('schedule_text') or '', max_chars=320) or 'none'}",
+        f"custom_times={sanitize_text(med.get('custom_times_text') or '', max_chars=240) or 'none'}",
+        f"daily_plan={schedule_preview or 'none'}",
+        f"recent_history={history_preview or 'none'}",
+        f"deterministic_label={deterministic_level}",
+        f"deterministic_message={sanitize_text(deterministic_message, max_chars=220)}",
+    ]
+    return {
+        "med_name": med_name,
+        "dose_value": dose_value,
+        "interval_hours": interval_hours,
+        "max_daily": max_daily,
+        "taken_last_24h": taken_last_24h,
+        "projected": projected,
+        "last_taken": last_taken,
+        "minutes_since": minutes_since,
+        "due_status": due_status,
+        "next_slot": next_slot,
+        "duplicate_ts": duplicate_ts,
+        "deterministic_level": deterministic_level,
+        "deterministic_message": deterministic_message,
+        "context_text": "\n".join(context_lines),
+    }
+
+
+def build_dose_safety_dashboard_message(
+    med: Dict[str, Any],
+    action: str,
+    now_ts: float,
+    context: Optional[Dict[str, Any]] = None,
+) -> str:
+    details = context or build_dose_safety_model_context(med, max(0.0, safe_float(med.get("dose_mg"))), now_ts)
+    med_name = sanitize_text(med.get("name") or "Medication", max_chars=120)
+    pieces = [f"{med_name}: {action}."]
+    if details["max_daily"] > 0:
+        pieces.append(f"{details['projected']:g}/{details['max_daily']:g} mg projected in the last 24h.")
+    else:
+        pieces.append(f"{details['projected']:g} mg projected in the last 24h.")
+    if details["interval_hours"] > 0 and details["minutes_since"] >= 0:
+        pieces.append(f"{details['minutes_since']:.0f} minutes since the last logged dose; stored interval {details['interval_hours']:g}h.")
+    if details.get("duplicate_ts") is not None:
+        pieces.append("A matching recent dose log was detected.")
+    next_slot = details.get("next_slot")
+    if next_slot:
+        pieces.append(
+            f"Next planned slot: {sanitize_text(next_slot.get('label') or 'dose', max_chars=40)} {sanitize_text(next_slot.get('time_text') or '', max_chars=20)}."
+        )
+    elif details.get("due_status"):
+        pieces.append(sanitize_text(details["due_status"].get("text") or "", max_chars=120) + ".")
+    return " ".join(piece for piece in pieces if piece).strip()
+
+
+def assess_dose_safety_with_llm(
+    key: bytes,
+    med: Dict[str, Any],
+    dose_mg: float,
+    now_ts: float,
+    settings: Dict[str, Any],
+    *,
+    source_label: str = "dose",
+) -> Dict[str, Any]:
+    context = build_dose_safety_model_context(med, dose_mg, now_ts, source_label=source_label)
+    quantum_packet = build_quantum_risk_packet("medication_dose_safety", context["context_text"])
+    med_name = sanitize_text(med.get("name") or "Medication", max_chars=120)
+    system_text = (
+        "You are MedSafe Dose Safety Judge, a private local schedule-check model running entirely on the user's device.\n"
+        "You are not a clinician.\n"
+        "Assess only the immediate schedule safety of logging one dose right now using the supplied stored facts.\n"
+        "Never invent age, weight, diagnoses, allergies, organ function, interactions, or clinician-only guidance.\n"
+        "Use the quantum risk packet as a tie-breaker only after the numeric schedule facts are checked.\n"
+        "Return exactly one tagged action and nothing else."
+    )
+    prompt = (
+        "Evaluate whether logging the candidate dose right now looks SAFE, needs CAUTION, or is UNSAFE.\n"
+        f"{quantum_packet['prompt_block']}\n"
+        "Facts:\n"
+        f"{context['context_text']}\n"
+        "Decision rules:\n"
+        "- Use SAFE only when the stored numbers and plan support logging the dose now.\n"
+        "- Use CAUTION when the timing is a little early, close to the stored daily limit, or important schedule details are missing.\n"
+        "- Use UNSAFE when the projected last-24-hour total exceeds the stored max_daily_mg, the stored interval is clearly violated, or a recent duplicate log is indicated.\n"
+        "- If deterministic_label is High, you should normally answer UNSAFE.\n"
+        "- If deterministic_label is Medium and the schedule facts are incomplete or close to a limit, answer CAUTION.\n"
+        "- If deterministic_label is Low and the stored facts are internally consistent, answer SAFE.\n"
+        "- If the only issue is that the next planned slot is later but the stored interval and daily-limit facts are otherwise okay, answer SAFE.\n"
+        "- Do not explain. Do not hedge. Do not output JSON.\n"
+        "- Return exactly one line in this format: [action]SAFE[/action] or [action]CAUTION[/action] or [action]UNSAFE[/action]\n"
+        f"Medication under review: {med_name}.\n"
+    )
+    raw = litert_chat_blocking(
+        key,
+        prompt,
+        system_text=system_text,
+        native_image_input=False,
+        inference_backend=settings.get("inference_backend", "Auto"),
+    )
+    fallback_action = normalize_dose_action_text(context["deterministic_level"])
+    action = resolve_dose_action_from_context(extract_action_tag(raw, fallback_action), context)
+    quantum_line = ""
+    if action != "Safe":
+        quantum_line = f" Quantum prior {quantum_packet['risk_level']} {quantum_packet['risk_score']:.0f}/100."
+    return {
+        "action": action,
+        "display": f"Dose safety AI: {action}",
+        "message": build_dose_safety_dashboard_message(med, action, now_ts, context) + quantum_line,
+        "raw": sanitize_text(raw, max_chars=400),
+        "prompt_block": quantum_packet["prompt_block"],
+        "quantum_summary": quantum_packet["risk_summary"],
+        "quantum_level": quantum_packet["risk_level"],
+        "quantum_score": quantum_packet["risk_score"],
+        "deterministic_level": context["deterministic_level"],
+        "deterministic_message": context["deterministic_message"],
+    }
+
+
+def dose_safety_process_worker(
+    result_queue: Any,
+    key: bytes,
+    med: Dict[str, Any],
+    dose_mg: float,
+    now_ts: float,
+    settings: Dict[str, Any],
+    source_label: str,
+) -> None:
+    try:
+        result_queue.put(
+            {
+                "ok": True,
+                "result": assess_dose_safety_with_llm(
+                    key,
+                    med,
+                    dose_mg,
+                    now_ts,
+                    settings,
+                    source_label=source_label,
+                ),
+            }
+        )
+    except Exception as exc:
+        result_queue.put({"ok": False, "error": sanitize_text(str(exc), max_chars=240)})
 
 
 def habit_due_status(last_ts: float, interval_hours: float, now_ts: Optional[float] = None) -> Dict[str, Any]:
@@ -2433,6 +2789,257 @@ def build_exercise_overview(
     return title, body
 
 
+def recovery_anchor_date(state: Dict[str, Any]) -> Optional[date]:
+    clean_start = parse_date_string(str(state.get("clean_start_date") or ""))
+    if clean_start is not None:
+        return clean_start
+    candidates: List[date] = []
+    relapse_date = parse_date_string(str(state.get("last_relapse_date") or ""))
+    if relapse_date is not None:
+        candidates.append(relapse_date)
+    for item in list(state.get("history") or []):
+        if sanitize_text(item.get("type") or "", max_chars=20).lower() != "relapse":
+            continue
+        event_day = datetime.fromtimestamp(safe_float(item.get("timestamp"))).date()
+        candidates.append(event_day)
+    if not candidates:
+        return None
+    return max(candidates)
+
+
+def recovery_clean_days(state: Dict[str, Any], today: Optional[date] = None) -> int:
+    anchor_date = recovery_anchor_date(state)
+    if anchor_date is None:
+        return 0
+    anchor = today or date.today()
+    if anchor < anchor_date:
+        return 0
+    return (anchor - anchor_date).days + 1
+
+
+def recovery_checked_in_today(state: Dict[str, Any], now_ts: Optional[float] = None) -> bool:
+    now = now_ts or time.time()
+    today = datetime.fromtimestamp(now).date()
+    for item in reversed(list(state.get("history") or [])):
+        if sanitize_text(item.get("type") or "", max_chars=20).lower() != "checkin":
+            continue
+        if datetime.fromtimestamp(safe_float(item.get("timestamp"))).date() == today:
+            return True
+    return False
+
+
+def recovery_next_milestone(days_clean: int) -> Optional[Tuple[int, int, str]]:
+    for milestone in RECOVERY_SUPPORT_MILESTONES:
+        if milestone[0] > days_clean:
+            return milestone
+    return None
+
+
+def apply_recovery_support_progress(
+    state: Dict[str, Any],
+    *,
+    now_ts: Optional[float] = None,
+    award_checkin_points: bool = False,
+) -> Tuple[Dict[str, Any], List[str]]:
+    updated = dict(state)
+    now = now_ts or time.time()
+    current_days = recovery_clean_days(updated, datetime.fromtimestamp(now).date())
+    updated["best_streak_days"] = max(max(0, int(safe_float(updated.get("best_streak_days") or 0))), current_days)
+    updated["cycle"] = max(1, int(safe_float(updated.get("cycle") or 1)))
+    claimed = {
+        sanitize_text(item, max_chars=24)
+        for item in list(updated.get("milestones_claimed") or [])
+        if sanitize_text(item, max_chars=24)
+    }
+    history = list(updated.get("history") or [])
+    points = max(0, int(safe_float(updated.get("points") or 0)))
+    rewards: List[str] = []
+    for milestone_days, bonus_points, label in RECOVERY_SUPPORT_MILESTONES:
+        claim_key = f"{updated['cycle']}:{milestone_days}"
+        if current_days >= milestone_days and claim_key not in claimed:
+            claimed.add(claim_key)
+            points += bonus_points
+            rewards.append(f"{label} unlocked (+{bonus_points} points)")
+            history.append(
+                {
+                    "timestamp": now,
+                    "type": "milestone",
+                    "note": "",
+                    "streak_days": milestone_days,
+                    "points_delta": bonus_points,
+                    "label": label,
+                }
+            )
+    if award_checkin_points:
+        points += 2
+        rewards.append("Daily check-in (+2 points)")
+    updated["points"] = points
+    updated["milestones_claimed"] = sorted(claimed)[-96:]
+    updated["history"] = history[-240:]
+    return updated, rewards
+
+
+def build_recovery_support_summary(state: Dict[str, Any], now_ts: Optional[float] = None) -> Tuple[str, str]:
+    now = now_ts or time.time()
+    days_clean = recovery_clean_days(state, datetime.fromtimestamp(now).date())
+    best_streak = max(days_clean, max(0, int(safe_float(state.get("best_streak_days") or 0))))
+    relapse_count = max(0, int(safe_float(state.get("relapse_count") or 0)))
+    points = max(0, int(safe_float(state.get("points") or 0)))
+    goal_name = sanitize_text(state.get("goal_name") or "Recovery", max_chars=120)
+    next_milestone = recovery_next_milestone(days_clean)
+    last_checkin = safe_float(state.get("latest_checkin_ts"))
+    latest_note = sanitize_text(state.get("latest_note") or "", max_chars=220)
+    latest_mood = max(0.0, min(10.0, safe_float(state.get("latest_mood") or 0.0)))
+    latest_craving = max(0.0, min(10.0, safe_float(state.get("latest_craving") or 0.0)))
+    reminder_time = sanitize_text(state.get("reminder_time") or recovery_support_defaults()["reminder_time"], max_chars=20)
+    due = recovery_support_due_status(state, now)
+    recent_events = list(state.get("history") or [])[-4:][::-1]
+    if days_clean <= 0:
+        title = f"{goal_name} planner ready"
+    elif relapse_count == 0 and days_clean >= 30:
+        title = f"{goal_name} streak building strong"
+    else:
+        title = f"{goal_name} day {days_clean}"
+    lines = [
+        f"Current clean streak: {days_clean} day{'s' if days_clean != 1 else ''}.",
+        f"Best streak: {best_streak} day{'s' if best_streak != 1 else ''}.",
+        f"Relapses logged: {relapse_count}.",
+        f"Support points: {points}.",
+    ]
+    if next_milestone is not None:
+        lines.append(f"Next milestone: day {next_milestone[0]} for +{next_milestone[1]} points.")
+    else:
+        lines.append("Top milestone unlocked. Keep protecting the streak one day at a time.")
+    lines.append(f"Check-in reminder: {reminder_time}. {sanitize_text(due.get('text') or '', max_chars=140)}")
+    if last_checkin > 0:
+        lines.append(f"Latest check-in: {format_timestamp(last_checkin)}.")
+    if last_checkin > 0:
+        lines.append(f"Mood {latest_mood:.0f}/10. Craving {latest_craving:.0f}/10.")
+    if latest_note:
+        lines.append(f"Latest note: {latest_note}")
+    if recent_events:
+        event_lines = []
+        for item in recent_events:
+            event_type = sanitize_text(item.get("type") or "", max_chars=20).lower()
+            if event_type == "milestone":
+                event_lines.append(
+                    f"{format_timestamp(safe_float(item.get('timestamp')))} • milestone • {sanitize_text(item.get('label') or '', max_chars=80)}"
+                )
+            elif event_type == "relapse":
+                event_lines.append(
+                    f"{format_timestamp(safe_float(item.get('timestamp')))} • relapse reset • {sanitize_text(item.get('note') or 'fresh start logged', max_chars=120)}"
+                )
+            else:
+                event_lines.append(
+                    f"{format_timestamp(safe_float(item.get('timestamp')))} • check-in • {sanitize_text(item.get('note') or 'steady work', max_chars=120)}"
+                )
+        lines.append("Recent progress: " + " | ".join(event_lines))
+    return title, " ".join(lines)
+
+
+def build_recovery_badges_text(state: Dict[str, Any]) -> str:
+    milestone_rows = [
+        item
+        for item in list(state.get("history") or [])
+        if sanitize_text(item.get("type") or "", max_chars=20).lower() == "milestone"
+    ]
+    if not milestone_rows:
+        return "No milestone badges unlocked yet. Your first rewards appear as the streak grows."
+    lines = []
+    for item in milestone_rows[-8:][::-1]:
+        label = sanitize_text(item.get("label") or "Milestone", max_chars=120)
+        points = int(safe_float(item.get("points_delta") or 0))
+        streak_days = max(0, int(safe_float(item.get("streak_days") or 0)))
+        lines.append(f"{label} • day {streak_days} • +{points} pts • {format_timestamp(safe_float(item.get('timestamp')))}")
+    return "\n".join(lines)
+
+
+def recovery_support_due_status(state: Dict[str, Any], now_ts: Optional[float] = None) -> Dict[str, Any]:
+    now = now_ts or time.time()
+    if not bool(state.get("enabled")):
+        return {"state": "Off", "text": "Recovery check-ins are off.", "due_now": False, "overdue": False}
+    reminder_minutes = parse_clock_minutes(state.get("reminder_time") or "") or (20 * 60)
+    today = datetime.fromtimestamp(now).date()
+    target_ts = clock_minutes_to_timestamp(today, reminder_minutes)
+    checked_in = recovery_checked_in_today(state, now)
+    if checked_in:
+        return {"state": "Done", "text": "Today's recovery check-in is complete.", "due_now": False, "overdue": False}
+    if now < target_ts:
+        return {"state": "Scheduled", "text": f"Recovery check-in {format_relative_due(target_ts, now)}.", "due_now": False, "overdue": False}
+    if now <= target_ts + 3.0 * 3600.0:
+        return {"state": "Due", "text": "Recovery check-in is due now.", "due_now": True, "overdue": False}
+    return {"state": "Overdue", "text": f"Recovery check-in {format_duration(now - target_ts)} overdue.", "due_now": True, "overdue": True}
+
+
+def build_recovery_support_nudge_text(state: Dict[str, Any], now_ts: Optional[float] = None) -> str:
+    now = now_ts or time.time()
+    if not bool(state.get("enabled")):
+        return ""
+    goal_name = sanitize_text(state.get("goal_name") or "Recovery", max_chars=120)
+    due = recovery_support_due_status(state, now)
+    latest_craving = max(0.0, min(10.0, safe_float(state.get("latest_craving") or 0.0)))
+    latest_mood = max(0.0, min(10.0, safe_float(state.get("latest_mood") or 0.0)))
+    days_clean = recovery_clean_days(state, datetime.fromtimestamp(now).date())
+    next_milestone = recovery_next_milestone(days_clean)
+    if latest_craving >= 7.0:
+        return (
+            f"Gentle nudge: {goal_name} protection mode. You logged craving {latest_craving:.0f}/10. "
+            f"Open the coping plan and protect the next 20 minutes."
+        )
+    if due.get("overdue"):
+        return f"Gentle nudge: {goal_name} check-in is overdue. Protect the streak with a quick honest note."
+    if due.get("due_now"):
+        return f"Gentle nudge: {goal_name} check-in is due now. One check-in keeps the streak visible."
+    if latest_mood <= 3.0 and safe_float(state.get("latest_checkin_ts")) > 0:
+        return (
+            f"Gentle nudge: mood has been low ({latest_mood:.0f}/10). Use Therapy or Recovery Coach mode for a grounded reset."
+        )
+    if next_milestone is not None:
+        days_left = max(0, next_milestone[0] - days_clean)
+        return f"Gentle nudge: {goal_name} is {days_left} day{'s' if days_left != 1 else ''} from the next milestone."
+    return f"Gentle nudge: {goal_name} streak is active. Keep the next small win simple."
+
+
+def build_dashboard_nudge_text(
+    med: Optional[Dict[str, Any]],
+    recovery_support: Dict[str, Any],
+    now_ts: Optional[float] = None,
+) -> str:
+    now = now_ts or time.time()
+    med_text = build_medication_nudge_text(med, now) if med is not None else ""
+    recovery_text = build_recovery_support_nudge_text(recovery_support, now)
+    if med_text and recovery_text:
+        return med_text + "\n\n" + recovery_text
+    return med_text or recovery_text or "Gentle nudge: choose a medication or recovery plan to see the next reminder."
+
+
+def build_recovery_support_context(state: Dict[str, Any], now_ts: Optional[float] = None) -> str:
+    now = now_ts or time.time()
+    title, summary = build_recovery_support_summary(state, now)
+    days_clean = recovery_clean_days(state, datetime.fromtimestamp(now).date())
+    next_milestone = recovery_next_milestone(days_clean)
+    due = recovery_support_due_status(state, now)
+    next_text = (
+        f"day {next_milestone[0]} (+{next_milestone[1]} pts)"
+        if next_milestone is not None
+        else "top milestone already reached"
+    )
+    return "\n".join(
+        [
+            "Recovery support:",
+            f"- enabled={'yes' if state.get('enabled') else 'no'} goal={sanitize_text(state.get('goal_name') or 'Recovery', max_chars=120)}",
+            f"- clean_start={sanitize_text(state.get('clean_start_date') or 'unset', max_chars=20)} current_streak_days={days_clean}",
+            f"- best_streak_days={max(0, int(safe_float(state.get('best_streak_days') or 0)))} relapse_count={max(0, int(safe_float(state.get('relapse_count') or 0)))}",
+            f"- points={max(0, int(safe_float(state.get('points') or 0)))} next_milestone={next_text}",
+            f"- reminder_time={sanitize_text(state.get('reminder_time') or '8:00 PM', max_chars=20)} due_status={sanitize_text(due.get('text') or '', max_chars=140)}",
+            f"- latest_mood={max(0.0, min(10.0, safe_float(state.get('latest_mood') or 0.0))):.0f}/10 latest_craving={max(0.0, min(10.0, safe_float(state.get('latest_craving') or 0.0))):.0f}/10",
+            f"- motivation={sanitize_text(state.get('motivation') or 'none', max_chars=220)}",
+            f"- coping_plan={sanitize_text(state.get('coping_plan') or 'none', max_chars=260)}",
+            f"- summary={sanitize_text(title + '. ' + summary, max_chars=420)}",
+        ]
+    )
+
+
 def build_schedule_context(data: Dict[str, Any], selected_med_id: Optional[str]) -> str:
     meds = list(data.get("meds") or [])
     now = time.time()
@@ -2498,6 +3105,17 @@ def build_schedule_context(data: Dict[str, Any], selected_med_id: Optional[str])
         )
     else:
         lines.append("- recovery mode not enabled")
+
+    exercise = data.get("exercise") or exercise_defaults()
+    exercise_title, exercise_body = build_exercise_overview(exercise, now)
+    lines.append("")
+    lines.append("Movement:")
+    lines.append(f"- {sanitize_text(exercise_title, max_chars=120)} | {sanitize_text(exercise_body, max_chars=320)}")
+
+    recovery_support = data.get("recovery_support") or recovery_support_defaults()
+    lines.append("")
+    lines.append(build_recovery_support_context(recovery_support, now))
+
     latest_imports = list(data.get("vision_imports") or [])
     if latest_imports:
         latest_import = latest_imports[-1]
@@ -2521,7 +3139,9 @@ def build_recent_assistant_context(history: List[Dict[str, Any]]) -> str:
     lines = ["Recent local chat memory:"]
     for item in history[-6:]:
         role = "User" if item.get("role") == "user" else "Assistant"
-        lines.append(f"{role}: {sanitize_text(item.get('content') or '', max_chars=280)}")
+        mode = normalize_assistant_mode(item.get("mode") or "General")
+        mode_suffix = "" if mode == "General" else f" [{mode}]"
+        lines.append(f"{role}{mode_suffix}: {sanitize_text(item.get('content') or '', max_chars=280)}")
     return "\n".join(lines)
 
 
@@ -2531,22 +3151,61 @@ def run_assistant_request(
     prompt: str,
     selected_med_id: Optional[str],
     settings: Dict[str, Any],
+    mode: str = "General",
 ) -> str:
-    system_text = (
-        "You are MedSafe, a private local health scheduling assistant running entirely on the user's device.\n"
-        "Use only the medication, dental hygiene, and recovery facts in the provided context and the user's request.\n"
-        "You are not a clinician and cannot verify interactions, diagnoses, allergies, organ function, or procedure complications.\n"
-        "When the user asks whether a dose looks okay, ground the answer in the stored dose amount, interval, planned times, and last-24-hour total from the context.\n"
-        "Use High only when the stored numbers clearly show a timing or 24-hour-limit problem, Medium when timing is a little early or key details are missing, and Low when the stored schedule supports the dose.\n"
-        "Do not keep repeating that something is unsafe unless the provided numbers clearly support that conclusion.\n"
-        "Be concise, practical, and clear when uncertainty exists."
-    )
+    active_mode = normalize_assistant_mode(mode)
+    if active_mode == "Therapy":
+        system_text = (
+            "You are MedSafe Therapy Companion, a private local reflective support assistant running entirely on the user's device.\n"
+            "Be warm, calm, validating, collaborative, and nonjudgmental.\n"
+            "Use reflective listening, grounding ideas, gentle CBT-style reframes, motivational interviewing, journaling prompts, and practical coping steps.\n"
+            "Keep the tone trauma-informed, shame-free, and emotionally steady. Avoid absolutist language and avoid pretending certainty about the user's life.\n"
+            "Use this support rhythm internally: stabilize emotion, name the pressure, reflect patterns, offer one grounding tool, offer one small next action, and close with encouragement.\n"
+            "Prefer one or two grounded interventions over long lectures. Mirror the user's feelings and needs in plain language when it helps them feel understood.\n"
+            "Use only the context provided from the encrypted vault and the user's message.\n"
+            "You are not a licensed therapist, you do not diagnose, and you do not replace professional care.\n"
+            "If the user mentions self-harm, overdose, suicidal intent, or immediate danger, urge immediate human help and emergency support clearly.\n"
+            "Prefer short supportive paragraphs followed by a few concrete next steps when helpful."
+        )
+        final_instruction = (
+            "Respond like a supportive therapist-style coach. Validate first, then offer 2-4 grounded next steps, reflection questions, or coping tools. When useful, include short sections named Reflect, Ground, and Next Step, and close with a compassionate check-in question."
+        )
+    elif active_mode == "Recovery Coach":
+        system_text = (
+            "You are MedSafe Recovery Coach, a private local relapse-prevention and recovery-support assistant running entirely on the user's device.\n"
+            "Be encouraging, direct, shame-free, and practical.\n"
+            "Use the stored clean-streak, relapse, milestone, points, and coping-plan context as the backbone of your response.\n"
+            "Use the stored reminder time, latest mood and craving, and milestone progress when those details are relevant.\n"
+            "Help the user protect the next 24 hours with concrete strategies such as urge surfing, trigger interruption, distraction plans, reaching out, and environment changes.\n"
+            "Treat craving spikes, low mood, anniversaries, and slip risk as immediate planning problems, not identity failures.\n"
+            "If the user reports a slip or relapse, treat it as data, help them restart without shame, and focus on the smallest stabilizing next actions.\n"
+            "When the user feels shaky, structure the reply around: protect the next 10 minutes, the next hour, and tonight.\n"
+            "Celebrate progress without sounding fake or childish.\n"
+            "You are not a clinician, sponsor, detox program, or emergency service.\n"
+            "If the user describes overdose risk, dangerous withdrawal, or immediate safety risk, tell them to seek urgent human help right away.\n"
+            "Keep replies actionable and structured around recovery momentum."
+        )
+        final_instruction = (
+            "Respond like a recovery therapist-coach. Reference the streak, points, mood, craving, reminder timing, or milestone context when relevant. Keep the structure practical, protect momentum, and end with a short action ladder for the next 10 minutes, next hour, and today."
+        )
+    else:
+        system_text = (
+            "You are MedSafe, a private local health scheduling assistant running entirely on the user's device.\n"
+            "Use only the medication, dental hygiene, recovery, movement, and recovery-support facts in the provided context and the user's request.\n"
+            "You are not a clinician and cannot verify interactions, diagnoses, allergies, organ function, or procedure complications.\n"
+            "When the user asks whether a dose looks okay, ground the answer in the stored dose amount, interval, planned times, and last-24-hour total from the context.\n"
+            "Use High only when the stored numbers clearly show a timing or 24-hour-limit problem, Medium when timing is a little early or key details are missing, and Low when the stored schedule supports the dose.\n"
+            "Do not keep repeating that something is unsafe unless the provided numbers clearly support that conclusion.\n"
+            "Be concise, practical, and clear when uncertainty exists."
+        )
+        final_instruction = "Answer directly. Use short paragraphs or bullets only when useful."
     user_text = "\n\n".join(
         [
+            f"Assistant mode: {active_mode}",
             build_schedule_context(data, selected_med_id),
             build_recent_assistant_context(list(data.get("assistant_history") or [])),
             f"User request: {sanitize_text(prompt, max_chars=1500)}",
-            "Answer directly. Use short paragraphs or bullets only when useful.",
+            final_instruction,
         ]
     )
     return litert_chat_blocking(
@@ -4831,11 +5490,7 @@ class MedSafeApp(MDApp):
         now = time.time()
         duplicate_ts = recent_duplicate_log_ts(med, dose_value, now)
         if duplicate_ts is not None:
-            self.last_check_level = "Medium"
-            self.last_check_display = "Already logged"
-            self.last_check_message = f"A matching dose was already logged {format_duration(now - duplicate_ts)} ago. It was not added again."
-            self.refresh_ui()
-            self.set_status(self.last_check_message)
+            self.start_dose_safety_assessment(med, dose_value, source_label=f"{source_label} duplicate")
             return
         label, message = dose_safety_level(med, dose_value, now)
         source_suffix = f" Logged for {source_label}." if source_label else ""
@@ -4846,7 +5501,9 @@ class MedSafeApp(MDApp):
             self.refresh_ui()
             self.set_status(message)
             self.show_dialog("High Safety Flag", message)
+            self.start_dose_safety_assessment(med, dose_value, source_label=f"{source_label} blocked")
             return
+        assessment_med = self.clone_med_snapshot(med)
         med["history"] = list(med.get("history") or []) + [[now, dose_value]]
         med["history"] = med["history"][-240:]
         med["last_taken_ts"] = now
@@ -4855,6 +5512,7 @@ class MedSafeApp(MDApp):
         self.save_data()
         self.refresh_ui()
         self.set_status(self.last_check_message)
+        self.start_dose_safety_assessment(assessment_med, dose_value, source_label=source_label)
 
     def on_checklist_take_dose(self, med_id: str, slot_label: str) -> None:
         self.selected_med_id = med_id
@@ -5209,6 +5867,7 @@ class MedSafeApp(MDApp):
                 self.set_status(f"Saved {name}. Ready to add another medication.")
         else:
             self.set_status(f"Saved {name}.")
+        self.start_dose_safety_assessment(med, max(dose_mg, max(0.0, safe_float(med.get("dose_mg")))), source_label="schedule update")
 
     def on_delete_med(self) -> None:
         med = self.current_selected_med()
@@ -5838,12 +6497,18 @@ class DesktopProgressAdapter:
 class DesktopRiskBadgeAdapter(DesktopLabelAdapter):
     def set_level(self, level: str) -> None:
         normalized = sanitize_text(level, max_chars=24).lower()
-        if normalized.startswith("low"):
-            label = "Low"
+        if normalized.startswith("assess") or normalized.startswith("check") or normalized.startswith("pending"):
+            label = "Checking"
+            fg = "#6a7e94"
+        elif normalized.startswith("safe") or normalized.startswith("low"):
+            label = "Safe" if normalized.startswith("safe") else "Low"
             fg = DESKTOP_SUCCESS
-        elif normalized.startswith("high"):
-            label = "High"
+        elif normalized.startswith("unsafe") or normalized.startswith("high"):
+            label = "Unsafe" if normalized.startswith("unsafe") else "High"
             fg = DESKTOP_DANGER
+        elif normalized.startswith("caution"):
+            label = "Caution"
+            fg = DESKTOP_WARNING
         else:
             label = "Medium"
             fg = DESKTOP_WARNING
@@ -5922,6 +6587,13 @@ class DesktopMedSafeApp:
         self.last_check_message = "Log a selected dose to score timing and daily totals."
         self.main_ui_started = False
         self.refresh_timer_started = False
+        self.dose_ai_request_id = 0
+        self.dose_ai_process: Optional[Any] = None
+        self.dose_ai_queue: Optional[Any] = None
+        self.assistant_request_pending = False
+        self.assistant_history_dirty = False
+        self.background_save_request_id = 0
+        self.assistant_mode = "General"
         self.setup_password_var: Optional[tk.BooleanVar] = None
         self.setup_download_model_var: Optional[tk.BooleanVar] = None
 
@@ -5975,6 +6647,12 @@ class DesktopMedSafeApp:
             self.window.mainloop()
 
     def on_close(self) -> None:
+        if self.assistant_history_dirty:
+            try:
+                self.save_data()
+            except Exception:
+                pass
+        self._cleanup_dose_safety_process(terminate=True)
         if self.vault is not None:
             self.vault.clear_cached_key()
         if self.window is not None:
@@ -5983,7 +6661,6 @@ class DesktopMedSafeApp:
 
     def run_on_ui_thread(self, callback: Callable[..., Any], *args: Any, delay_ms: int = 0) -> None:
         if self.window is None:
-            callback(*args)
             return
         self.window.after(max(0, int(delay_ms)), lambda: callback(*args))
 
@@ -5999,6 +6676,279 @@ class DesktopMedSafeApp:
             self.window.after(interval_ms, runner)
 
         self.window.after(interval_ms, runner)
+
+    def clone_med_snapshot(self, med: Dict[str, Any]) -> Dict[str, Any]:
+        return json.loads(json.dumps(med))
+
+    def clone_data_snapshot(self) -> Dict[str, Any]:
+        return ensure_vault_shape(json.loads(json.dumps(self.data_cache)))
+
+    def save_data_async(self, snapshot: Optional[Dict[str, Any]] = None) -> None:
+        if not self.vault:
+            return
+        self.assistant_history_dirty = False
+        self.background_save_request_id += 1
+        request_id = self.background_save_request_id
+        prepared_snapshot = ensure_vault_shape(json.loads(json.dumps(snapshot if snapshot is not None else self.data_cache)))
+
+        def worker() -> None:
+            if request_id != self.background_save_request_id or not self.vault:
+                return
+            try:
+                self.vault.save(prepared_snapshot)
+            except Exception:
+                return
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def persist_data_async(self) -> None:
+        self.save_data_async()
+
+    def _cleanup_dose_safety_process(self, *, terminate: bool = False) -> None:
+        process = self.dose_ai_process
+        queue_obj = self.dose_ai_queue
+        self.dose_ai_process = None
+        self.dose_ai_queue = None
+        if process is not None:
+            try:
+                if terminate and process.is_alive():
+                    process.terminate()
+            except Exception:
+                pass
+            try:
+                process.join(timeout=0.2)
+            except Exception:
+                pass
+        if queue_obj is not None:
+            try:
+                queue_obj.close()
+            except Exception:
+                pass
+            try:
+                queue_obj.join_thread()
+            except Exception:
+                pass
+
+    def _saved_dose_safety_review(
+        self,
+        med: Dict[str, Any],
+        dose_value: float,
+        source_label: str,
+        *,
+        action: str,
+        display: str,
+        message: str,
+        raw: str = "",
+        quantum_level: str = "",
+        quantum_score: float = 0.0,
+        deterministic_level: str = "",
+        deterministic_message: str = "",
+    ) -> Dict[str, Any]:
+        review = dose_safety_review_defaults()
+        review.update(
+            {
+                "timestamp": time.time(),
+                "med_id": sanitize_text(med.get("id") or "", max_chars=32),
+                "med_name": sanitize_text(med.get("name") or "Medication", max_chars=120),
+                "dose_mg": max(0.0, safe_float(dose_value)),
+                "source_label": sanitize_text(source_label, max_chars=60),
+                "action": normalize_dose_action_text(action, ""),
+                "display": sanitize_text(display, max_chars=160),
+                "message": sanitize_text(message, max_chars=420),
+                "raw": sanitize_text(raw, max_chars=400),
+                "quantum_level": sanitize_text(quantum_level, max_chars=40),
+                "quantum_score": max(0.0, min(100.0, safe_float(quantum_score))),
+                "deterministic_level": sanitize_text(deterministic_level, max_chars=40),
+                "deterministic_message": sanitize_text(deterministic_message, max_chars=260),
+            }
+        )
+        return review
+
+    def _restore_saved_dose_safety_review(self) -> None:
+        review = dict(self.data_cache.get("dose_safety_review") or {})
+        if safe_float(review.get("timestamp")) <= 0:
+            return
+        action = normalize_dose_action_text(review.get("action") or "", "")
+        if action:
+            self.last_check_level = action
+        display = sanitize_text(review.get("display") or "", max_chars=160)
+        message = sanitize_text(review.get("message") or "", max_chars=420)
+        if display:
+            self.last_check_display = display
+        if message:
+            self.last_check_message = message
+
+    def start_dose_safety_assessment(self, med: Dict[str, Any], dose_value: float, *, source_label: str = "dose") -> None:
+        med_snapshot = self.clone_med_snapshot(med)
+        now_ts = time.time()
+        self.dose_ai_request_id += 1
+        request_id = self.dose_ai_request_id
+        med_name = sanitize_text(med_snapshot.get("name") or "Medication", max_chars=120)
+        self._cleanup_dose_safety_process(terminate=True)
+        self.last_check_level = "Assessing"
+        self.last_check_display = "Dose safety AI"
+        self.last_check_message = f"Assessing {med_name} with the local model..."
+        self.refresh_dashboard()
+        if not self.vault:
+            self.run_on_ui_thread(
+                self._dose_safety_assessment_failed,
+                request_id,
+                med_snapshot,
+                dose_value,
+                now_ts,
+                f"{source_label}: vault unavailable",
+            )
+            return
+        settings = dict(self.settings_data)
+
+        def launcher() -> None:
+            try:
+                if not self.vault:
+                    raise RuntimeError("Dose safety vault unavailable.")
+                key = self.vault.get_or_create_key()
+                ctx = mp.get_context("spawn")
+                result_queue = ctx.Queue()
+                process = ctx.Process(
+                    target=dose_safety_process_worker,
+                    args=(result_queue, key, med_snapshot, dose_value, now_ts, settings, source_label),
+                    daemon=True,
+                )
+                process.start()
+                self.run_on_ui_thread(
+                    self._dose_safety_process_started,
+                    request_id,
+                    process,
+                    result_queue,
+                    med_snapshot,
+                    dose_value,
+                    now_ts,
+                    source_label,
+                )
+            except Exception as exc:
+                self.run_on_ui_thread(self._dose_safety_assessment_failed, request_id, med_snapshot, dose_value, now_ts, str(exc))
+
+        threading.Thread(target=launcher, daemon=True).start()
+
+    def _dose_safety_process_started(
+        self,
+        request_id: int,
+        process: Any,
+        result_queue: Any,
+        med: Dict[str, Any],
+        dose_value: float,
+        now_ts: float,
+        source_label: str,
+    ) -> None:
+        if request_id != self.dose_ai_request_id:
+            try:
+                if process.is_alive():
+                    process.terminate()
+            except Exception:
+                pass
+            try:
+                result_queue.close()
+            except Exception:
+                pass
+            return
+        self.dose_ai_process = process
+        self.dose_ai_queue = result_queue
+        self.run_on_ui_thread(self._poll_dose_safety_process, request_id, med, dose_value, now_ts, source_label, delay_ms=120)
+
+    def _poll_dose_safety_process(
+        self,
+        request_id: int,
+        med: Dict[str, Any],
+        dose_value: float,
+        now_ts: float,
+        source_label: str,
+    ) -> None:
+        if request_id != self.dose_ai_request_id:
+            self._cleanup_dose_safety_process(terminate=True)
+            return
+        process = self.dose_ai_process
+        result_queue = self.dose_ai_queue
+        if process is None or result_queue is None:
+            self._dose_safety_assessment_failed(request_id, med, dose_value, now_ts, "Dose safety worker did not start.")
+            return
+        try:
+            payload = result_queue.get_nowait()
+        except queue.Empty:
+            try:
+                alive = process.is_alive()
+            except Exception:
+                alive = False
+            if alive:
+                self.run_on_ui_thread(self._poll_dose_safety_process, request_id, med, dose_value, now_ts, source_label, delay_ms=120)
+            else:
+                self._cleanup_dose_safety_process(terminate=False)
+                self._dose_safety_assessment_failed(request_id, med, dose_value, now_ts, "Dose safety worker ended unexpectedly.")
+            return
+        self._cleanup_dose_safety_process(terminate=False)
+        if payload.get("ok"):
+            self._dose_safety_assessment_done(request_id, med, dose_value, source_label, dict(payload.get("result") or {}))
+        else:
+            self._dose_safety_assessment_failed(
+                request_id,
+                med,
+                dose_value,
+                now_ts,
+                sanitize_text(payload.get("error") or "Dose safety worker failed.", max_chars=240),
+            )
+
+    def _dose_safety_assessment_done(
+        self,
+        request_id: int,
+        med: Dict[str, Any],
+        dose_value: float,
+        source_label: str,
+        result: Dict[str, Any],
+    ) -> None:
+        if request_id != self.dose_ai_request_id:
+            return
+        self.last_check_level = result.get("action") or "Caution"
+        self.last_check_display = sanitize_text(result.get("display") or "Dose safety AI", max_chars=160)
+        self.last_check_message = sanitize_text(result.get("message") or "Dose safety review updated.", max_chars=420)
+        self.data_cache["dose_safety_review"] = self._saved_dose_safety_review(
+            med,
+            dose_value,
+            source_label,
+            action=result.get("action") or "",
+            display=self.last_check_display,
+            message=self.last_check_message,
+            raw=result.get("raw") or "",
+            quantum_level=result.get("quantum_level") or "",
+            quantum_score=safe_float(result.get("quantum_score") or 0.0),
+            deterministic_level=result.get("deterministic_level") or "",
+            deterministic_message=result.get("deterministic_message") or "",
+        )
+        self.save_data_async()
+        self.refresh_dashboard()
+        self.set_status(self.last_check_message)
+
+    def _dose_safety_assessment_failed(self, request_id: int, med: Dict[str, Any], dose_value: float, now_ts: float, error_text: str) -> None:
+        if request_id != self.dose_ai_request_id:
+            return
+        label, _message = dose_safety_level(med, dose_value, now_ts)
+        action = normalize_dose_action_text(label)
+        self.last_check_level = action
+        self.last_check_display = f"Dose safety AI: {action}"
+        fallback_message = build_dose_safety_dashboard_message(med, action, now_ts)
+        if error_text:
+            fallback_message += " Local model unavailable, so this used the stored schedule rules."
+        self.last_check_message = sanitize_text(fallback_message, max_chars=420)
+        self.data_cache["dose_safety_review"] = self._saved_dose_safety_review(
+            med,
+            dose_value,
+            "fallback",
+            action=action,
+            display=self.last_check_display,
+            message=self.last_check_message,
+            deterministic_level=label,
+            deterministic_message=_message if "_message" in locals() else "",
+        )
+        self.save_data_async()
+        self.refresh_dashboard()
+        self.set_status(self.last_check_message)
 
     def _register(self, name: str, adapter: Any) -> Any:
         self.ids[name] = adapter
@@ -6509,7 +7459,7 @@ class DesktopMedSafeApp:
         )
         tabview.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 18))
 
-        for tab_name in ("Dashboard", "Medications", "Vision", "Dental", "Exercise", "Assistant", "Settings"):
+        for tab_name in ("Dashboard", "Medications", "Vision", "Dental", "Exercise", "Recovery", "Assistant", "Settings"):
             tabview.add(tab_name)
 
         self._build_dashboard_tab(tabview.tab("Dashboard"))
@@ -6517,6 +7467,7 @@ class DesktopMedSafeApp:
         self._build_vision_tab(tabview.tab("Vision"))
         self._build_dental_tab(tabview.tab("Dental"))
         self._build_exercise_tab(tabview.tab("Exercise"))
+        self._build_recovery_tab(tabview.tab("Recovery"))
         self._build_assistant_tab(tabview.tab("Assistant"))
         self._build_model_tab(tabview.tab("Settings"))
 
@@ -6572,8 +7523,14 @@ class DesktopMedSafeApp:
             muted=True,
             wrap=420,
         )
-        risk_caption.widget.grid(row=3, column=0, sticky="ew", padx=18, pady=(8, 18))
+        risk_caption.widget.grid(row=3, column=0, sticky="ew", padx=18, pady=(8, 12))
         self._register("dashboard_risk_caption", risk_caption)
+        self._button(
+            risk_card,
+            text="Run Safety Check",
+            command=self.on_run_safety_check,
+            tone="neutral",
+        ).grid(row=4, column=0, sticky="ew", padx=18, pady=(0, 18))
 
         summary_card = self._card(left)
         summary_card.grid(row=1, column=0, sticky="nsew", pady=7)
@@ -6763,11 +7720,12 @@ class DesktopMedSafeApp:
 
         buttons = ctk.CTkFrame(form_card, fg_color="transparent")
         buttons.grid(row=14, column=0, columnspan=3, sticky="ew", padx=18, pady=(0, 18))
-        buttons.grid_columnconfigure((0, 1, 2, 3), weight=1)
+        buttons.grid_columnconfigure((0, 1, 2, 3, 4), weight=1)
         self._button(buttons, text="New", command=self.on_new_med, tone="neutral").grid(row=0, column=0, sticky="ew", padx=(0, 6))
         self._button(buttons, text="Save", command=self.on_save_med).grid(row=0, column=1, sticky="ew", padx=6)
         self._button(buttons, text="Delete", command=self.on_delete_med, tone="danger").grid(row=0, column=2, sticky="ew", padx=6)
-        self._button(buttons, text="Log Dose", command=self.on_log_dose, tone="warning").grid(row=0, column=3, sticky="ew", padx=(6, 0))
+        self._button(buttons, text="Run Safety Check", command=self.on_run_safety_check, tone="neutral").grid(row=0, column=3, sticky="ew", padx=6)
+        self._button(buttons, text="Log Dose", command=self.on_log_dose, tone="warning").grid(row=0, column=4, sticky="ew", padx=(6, 0))
 
     def _build_vision_tab(self, tab: Any) -> None:
         tab.grid_columnconfigure(0, weight=1)
@@ -6978,40 +7936,205 @@ class DesktopMedSafeApp:
         scroll.grid_columnconfigure(0, weight=1)
 
         card = self._card(scroll)
-        card.grid(row=0, column=0, sticky="ew")
+        card.grid(row=0, column=0, sticky="ew", pady=(0, 12))
         card.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(card, text="Local Gemma Assistant", anchor="w", text_color=DESKTOP_TEXT, font=ctk.CTkFont(size=18, weight="bold")).grid(
             row=0, column=0, sticky="w", padx=18, pady=(18, 8)
         )
         ctk.CTkLabel(
             card,
-            text="Ask about doses, schedule consistency, dental hygiene reminders, or recovery notes stored in the encrypted vault.",
+            text="Switch between a practical local health assistant, a therapy-style support mode, and a recovery coach mode that uses the plan from the Recovery tab.",
             anchor="w",
             justify="left",
             wraplength=980,
             text_color=DESKTOP_MUTED,
             font=ctk.CTkFont(size=13),
         ).grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 12))
+        mode_row = ctk.CTkFrame(card, fg_color="transparent")
+        mode_row.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 10))
+        mode_row.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(mode_row, text="Assistant mode", anchor="w", text_color=DESKTOP_MUTED).grid(row=0, column=0, sticky="w", padx=(0, 12))
+        mode_menu = ctk.CTkOptionMenu(
+            mode_row,
+            values=["General", "Therapy", "Recovery Coach"],
+            command=self.on_assistant_mode_change,
+            fg_color=DESKTOP_SURFACE_ALT,
+            button_color=DESKTOP_ACCENT,
+            button_hover_color="#0d6b63",
+            dropdown_fg_color=DESKTOP_SURFACE_ALT,
+            dropdown_hover_color="#223443",
+            text_color=DESKTOP_TEXT,
+            corner_radius=12,
+        )
+        mode_menu.grid(row=0, column=1, sticky="w")
+        try:
+            mode_menu.set(self.assistant_mode)
+        except Exception:
+            pass
+        self.ids["assistant_mode_menu"] = mode_menu
+        mode_hint = self._label(
+            card,
+            text="General mode focuses on schedule, wellness, dental, and practical vault guidance.",
+            muted=True,
+            wrap=980,
+        )
+        mode_hint.widget.grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 8))
+        self._register("assistant_mode_hint", mode_hint)
         ctk.CTkLabel(
             card,
-            text="This panel scrolls too, so the chat controls stay reachable on smaller displays.",
+            text="Press Enter to send. Press Shift+Enter for a new line. The assistant stays fully local.",
             anchor="w",
             justify="left",
             wraplength=980,
             text_color=DESKTOP_MUTED,
             font=ctk.CTkFont(size=12),
-        ).grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 10))
+        ).grid(row=4, column=0, sticky="ew", padx=18, pady=(0, 10))
         assistant_history = self._readonly_box(card, height=340)
-        assistant_history.widget.grid(row=3, column=0, sticky="nsew", padx=18, pady=(0, 12))
+        assistant_history.widget.grid(row=5, column=0, sticky="nsew", padx=18, pady=(0, 12))
         self._register("assistant_history", assistant_history)
         assistant_input = self._edit_box(card, height=110)
-        assistant_input.widget.grid(row=4, column=0, sticky="ew", padx=18, pady=(0, 12))
+        assistant_input.widget.grid(row=6, column=0, sticky="ew", padx=18, pady=(0, 12))
         self._register("assistant_input", assistant_input)
+        self._bind_assistant_input_shortcuts(assistant_input)
         buttons = ctk.CTkFrame(card, fg_color="transparent")
-        buttons.grid(row=5, column=0, sticky="ew", padx=18, pady=(0, 18))
+        buttons.grid(row=7, column=0, sticky="ew", padx=18, pady=(0, 18))
         buttons.grid_columnconfigure((0, 1), weight=1)
         self._button(buttons, text="Send", command=self.on_assistant_send).grid(row=0, column=0, sticky="ew", padx=(0, 6))
         self._button(buttons, text="Clear Chat", command=self.on_assistant_clear, tone="danger").grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        self.on_assistant_mode_change(self.assistant_mode)
+
+    def _build_recovery_tab(self, tab: Any) -> None:
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+        scroll = ctk.CTkScrollableFrame(
+            tab,
+            fg_color="transparent",
+            scrollbar_button_color="#314455",
+            scrollbar_button_hover_color="#42586c",
+        )
+        scroll.grid(row=0, column=0, sticky="nsew", padx=14, pady=14)
+        scroll.grid_columnconfigure(0, weight=1)
+
+        recovery_card = self._card(scroll)
+        recovery_card.grid(row=0, column=0, sticky="ew")
+        recovery_card.grid_columnconfigure((0, 1), weight=1)
+        ctk.CTkLabel(
+            recovery_card,
+            text="Recovery Support Studio",
+            anchor="w",
+            text_color=DESKTOP_TEXT,
+            font=ctk.CTkFont(size=18, weight="bold"),
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=18, pady=(18, 8))
+        ctk.CTkLabel(
+            recovery_card,
+            text="Track clean days from your Clean since date, log check-ins or resets, and keep recovery milestones ready for the local coach.",
+            anchor="w",
+            justify="left",
+            wraplength=980,
+            text_color=DESKTOP_MUTED,
+            font=ctk.CTkFont(size=13),
+        ).grid(row=1, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 10))
+        recovery_title = self._label(recovery_card, text="Recovery planner ready", bold=True, wrap=980)
+        recovery_title.widget.grid(row=2, column=0, columnspan=2, sticky="ew", padx=18)
+        self._register("recovery_support_title", recovery_title)
+        reward_line = self._label(recovery_card, text="0 clean days | 0 pts | Next milestone: day 1 (+10 pts)", muted=True, wrap=980)
+        reward_line.widget.grid(row=3, column=0, columnspan=2, sticky="ew", padx=18, pady=(8, 12))
+        self._register("recovery_reward_line", reward_line)
+        reminder_line = self._label(recovery_card, text="Recovery check-ins are off.", muted=True, wrap=980)
+        reminder_line.widget.grid(row=4, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 12))
+        self._register("recovery_reminder_line", reminder_line)
+        ctk.CTkLabel(recovery_card, text="Recovery focus", anchor="w", text_color=DESKTOP_MUTED).grid(row=5, column=0, sticky="w", padx=(18, 8))
+        ctk.CTkLabel(recovery_card, text="Clean since (YYYY-MM-DD)", anchor="w", text_color=DESKTOP_MUTED).grid(row=5, column=1, sticky="w", padx=(8, 18))
+        recovery_goal_name = self._entry(recovery_card, placeholder="Recovery focus")
+        recovery_clean_start = self._entry(recovery_card, placeholder="YYYY-MM-DD")
+        recovery_goal_name.widget.grid(row=6, column=0, sticky="ew", padx=(18, 8), pady=(6, 12))
+        recovery_clean_start.widget.grid(row=6, column=1, sticky="ew", padx=(8, 18), pady=(6, 12))
+        self._register("recovery_goal_name", recovery_goal_name)
+        self._register("recovery_clean_start", recovery_clean_start)
+        ctk.CTkLabel(recovery_card, text="Why this matters", anchor="w", text_color=DESKTOP_MUTED).grid(row=7, column=0, sticky="w", padx=(18, 8))
+        ctk.CTkLabel(recovery_card, text="Coping plan / trigger interrupts", anchor="w", text_color=DESKTOP_MUTED).grid(row=7, column=1, sticky="w", padx=(8, 18))
+        recovery_motivation = self._edit_box(recovery_card, height=120)
+        recovery_coping_plan = self._edit_box(recovery_card, height=120)
+        recovery_motivation.widget.grid(row=8, column=0, sticky="ew", padx=(18, 8), pady=(6, 12))
+        recovery_coping_plan.widget.grid(row=8, column=1, sticky="ew", padx=(8, 18), pady=(6, 12))
+        self._register("recovery_motivation", recovery_motivation)
+        self._register("recovery_coping_plan", recovery_coping_plan)
+        ctk.CTkLabel(recovery_card, text="Check-in reminder time", anchor="w", text_color=DESKTOP_MUTED).grid(
+            row=9, column=0, sticky="w", padx=(18, 8)
+        )
+        recovery_reminder_time = self._entry(recovery_card, placeholder="8:00 PM")
+        recovery_reminder_time.widget.grid(row=10, column=0, sticky="ew", padx=(18, 8), pady=(6, 12))
+        self._register("recovery_reminder_time", recovery_reminder_time)
+        slider_frame = ctk.CTkFrame(recovery_card, fg_color="transparent")
+        slider_frame.grid(row=9, column=1, rowspan=2, sticky="ew", padx=(8, 18), pady=(0, 12))
+        slider_frame.grid_columnconfigure((0, 1), weight=1)
+        mood_value = self._label(slider_frame, text="Mood 5/10", bold=True, wrap=220)
+        mood_value.widget.grid(row=0, column=0, sticky="w")
+        self._register("recovery_mood_value", mood_value)
+        craving_value = self._label(slider_frame, text="Craving 0/10", bold=True, wrap=220)
+        craving_value.widget.grid(row=0, column=1, sticky="w", padx=(12, 0))
+        self._register("recovery_craving_value", craving_value)
+        mood_slider = ctk.CTkSlider(
+            slider_frame,
+            from_=0,
+            to=10,
+            number_of_steps=10,
+            fg_color=DESKTOP_BORDER,
+            progress_color=DESKTOP_SUCCESS,
+            button_color=DESKTOP_SUCCESS,
+            button_hover_color="#2d8b61",
+            command=lambda value: self.on_recovery_slider_change("mood", value),
+        )
+        mood_slider.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        try:
+            mood_slider.set(5)
+        except Exception:
+            pass
+        self.ids["recovery_mood_slider"] = mood_slider
+        craving_slider = ctk.CTkSlider(
+            slider_frame,
+            from_=0,
+            to=10,
+            number_of_steps=10,
+            fg_color=DESKTOP_BORDER,
+            progress_color=DESKTOP_WARNING,
+            button_color=DESKTOP_WARNING,
+            button_hover_color="#b8801f",
+            command=lambda value: self.on_recovery_slider_change("craving", value),
+        )
+        craving_slider.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=(8, 0))
+        try:
+            craving_slider.set(0)
+        except Exception:
+            pass
+        self.ids["recovery_craving_slider"] = craving_slider
+        ctk.CTkLabel(recovery_card, text="Daily check-in or reset note", anchor="w", text_color=DESKTOP_MUTED).grid(
+            row=11, column=0, columnspan=2, sticky="w", padx=18
+        )
+        recovery_checkin_note = self._edit_box(recovery_card, height=110)
+        recovery_checkin_note.widget.grid(row=12, column=0, columnspan=2, sticky="ew", padx=18, pady=(6, 12))
+        self._register("recovery_checkin_note", recovery_checkin_note)
+        recovery_buttons = ctk.CTkFrame(recovery_card, fg_color="transparent")
+        recovery_buttons.grid(row=13, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 12))
+        recovery_buttons.grid_columnconfigure((0, 1, 2), weight=1)
+        self._button(recovery_buttons, text="Save Recovery Plan", command=self.on_save_recovery_support_plan, tone="warning").grid(
+            row=0, column=0, sticky="ew", padx=(0, 6)
+        )
+        self._button(recovery_buttons, text="Daily Check-In", command=self.on_recovery_support_checkin).grid(
+            row=0, column=1, sticky="ew", padx=6
+        )
+        self._button(recovery_buttons, text="Log Relapse / Restart", command=self.on_recovery_support_relapse, tone="danger").grid(
+            row=0, column=2, sticky="ew", padx=(6, 0)
+        )
+        badges_label = self._label(recovery_card, text="Milestone shelf", bold=True, wrap=980)
+        badges_label.widget.grid(row=14, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 8))
+        self._register("recovery_badges_label", badges_label)
+        badges_box = self._readonly_box(recovery_card, height=130)
+        badges_box.widget.grid(row=15, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 12))
+        self._register("recovery_badges", badges_box)
+        recovery_summary = self._readonly_box(recovery_card, height=220)
+        recovery_summary.widget.grid(row=16, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 18))
+        self._register("recovery_support_summary", recovery_summary)
 
     def _build_model_tab(self, tab: Any) -> None:
         tab.grid_columnconfigure(0, weight=1)
@@ -7148,6 +8271,7 @@ class DesktopMedSafeApp:
                 ),
             )
             self.selected_med_id = str(ranked[0].get("id"))
+        self._restore_saved_dose_safety_review()
         self.refresh_ui()
 
     def refresh_time_sensitive_labels(self) -> None:
@@ -7155,6 +8279,7 @@ class DesktopMedSafeApp:
         self.refresh_med_list()
         self.refresh_dental_ui()
         self.refresh_exercise_ui()
+        self.refresh_recovery_support_ui()
 
     def refresh_ui(self) -> None:
         self.refresh_dashboard()
@@ -7165,6 +8290,7 @@ class DesktopMedSafeApp:
         self.refresh_vision_summary()
         self.refresh_dental_ui()
         self.refresh_exercise_ui()
+        self.refresh_recovery_support_ui()
 
     def save_data(self) -> None:
         if self.vault:
@@ -7351,7 +8477,11 @@ class DesktopMedSafeApp:
         self.ids.selected_med_summary.text = summary_text
         self.ids.selected_med_schedule.text = schedule_text
         self.ids.selected_med_history.text = build_med_history_text(selected)
-        self.ids.dashboard_nudge.text = build_medication_nudge_text(selected, now)
+        self.ids.dashboard_nudge.text = build_dashboard_nudge_text(
+            selected,
+            self.current_recovery_support_state(),
+            now,
+        )
         self._render_daily_checklist(selected, now)
 
     def refresh_med_list(self) -> None:
@@ -7408,7 +8538,9 @@ class DesktopMedSafeApp:
         lines = []
         for item in history[-12:]:
             speaker = "You" if item.get("role") == "user" else "MedSafe"
-            lines.append(f"{speaker}\n{sanitize_text(item.get('content') or '', max_chars=1200)}")
+            mode = normalize_assistant_mode(item.get("mode") or "General")
+            mode_suffix = "" if mode == "General" else f" | {mode}"
+            lines.append(f"{speaker}{mode_suffix}\n{sanitize_text(item.get('content') or '', max_chars=1200)}")
         self.ids.assistant_history.text = "\n\n".join(lines)
 
     def refresh_vision_summary(self) -> None:
@@ -7719,6 +8851,17 @@ class DesktopMedSafeApp:
             return
         self._log_dose_for_med(med)
 
+    def on_run_safety_check(self) -> None:
+        med = self.current_selected_med()
+        if not med:
+            self.set_status("Select a medication before running a safety check.")
+            return
+        dose_value = max(0.0, safe_float(self.ids.dose_mg.text) or safe_float(med.get("dose_mg")))
+        if dose_value <= 0:
+            self.set_status("Enter or save a dose amount before running a safety check.")
+            return
+        self.start_dose_safety_assessment(med, dose_value, source_label="manual check")
+
     def on_log_dental_habit(self, habit: str) -> None:
         hygiene = dict(self.data_cache.get("dental_hygiene") or dental_hygiene_defaults())
         now = time.time()
@@ -7850,43 +8993,327 @@ class DesktopMedSafeApp:
             return
         on_ready(chosen)
 
-    def append_assistant_message(self, role: str, content: str) -> None:
+    def on_assistant_mode_change(self, value: str) -> None:
+        self.assistant_mode = normalize_assistant_mode(value)
+        if "assistant_mode_hint" in self.ids:
+            if self.assistant_mode == "Therapy":
+                self.ids.assistant_mode_hint.text = (
+                    "Therapy mode keeps the tone supportive and reflective. It is not a licensed therapist or crisis service."
+                )
+            elif self.assistant_mode == "Recovery Coach":
+                self.ids.assistant_mode_hint.text = (
+                    "Recovery Coach mode focuses on streak protection, relapse prevention, milestones, and the next 24 hours."
+                )
+            else:
+                self.ids.assistant_mode_hint.text = (
+                    "General mode focuses on schedule, wellness, dental, and practical vault guidance."
+                )
+        self.set_status(f"Assistant mode set to {self.assistant_mode}.")
+
+    def on_recovery_slider_change(self, field: str, value: float) -> None:
+        clean_field = sanitize_text(field, max_chars=24).lower()
+        label_map = {
+            "mood": ("recovery_mood_value", "Mood"),
+            "craving": ("recovery_craving_value", "Craving"),
+        }
+        target = label_map.get(clean_field)
+        if not target or target[0] not in self.ids:
+            return
+        self.ids[target[0]].text = f"{target[1]} {float(value):.0f}/10"
+
+    def _slider_value(self, widget_id: str, default: float = 0.0) -> float:
+        widget = self.ids.get(widget_id)
+        if widget is None:
+            return max(0.0, min(10.0, float(default)))
+        try:
+            raw_value = widget.get()
+        except Exception:
+            raw_value = getattr(widget, "_value", default)
+        return max(0.0, min(10.0, safe_float(raw_value if raw_value is not None else default)))
+
+    def _set_slider_value(self, widget_id: str, value: float) -> None:
+        widget = self.ids.get(widget_id)
+        if widget is None:
+            return
+        clamped = max(0.0, min(10.0, safe_float(value)))
+        try:
+            current = safe_float(widget.get())
+        except Exception:
+            current = safe_float(getattr(widget, "_value", clamped))
+        if abs(current - clamped) <= 0.05:
+            return
+        try:
+            widget.set(clamped)
+        except Exception:
+            return
+
+    def _bind_assistant_input_shortcuts(self, adapter: DesktopTextboxAdapter) -> None:
+        def handler(event: Any) -> str:
+            if getattr(event, "keysym", "") != "Return":
+                return ""
+            if int(getattr(event, "state", 0)) & 0x0001:
+                target = getattr(adapter.widget, "_textbox", None) or adapter.widget
+                try:
+                    target.insert("insert", "\n")
+                except Exception:
+                    pass
+                return "break"
+            self.on_assistant_send()
+            return "break"
+
+        for target in (getattr(adapter.widget, "_textbox", None), adapter.widget):
+            if target is None:
+                continue
+            try:
+                target.bind("<Return>", handler)
+            except Exception:
+                continue
+
+    def append_assistant_message(self, role: str, content: str, *, mode: Optional[str] = None, persist: bool = True) -> None:
         history = list(self.data_cache.get("assistant_history") or [])
-        history.append({"role": role, "content": sanitize_text(content, max_chars=3000), "timestamp": time.time()})
+        history.append(
+            {
+                "role": role,
+                "mode": normalize_assistant_mode(mode or self.assistant_mode),
+                "content": sanitize_text(content, max_chars=3000),
+                "timestamp": time.time(),
+            }
+        )
         self.data_cache["assistant_history"] = history[-24:]
-        self.save_data()
+        if persist:
+            self.save_data()
+            self.assistant_history_dirty = False
+        else:
+            self.assistant_history_dirty = True
         self.refresh_assistant_history()
 
     def on_assistant_send(self) -> None:
         prompt = sanitize_text(self.ids.assistant_input.text, max_chars=1600)
         if not prompt or not self.vault:
             return
+        if self.assistant_request_pending:
+            self.set_status("Assistant is still working on the last message.")
+            return
         self.ids.assistant_input.text = ""
-        self.append_assistant_message("user", prompt)
-        self.set_status("Thinking with Gemma 4...")
-
-        snapshot = ensure_vault_shape(json.loads(json.dumps(self.data_cache)))
+        active_mode = normalize_assistant_mode(self.assistant_mode)
+        selected_med_id = self.selected_med_id
         settings = dict(self.settings_data)
-        key = self.vault.get_or_create_key()
+        self.assistant_request_pending = True
+        self.append_assistant_message("user", prompt, mode=active_mode, persist=False)
+        self.set_status("Thinking with Gemma 4...")
 
         def worker() -> None:
             try:
-                reply = run_assistant_request(key, snapshot, prompt, self.selected_med_id, settings)
+                if not self.vault:
+                    raise RuntimeError("Assistant vault unavailable.")
+                key = self.vault.get_or_create_key()
+                snapshot = self.clone_data_snapshot()
+                reply = run_assistant_request(key, snapshot, prompt, selected_med_id, settings, mode=active_mode)
             except Exception as exc:
                 reply = f"Assistant unavailable: {exc}"
-            self.run_on_ui_thread(self._assistant_done, reply)
+            self.run_on_ui_thread(self._assistant_done, reply, active_mode)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _assistant_done(self, reply: str) -> None:
-        self.append_assistant_message("assistant", reply)
+    def _assistant_done(self, reply: str, mode: str) -> None:
+        self.assistant_request_pending = False
+        self.append_assistant_message("assistant", reply, mode=mode, persist=False)
+        self.persist_data_async()
         self.set_status("Assistant reply ready.")
 
     def on_assistant_clear(self) -> None:
+        self.assistant_request_pending = False
         self.data_cache["assistant_history"] = []
         self.save_data()
+        self.assistant_history_dirty = False
         self.refresh_assistant_history()
         self.set_status("Assistant chat cleared.")
+
+    def current_recovery_support_state(self) -> Dict[str, Any]:
+        return dict(self.data_cache.get("recovery_support") or recovery_support_defaults())
+
+    def refresh_recovery_support_ui(self) -> None:
+        if "recovery_support_summary" not in self.ids:
+            return
+        state = self.current_recovery_support_state()
+        now = time.time()
+        title, body = build_recovery_support_summary(state, now)
+        mood_value = max(0.0, min(10.0, safe_float(state.get("latest_mood") or 0.0)))
+        craving_value = max(0.0, min(10.0, safe_float(state.get("latest_craving") or 0.0)))
+        reminder_time = sanitize_text(state.get("reminder_time") or recovery_support_defaults()["reminder_time"], max_chars=20)
+        due = recovery_support_due_status(state, now)
+        milestone_count = len(
+            [
+                item
+                for item in list(state.get("history") or [])
+                if sanitize_text(item.get("type") or "", max_chars=20).lower() == "milestone"
+            ]
+        )
+        self.ids.recovery_support_title.text = title
+        self.ids.recovery_support_summary.text = body
+        self.set_field_text("recovery_goal_name", sanitize_text(state.get("goal_name") or "Recovery", max_chars=120))
+        self.set_field_text("recovery_clean_start", sanitize_text(state.get("clean_start_date") or "", max_chars=20))
+        self.set_field_text("recovery_motivation", sanitize_text(state.get("motivation") or "", max_chars=1200))
+        self.set_field_text("recovery_coping_plan", sanitize_text(state.get("coping_plan") or "", max_chars=1200))
+        self.set_field_text("recovery_reminder_time", reminder_time)
+        self._set_slider_value("recovery_mood_slider", mood_value)
+        self._set_slider_value("recovery_craving_slider", craving_value)
+        self.on_recovery_slider_change("mood", mood_value)
+        self.on_recovery_slider_change("craving", craving_value)
+        streak_days = recovery_clean_days(state, datetime.fromtimestamp(now).date())
+        next_milestone = recovery_next_milestone(streak_days)
+        next_text = (
+            f"Next milestone: day {next_milestone[0]} (+{next_milestone[1]} pts)"
+            if next_milestone is not None
+            else "Top milestone already unlocked"
+        )
+        self.ids.recovery_reward_line.text = (
+            f"{streak_days} clean day{'s' if streak_days != 1 else ''} | "
+            f"{max(0, int(safe_float(state.get('points') or 0)))} pts | {next_text}"
+        )
+        reminder_prefix = f"Reminder {reminder_time} | " if state.get("enabled") else ""
+        self.ids.recovery_reminder_line.text = reminder_prefix + sanitize_text(due.get("text") or "", max_chars=180)
+        if due.get("overdue"):
+            self.ids.recovery_reminder_line.text_color = DESKTOP_DANGER
+        elif due.get("due_now"):
+            self.ids.recovery_reminder_line.text_color = DESKTOP_WARNING
+        elif sanitize_text(due.get("state") or "", max_chars=20).lower() == "done":
+            self.ids.recovery_reminder_line.text_color = DESKTOP_SUCCESS
+        else:
+            self.ids.recovery_reminder_line.text_color = DESKTOP_MUTED
+        self.ids.recovery_badges_label.text = (
+            f"Milestone shelf ({milestone_count} unlocked)" if milestone_count else "Milestone shelf"
+        )
+        self.ids.recovery_badges.text = build_recovery_badges_text(state)
+
+    def on_save_recovery_support_plan(self) -> None:
+        state = self.current_recovery_support_state()
+        goal_name = sanitize_text(self.ids.recovery_goal_name.text, max_chars=120) or "Recovery"
+        clean_start_date = sanitize_text(self.ids.recovery_clean_start.text, max_chars=20)
+        motivation = sanitize_text(self.ids.recovery_motivation.text, max_chars=1200)
+        coping_plan = sanitize_text(self.ids.recovery_coping_plan.text, max_chars=1200)
+        reminder_time = sanitize_text(self.ids.recovery_reminder_time.text, max_chars=20) or recovery_support_defaults()["reminder_time"]
+        latest_mood = self._slider_value("recovery_mood_slider", state.get("latest_mood") or 5.0)
+        latest_craving = self._slider_value("recovery_craving_slider", state.get("latest_craving") or 0.0)
+        clean_start_parsed = parse_date_string(clean_start_date) if clean_start_date else None
+        if clean_start_date and clean_start_parsed is None:
+            self.set_status("Use YYYY-MM-DD for the clean start date.")
+            return
+        if clean_start_parsed is not None and clean_start_parsed > datetime.fromtimestamp(time.time()).date():
+            self.set_status("Clean start date cannot be in the future.")
+            return
+        if reminder_time and parse_clock_minutes(reminder_time) is None:
+            self.set_status("Use HH:MM or am/pm format for the recovery reminder time.")
+            return
+        state["enabled"] = bool(goal_name or clean_start_date or motivation or coping_plan)
+        state["goal_name"] = goal_name
+        state["clean_start_date"] = clean_start_date
+        state["motivation"] = motivation
+        state["coping_plan"] = coping_plan
+        state["reminder_time"] = reminder_time
+        state["latest_mood"] = latest_mood
+        state["latest_craving"] = latest_craving
+        state, rewards = apply_recovery_support_progress(state, now_ts=time.time(), award_checkin_points=False)
+        self.data_cache["recovery_support"] = state
+        self.save_data()
+        self.refresh_dashboard()
+        self.refresh_recovery_support_ui()
+        if rewards:
+            self.set_status("Recovery plan saved. " + " ".join(rewards[:2]))
+        else:
+            self.set_status(f"Saved {goal_name} recovery plan.")
+
+    def on_recovery_support_checkin(self) -> None:
+        state = self.current_recovery_support_state()
+        now = time.time()
+        note = sanitize_text(self.ids.recovery_checkin_note.text, max_chars=1200)
+        mood_value = self._slider_value("recovery_mood_slider", state.get("latest_mood") or 5.0)
+        craving_value = self._slider_value("recovery_craving_slider", state.get("latest_craving") or 0.0)
+        reminder_time = sanitize_text(self.ids.recovery_reminder_time.text, max_chars=20)
+        if not sanitize_text(state.get("goal_name") or "", max_chars=120):
+            state["goal_name"] = "Recovery"
+        if not sanitize_text(state.get("clean_start_date") or "", max_chars=20):
+            state["clean_start_date"] = datetime.fromtimestamp(now).date().isoformat()
+        if reminder_time and parse_clock_minutes(reminder_time) is not None:
+            state["reminder_time"] = reminder_time
+        days_clean = recovery_clean_days(state, datetime.fromtimestamp(now).date())
+        already_checked_in = recovery_checked_in_today(state, now)
+        points_delta = 0 if already_checked_in else 2
+        state["enabled"] = True
+        state["latest_note"] = note
+        state["latest_checkin_ts"] = now
+        state["latest_mood"] = mood_value
+        state["latest_craving"] = craving_value
+        history = list(state.get("history") or [])
+        history.append(
+            {
+                "timestamp": now,
+                "type": "checkin",
+                "note": note or "Daily recovery check-in logged.",
+                "streak_days": days_clean,
+                "points_delta": points_delta,
+                "mood": mood_value,
+                "craving": craving_value,
+                "label": "Daily check-in",
+            }
+        )
+        state["history"] = history[-240:]
+        state, rewards = apply_recovery_support_progress(state, now_ts=now, award_checkin_points=not already_checked_in)
+        self.data_cache["recovery_support"] = state
+        self.save_data()
+        self.ids.recovery_checkin_note.text = ""
+        self.refresh_dashboard()
+        self.refresh_recovery_support_ui()
+        if rewards:
+            self.set_status("Recovery check-in saved. " + " ".join(rewards[:2]))
+        else:
+            self.set_status("Recovery check-in saved.")
+
+    def on_recovery_support_relapse(self) -> None:
+        state = self.current_recovery_support_state()
+        now = time.time()
+        today_text = datetime.fromtimestamp(now).date().isoformat()
+        note = sanitize_text(self.ids.recovery_checkin_note.text, max_chars=1200) or "Relapse/reset logged. Starting a fresh day-one plan."
+        mood_value = self._slider_value("recovery_mood_slider", state.get("latest_mood") or 5.0)
+        craving_value = self._slider_value("recovery_craving_slider", state.get("latest_craving") or 0.0)
+        reminder_time = sanitize_text(self.ids.recovery_reminder_time.text, max_chars=20)
+        previous_streak = recovery_clean_days(state, datetime.fromtimestamp(now).date())
+        state["enabled"] = True
+        if reminder_time and parse_clock_minutes(reminder_time) is not None:
+            state["reminder_time"] = reminder_time
+        state["best_streak_days"] = max(previous_streak, max(0, int(safe_float(state.get("best_streak_days") or 0))))
+        state["relapse_count"] = max(0, int(safe_float(state.get("relapse_count") or 0))) + 1
+        state["last_relapse_date"] = today_text
+        state["clean_start_date"] = today_text
+        state["cycle"] = max(1, int(safe_float(state.get("cycle") or 1))) + 1
+        state["latest_note"] = note
+        state["latest_checkin_ts"] = now
+        state["latest_mood"] = mood_value
+        state["latest_craving"] = craving_value
+        history = list(state.get("history") or [])
+        history.append(
+            {
+                "timestamp": now,
+                "type": "relapse",
+                "note": note,
+                "streak_days": previous_streak,
+                "points_delta": 0,
+                "mood": mood_value,
+                "craving": craving_value,
+                "label": "Reset",
+            }
+        )
+        state["history"] = history[-240:]
+        state, rewards = apply_recovery_support_progress(state, now_ts=now, award_checkin_points=False)
+        self.data_cache["recovery_support"] = state
+        self.save_data()
+        self.ids.recovery_checkin_note.text = ""
+        self.refresh_dashboard()
+        self.refresh_recovery_support_ui()
+        if rewards:
+            self.set_status("Recovery reset saved. " + " ".join(rewards[:2]))
+        else:
+            self.set_status("Recovery reset saved. Day 1 starts again now.")
 
     def _start_image_analysis(self, image_path: Path) -> None:
         if not self.vault:
@@ -7894,13 +9321,17 @@ class DesktopMedSafeApp:
         self.ids.vision_last_file.text = f"Last image: {image_path.name}"
         self.ids.vision_status.text = "Reading bottle photo with Gemma 4..."
         self.set_status("Importing medication from photo...")
-        key = self.vault.get_or_create_key()
         settings = dict(self.settings_data)
+        selected_med_id = self.selected_med_id
+        data_snapshot = self.clone_data_snapshot()
 
         def worker() -> None:
             try:
+                if not self.vault:
+                    raise RuntimeError("Bottle photo vault unavailable.")
+                key = self.vault.get_or_create_key()
                 payload, raw = analyze_medication_image(key, image_path, settings)
-                updated, med_id, created = apply_vision_payload(self.data_cache, payload, selected_med_id=self.selected_med_id)
+                updated, med_id, created = apply_vision_payload(data_snapshot, payload, selected_med_id=selected_med_id)
                 self.run_on_ui_thread(self._vision_done, updated, med_id, payload, created, raw)
             except Exception as exc:
                 self.run_on_ui_thread(self._vision_failed, str(exc))
@@ -7962,13 +9393,16 @@ class DesktopMedSafeApp:
         self.ids.dental_hygiene_photo.text = f"Last hygiene photo: {image_path.name}"
         self.ids.dental_hygiene_status.text = "Reviewing hygiene photo with Gemma 4..."
         self.set_status("Reviewing dental hygiene photo...")
-        key = self.vault.get_or_create_key()
         settings = dict(self.settings_data)
+        data_snapshot = self.clone_data_snapshot()
 
         def worker() -> None:
             try:
+                if not self.vault:
+                    raise RuntimeError("Dental hygiene vault unavailable.")
+                key = self.vault.get_or_create_key()
                 payload, raw = analyze_dental_hygiene_image(key, image_path, settings)
-                updated = apply_dental_hygiene_payload(self.data_cache, payload)
+                updated = apply_dental_hygiene_payload(data_snapshot, payload)
                 self.run_on_ui_thread(self._dental_hygiene_done, updated, payload, raw)
             except Exception as exc:
                 self.run_on_ui_thread(self._dental_hygiene_failed, str(exc))
@@ -8017,13 +9451,16 @@ class DesktopMedSafeApp:
         self.ids.recovery_last_photo.text = f"Last recovery photo: {image_path.name}"
         self.ids.recovery_mode_status.text = "Reviewing recovery photo with Gemma 4..."
         self.set_status("Reviewing dental recovery photo...")
-        key = self.vault.get_or_create_key()
         settings = dict(self.settings_data)
+        data_snapshot = self.clone_data_snapshot()
 
         def worker() -> None:
             try:
+                if not self.vault:
+                    raise RuntimeError("Dental recovery vault unavailable.")
+                key = self.vault.get_or_create_key()
                 payload, raw = analyze_dental_recovery_image(key, image_path, settings, recovery_state)
-                updated = apply_dental_recovery_payload(self.data_cache, payload, recovery_state)
+                updated = apply_dental_recovery_payload(data_snapshot, payload, recovery_state)
                 self.run_on_ui_thread(self._recovery_done, updated, payload, raw)
             except Exception as exc:
                 self.run_on_ui_thread(self._recovery_failed, str(exc))
@@ -8077,9 +9514,12 @@ class DesktopMedSafeApp:
             return
         self.ids.model_progress.value = 0
         self.set_status("Downloading Gemma 4...")
-        key = self.vault.get_or_create_key()
 
         def worker() -> str:
+            if not self.vault:
+                raise RuntimeError("Model vault unavailable.")
+            key = self.vault.get_or_create_key()
+
             def reporter(kind: str, payload: Any) -> None:
                 if kind == "progress":
                     self.run_on_ui_thread(setattr, self.ids.model_progress, "value", int(float(payload) * 100))
@@ -8101,8 +9541,11 @@ class DesktopMedSafeApp:
             return
         self.ids.model_progress.value = 15
         self.set_status("Verifying model hash...")
-        key = self.vault.get_or_create_key()
-        self._run_model_task(lambda: verify_model_hash(key), self._model_verify_done, "Model Verification Failed")
+        self._run_model_task(
+            lambda: verify_model_hash(self.vault.get_or_create_key()) if self.vault else ("", False),
+            self._model_verify_done,
+            "Model Verification Failed",
+        )
 
     def _model_verify_done(self, result: Tuple[str, bool]) -> None:
         sha, okay = result
@@ -8361,7 +9804,11 @@ def _desktop_refresh_dashboard(self: DesktopMedSafeApp) -> None:
     self.ids.selected_med_summary.text = summary_text
     self.ids.selected_med_schedule.text = schedule_text
     self.ids.selected_med_history.text = build_med_history_text(selected)
-    self.ids.dashboard_nudge.text = build_medication_nudge_text(selected, now)
+    self.ids.dashboard_nudge.text = build_dashboard_nudge_text(
+        selected,
+        self.current_recovery_support_state(),
+        now,
+    )
     self.ids.daily_checklist_hint.text = (
         "Each row shows the time, medication, and planned dose. Check it when you take it; "
         "missed slots get an X and elapsed time."
