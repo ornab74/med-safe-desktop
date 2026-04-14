@@ -179,6 +179,8 @@ FILE_ENCRYPTION_CHUNK_SIZE = 4 * 1024 * 1024
 KEY_WRAP_MAGIC = b"MSKEY001"
 KEY_WRAP_SALT_LEN = 16
 KEY_WRAP_NONCE_LEN = 12
+DOSE_HISTORY_DUPLICATE_WINDOW_SECONDS = 5 * 60.0
+DOSE_RELOG_GUARD_SECONDS = 90.0
 NAMED_DOSE_PRESETS: Tuple[Tuple[str, int], ...] = (
     ("Breakfast", 8 * 60),
     ("Daytime", 10 * 60),
@@ -518,11 +520,14 @@ def mg_from_text(text: str) -> float:
 def infer_interval_from_text(text: str) -> float:
     lowered = sanitize_text(text, max_chars=500).lower()
     for pattern in (
+        r"every\s+(\d+(?:\.\d+)?)\s*(?:to|-)\s*(\d+(?:\.\d+)?)\s*(?:hours|hour|hrs|hr)\b",
         r"every\s+(\d+(?:\.\d+)?)\s*(?:hours|hour|hrs|hr)\b",
         r"q(\d+(?:\.\d+)?)h\b",
     ):
         match = re.search(pattern, lowered)
         if match:
+            if match.lastindex and match.lastindex >= 2 and match.group(2):
+                return min(safe_float(match.group(1)), safe_float(match.group(2)))
             return safe_float(match.group(1))
     named = {
         "once daily": 24.0,
@@ -550,6 +555,12 @@ def infer_max_daily_mg(text: str, dose_mg: float) -> float:
         tablet_match = re.search(r"(?:max(?:imum)?|not more than|do not exceed)\s+(\d+(?:\.\d+)?)\s+(?:tablets|capsules|pills?)", lowered)
         if tablet_match:
             return safe_float(tablet_match.group(1)) * dose_mg
+        dose_count_match = re.search(
+            r"(?:max(?:imum)?(?:\s+of)?|up to|not more than|do not exceed|no more than)\s+(\d+(?:\.\d+)?)\s+(?:doses?|times?)\s+(?:in|per)\s+24\s*(?:hours?|hrs?|hr|h)\b",
+            lowered,
+        )
+        if dose_count_match:
+            return safe_float(dose_count_match.group(1)) * dose_mg
     return 0.0
 
 
@@ -1590,14 +1601,60 @@ def selected_or_matching_med_id(data: Dict[str, Any], payload_name: str, selecte
     return None
 
 
-def total_taken_last_24h(med: Dict[str, Any], now_ts: float) -> float:
-    cutoff = now_ts - 24 * 3600.0
-    total = 0.0
+def medication_history_rows(
+    med: Dict[str, Any],
+    *,
+    collapse_probable_duplicates: bool = True,
+    duplicate_window_seconds: float = DOSE_HISTORY_DUPLICATE_WINDOW_SECONDS,
+) -> List[Tuple[float, float]]:
+    rows: List[Tuple[float, float]] = []
     for row in med.get("history", []) or []:
-        if len(row) < 2:
+        if not isinstance(row, (list, tuple)) or len(row) < 2:
             continue
         ts = safe_float(row[0])
         mg = max(0.0, safe_float(row[1]))
+        if ts <= 0 or mg <= 0:
+            continue
+        rows.append((ts, mg))
+    rows.sort(key=lambda item: item[0])
+    if not collapse_probable_duplicates:
+        return rows
+    normalized: List[Tuple[float, float]] = []
+    for ts, mg in rows:
+        if normalized:
+            prev_ts, prev_mg = normalized[-1]
+            if (ts - prev_ts) <= duplicate_window_seconds and abs(prev_mg - mg) <= 1e-6:
+                continue
+        normalized.append((ts, mg))
+    return normalized
+
+
+def last_effective_taken_ts(med: Dict[str, Any]) -> float:
+    rows = medication_history_rows(med)
+    if rows:
+        return rows[-1][0]
+    return safe_float(med.get("last_taken_ts"))
+
+
+def recent_duplicate_log_ts(med: Dict[str, Any], dose_mg: float, now_ts: float) -> Optional[float]:
+    dose_value = max(0.0, dose_mg)
+    if dose_value <= 0:
+        return None
+    rows = medication_history_rows(med, collapse_probable_duplicates=False)
+    if not rows:
+        return None
+    last_ts, last_mg = rows[-1]
+    if abs(last_mg - dose_value) > 1e-6:
+        return None
+    if 0.0 <= (now_ts - last_ts) <= DOSE_RELOG_GUARD_SECONDS:
+        return last_ts
+    return None
+
+
+def total_taken_last_24h(med: Dict[str, Any], now_ts: float) -> float:
+    cutoff = now_ts - 24 * 3600.0
+    total = 0.0
+    for ts, mg in medication_history_rows(med):
         if ts >= cutoff:
             total += mg
     return total
@@ -1857,9 +1914,9 @@ def build_medication_daily_slots(
     day_start = clock_minutes_to_timestamp(target_day, 0)
     day_end = day_start + 24.0 * 3600.0
     history_rows = [
-        (row_index, safe_float(row[0]), max(0.0, safe_float(row[1])))
-        for row_index, row in enumerate(list(med.get("history") or []))
-        if len(row) >= 2 and (day_start - tolerance) <= safe_float(row[0]) < (day_end + tolerance)
+        (row_index, ts, amount)
+        for row_index, (ts, amount) in enumerate(medication_history_rows(med))
+        if (day_start - tolerance) <= ts < (day_end + tolerance)
     ]
     used_rows = set()
     for slot in slots:
@@ -1941,7 +1998,7 @@ def next_due_timestamp(med: Dict[str, Any]) -> Optional[float]:
     if slot is not None:
         return safe_float(slot.get("scheduled_ts"))
     interval_hours = max(0.0, safe_float(med.get("interval_hours")))
-    last_taken_ts = safe_float(med.get("last_taken_ts"))
+    last_taken_ts = last_effective_taken_ts(med)
     if interval_hours <= 0:
         return None
     if last_taken_ts <= 0:
@@ -1980,7 +2037,7 @@ def medication_due_status(med: Dict[str, Any], now_ts: Optional[float] = None) -
             "slot": slot,
         }
     interval_hours = max(0.0, safe_float(med.get("interval_hours")))
-    last_taken_ts = safe_float(med.get("last_taken_ts"))
+    last_taken_ts = last_effective_taken_ts(med)
     next_ts = next_due_timestamp(med)
     if interval_hours <= 0:
         return {"state": "Flexible", "text": "Flexible schedule", "next_ts": None, "due_now": False, "overdue": False}
@@ -2003,7 +2060,7 @@ def medication_card_line(med: Dict[str, Any], now_ts: Optional[float] = None) ->
     dose_text = f"{int(dose) if dose.is_integer() else dose:g} mg"
     interval_text = f"every {int(interval) if interval.is_integer() else interval:g}h" if interval > 0 else "flex schedule"
     max_daily = max(0.0, safe_float(med.get("max_daily_mg")))
-    daily_text = f"{daily:g}/{max_daily:g} mg today" if max_daily > 0 else f"{daily:g} mg today"
+    daily_text = f"{daily:g}/{max_daily:g} mg last 24h" if max_daily > 0 else f"{daily:g} mg last 24h"
     return f"{dose_text} | {interval_text} | {status['text']} | {daily_text}"
 
 
@@ -2029,7 +2086,7 @@ def build_timeline_text(meds: List[Dict[str, Any]], now_ts: Optional[float] = No
 def build_med_history_text(med: Optional[Dict[str, Any]]) -> str:
     if not med:
         return "Select a medication to see recent logs."
-    rows = list(med.get("history") or [])[-5:]
+    rows = medication_history_rows(med)[-5:]
     if not rows:
         return "No doses logged for this medication yet."
     lines = []
@@ -2092,9 +2149,10 @@ def dose_safety_level(med: Dict[str, Any], dose_mg: float, now_ts: float) -> Tup
     dose_value = max(0.0, dose_mg)
     interval_hours = max(0.0, safe_float(med.get("interval_hours")))
     max_daily = max(0.0, safe_float(med.get("max_daily_mg")))
-    last_taken = safe_float(med.get("last_taken_ts"))
+    last_taken = last_effective_taken_ts(med)
     minutes_since = (now_ts - last_taken) / 60.0 if last_taken > 0 else 1e9
-    projected = total_taken_last_24h(med, now_ts) + dose_value
+    taken_last_24h = total_taken_last_24h(med, now_ts)
+    projected = taken_last_24h + dose_value
     ratio = (projected / max_daily) if max_daily > 0 else 0.0
     way_too_soon = interval_hours > 0 and minutes_since < interval_hours * 60.0 * 0.50
     too_soon = interval_hours > 0 and minutes_since < interval_hours * 60.0 * 0.85
@@ -2103,7 +2161,7 @@ def dose_safety_level(med: Dict[str, Any], dose_mg: float, now_ts: float) -> Tup
     if dose_value <= 0:
         return "High", "Dose is missing or invalid. Enter a valid mg value before logging."
     if max_daily > 0 and projected > max_daily + 1e-6:
-        return "High", f"Unsafe: this would exceed the stored 24h limit ({projected:g}/{max_daily:g} mg)."
+        return "High", f"Unsafe: this would exceed the stored 24h limit ({projected:g}/{max_daily:g} mg in the last 24h)."
     if way_too_soon:
         return "High", f"Unsafe: this is much earlier than the stored {interval_hours:g}h interval."
     if next_slot is not None and next_slot.get("status") == "upcoming":
@@ -2115,7 +2173,7 @@ def dose_safety_level(med: Dict[str, Any], dose_mg: float, now_ts: float) -> Tup
     if max_daily > 0 and abs(projected - max_daily) <= 1e-6:
         return "Low", f"On schedule. This dose reaches the stored 24h limit at {projected:g} mg."
     if max_daily > 0 and ratio >= 0.90:
-        return "Medium", f"Caution: close to the 24h limit ({projected:g}/{max_daily:g} mg projected)."
+        return "Medium", f"Caution: close to the 24h limit ({projected:g}/{max_daily:g} mg in the last 24h after this dose)."
     if interval_hours <= 0 and max_daily <= 0:
         return "Medium", "Schedule has no interval or daily limit stored, so this stays a caution check."
     if next_slot is not None and next_slot.get("status") == "missed":
@@ -2371,16 +2429,18 @@ def build_schedule_context(data: Dict[str, Any], selected_med_id: Optional[str])
         for med in meds:
             status = medication_due_status(med, now)
             schedule_preview = sanitize_text(build_medication_schedule_text(med, now).replace("\n", " | "), max_chars=260)
+            last_24h = total_taken_last_24h(med, now)
             marker = " [selected]" if str(med.get("id")) == selected_med_id else ""
             lines.append(
                 "- {name}{marker}: dose={dose:g}mg interval={interval:g}h max_daily={max_daily:g}mg "
-                "last_taken={last_taken} next_due={next_due} plan={plan} notes={notes}".format(
+                "last_taken={last_taken} last_24h_total={last_24h:g}mg next_due={next_due} plan={plan} notes={notes}".format(
                     name=sanitize_text(med.get("name"), max_chars=120),
                     marker=marker,
                     dose=max(0.0, safe_float(med.get("dose_mg"))),
                     interval=max(0.0, safe_float(med.get("interval_hours"))),
                     max_daily=max(0.0, safe_float(med.get("max_daily_mg"))),
-                    last_taken=format_timestamp(safe_float(med.get("last_taken_ts"))),
+                    last_taken=format_timestamp(last_effective_taken_ts(med)),
+                    last_24h=last_24h,
                     next_due=status["text"],
                     plan=schedule_preview or "no daily plan",
                     notes=sanitize_text(med.get("notes") or "none", max_chars=180) or "none",
@@ -2464,6 +2524,9 @@ def run_assistant_request(
         "You are MedSafe, a private local health scheduling assistant running entirely on the user's device.\n"
         "Use only the medication, dental hygiene, and recovery facts in the provided context and the user's request.\n"
         "You are not a clinician and cannot verify interactions, diagnoses, allergies, organ function, or procedure complications.\n"
+        "When the user asks whether a dose looks okay, ground the answer in the stored dose amount, interval, planned times, and last-24-hour total from the context.\n"
+        "Use High only when the stored numbers clearly show a timing or 24-hour-limit problem, Medium when timing is a little early or key details are missing, and Low when the stored schedule supports the dose.\n"
+        "Do not keep repeating that something is unsafe unless the provided numbers clearly support that conclusion.\n"
         "Be concise, practical, and clear when uncertainty exists."
     )
     user_text = "\n\n".join(
@@ -2533,11 +2596,20 @@ def normalize_photo_payload(raw_payload: Dict[str, Any], image_name: str, risk_p
     if confidence > 1.0 and confidence <= 100.0:
         confidence /= 100.0
     confidence = max(0.0, min(1.0, confidence))
-    risk_fields = normalize_risk_fields(raw_payload, risk_packet)
     if not name:
         raise ValueError("The model could not confidently read a medication name from that photo.")
     if not schedule_text:
         schedule_text = "Imported from bottle photo. Review directions before relying on it."
+    risk_fields = resolve_medication_review_risk(
+        normalize_risk_fields(raw_payload, {"risk_score": 0.0, "risk_level": "", "risk_summary": ""}),
+        name=name,
+        dose_mg=dose_mg,
+        interval_hours=interval_hours,
+        max_daily_mg=max_daily_mg,
+        schedule_text=schedule_text,
+        notes=notes,
+        confidence=confidence,
+    )
     return {
         "name": name,
         "dose_mg": dose_mg,
@@ -2554,6 +2626,86 @@ def normalize_photo_payload(raw_payload: Dict[str, Any], image_name: str, risk_p
     }
 
 
+def resolve_medication_review_risk(
+    provided: Dict[str, Any],
+    *,
+    name: str,
+    dose_mg: float,
+    interval_hours: float,
+    max_daily_mg: float,
+    schedule_text: str,
+    notes: str,
+    confidence: float,
+) -> Dict[str, Any]:
+    issues: List[str] = []
+    derived_score = 0.0
+    clarity_text = " ".join((schedule_text, notes, sanitize_text(provided.get("risk_summary") or "", max_chars=260))).lower()
+    has_named_slots = bool(infer_named_dose_slots(schedule_text))
+    mentions_daily_limit = any(
+        phrase in clarity_text
+        for phrase in ("24 hour", "24-hour", "24hr", "24 hr", "max", "maximum", "do not exceed", "not more than", "no more than")
+    )
+
+    if any(token in clarity_text for token in ("blur", "blurry", "unclear", "cut off", "cropped", "partial", "hidden", "illegible", "conflict", "confusing")):
+        derived_score += 35.0
+        issues.append("parts of the label may be hard to read")
+    if not name:
+        derived_score += 45.0
+        issues.append("the medication name was unclear")
+    if dose_mg <= 0:
+        derived_score += 20.0
+        issues.append("dose strength needs a manual check")
+    if not schedule_text:
+        derived_score += 25.0
+        issues.append("directions were not clearly extracted")
+    if interval_hours <= 0 and not has_named_slots:
+        derived_score += 15.0
+        issues.append("timing directions still need manual review")
+    if max_daily_mg <= 0 and mentions_daily_limit:
+        derived_score += 20.0
+        issues.append("the 24-hour limit may not have been read correctly")
+    if confidence <= 0.0:
+        derived_score += 20.0
+        issues.append("model confidence was unavailable")
+    elif confidence < 0.55:
+        derived_score += 40.0
+        issues.append("the extraction confidence was low")
+    elif confidence < 0.75:
+        derived_score += 15.0
+        issues.append("some fields may still need a manual re-check")
+
+    explicit_score = max(0.0, min(100.0, safe_float(provided.get("risk_score"))))
+    explicit_level = sanitize_text(provided.get("risk_level") or "", max_chars=24)
+    explicit_summary = sanitize_text(provided.get("risk_summary") or "", max_chars=260)
+    if explicit_level == "Low":
+        explicit_score = max(explicit_score, 18.0)
+    elif explicit_level == "Medium":
+        explicit_score = max(explicit_score, 55.0)
+    elif explicit_level == "High":
+        explicit_score = max(explicit_score, 80.0)
+
+    if explicit_score > 0:
+        derived_score = max(derived_score, explicit_score)
+    elif not issues:
+        derived_score = 18.0 if confidence >= 0.85 and name and (dose_mg > 0 or schedule_text) else 35.0
+
+    derived_score = max(0.0, min(100.0, derived_score))
+    level = risk_level_from_score(derived_score)
+    if not explicit_summary:
+        if issues:
+            explicit_summary = sanitize_text("; ".join(issues[:2]).capitalize() + ".", max_chars=260)
+        elif level == "Low":
+            explicit_summary = "Visible label details looked consistent, but compare the saved schedule with the bottle once before relying on it."
+        else:
+            explicit_summary = "Review the bottle directions manually before relying on this imported schedule."
+
+    return {
+        "risk_score": derived_score,
+        "risk_level": level,
+        "risk_summary": explicit_summary,
+    }
+
+
 def analyze_medication_image(key: bytes, image_path: Path, settings: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
     risk_packet = build_quantum_risk_packet(
         "medication_label",
@@ -2562,15 +2714,14 @@ def analyze_medication_image(key: bytes, image_path: Path, settings: Dict[str, A
     system_text = (
         "You are a medication label extraction assistant.\n"
         "Read only visible label text from the provided medicine bottle or box image.\n"
-        "Use the provided quantum risk simulation as a conservative review prior only.\n"
-        "Visible label evidence is more important than the prior.\n"
-        "If text is blurry, cut off, or conflicting, raise risk and lower confidence instead of guessing.\n"
+        "Do not fill in dose timing or safety limits from general medical knowledge.\n"
+        "Use only visible text from the image.\n"
+        "If text is blurry, cut off, or conflicting, keep unclear numeric fields as 0 and raise the review risk instead of guessing.\n"
         "Return raw JSON only.\n"
         "If something is unclear, keep the field conservative instead of inventing details."
     )
     prompt = (
         "Extract the medication schedule from this image.\n"
-        f"{risk_packet['prompt_block']}\n"
         "Return JSON with exactly these keys:\n"
         "{"
         '"name":"",'
@@ -2587,8 +2738,14 @@ def analyze_medication_image(key: bytes, image_path: Path, settings: Dict[str, A
         "Rules:\n"
         "- Use numbers only for numeric fields.\n"
         "- Use 0 when the label does not clearly show a value.\n"
+        "- If the label says a range like every 4-6 hours, use the minimum interval.\n"
+        "- If the label says no more than 4 doses in 24 hours and the dose strength is visible, convert that to max_daily_mg.\n"
         "- Put PRN, take-with-food, tablet-count, or warning notes into notes.\n"
         "- risk_score is 0-100 for how cautiously the user should manually review this extraction before relying on it.\n"
+        "- Base the risk only on label clarity and extraction completeness, not on whether the medication itself is dangerous.\n"
+        "- Low means the name and key schedule details are clearly visible and internally consistent.\n"
+        "- Medium means at least one important field needed partial reading, inference, or a manual re-check.\n"
+        "- High means the name, dose, interval, or 24-hour limit is blurry, cut off, conflicting, or missing.\n"
         "- risk_level must be exactly Low, Medium, or High.\n"
         "- risk_summary should be one short sentence about what needs verification.\n"
         "- Never output markdown fences or commentary."
@@ -4660,21 +4817,32 @@ class MedSafeApp(MDApp):
     def _log_dose_for_med(self, med: Dict[str, Any], *, source_label: str = "dose") -> None:
         dose_value = max(0.0, safe_float(self.ids.dose_mg.text) or safe_float(med.get("dose_mg")))
         now = time.time()
+        duplicate_ts = recent_duplicate_log_ts(med, dose_value, now)
+        if duplicate_ts is not None:
+            self.last_check_level = "Medium"
+            self.last_check_display = "Already logged"
+            self.last_check_message = f"A matching dose was already logged {format_duration(now - duplicate_ts)} ago. It was not added again."
+            self.refresh_ui()
+            self.set_status(self.last_check_message)
+            return
         label, message = dose_safety_level(med, dose_value, now)
+        source_suffix = f" Logged for {source_label}." if source_label else ""
+        self.last_check_level = label
+        self.last_check_display = label
+        self.last_check_message = message + (source_suffix if label != "High" else "")
+        if label == "High":
+            self.refresh_ui()
+            self.set_status(message)
+            self.show_dialog("High Safety Flag", message)
+            return
         med["history"] = list(med.get("history") or []) + [[now, dose_value]]
         med["history"] = med["history"][-240:]
         med["last_taken_ts"] = now
         if dose_value > 0:
             med["dose_mg"] = dose_value
         self.save_data()
-        self.last_check_level = label
-        self.last_check_display = label
-        source_suffix = f" Logged for {source_label}." if source_label else ""
-        self.last_check_message = message + source_suffix
         self.refresh_ui()
         self.set_status(self.last_check_message)
-        if label == "High":
-            self.show_dialog("High Safety Flag", self.last_check_message)
 
     def on_checklist_take_dose(self, med_id: str, slot_label: str) -> None:
         self.selected_med_id = med_id
@@ -4709,7 +4877,7 @@ class MedSafeApp(MDApp):
             summary_text = (
                 f"{sanitize_text(selected.get('name'), max_chars=120)}\n"
                 f"{medication_card_line(selected, now)}\n"
-                f"Last taken: {format_timestamp(safe_float(selected.get('last_taken_ts')))}\n"
+                f"Last taken: {format_timestamp(last_effective_taken_ts(selected))}\n"
                 f"Directions: {sanitize_text(selected.get('schedule_text') or 'No bottle directions saved yet.', max_chars=260)}"
             )
 
@@ -5039,20 +5207,31 @@ class MedSafeApp(MDApp):
             return
         dose_value = max(0.0, safe_float(self.root.ids.dose_mg.text) or safe_float(med.get("dose_mg")))
         now = time.time()
+        duplicate_ts = recent_duplicate_log_ts(med, dose_value, now)
+        if duplicate_ts is not None:
+            self.last_check_level = "Medium"
+            self.last_check_display = "Already logged"
+            self.last_check_message = f"A matching dose was already logged {format_duration(now - duplicate_ts)} ago. It was not added again."
+            self.refresh_ui()
+            self.set_status(self.last_check_message)
+            return
         label, message = dose_safety_level(med, dose_value, now)
+        self.last_check_level = label
+        self.last_check_display = label
+        self.last_check_message = message
+        if label == "High":
+            self.refresh_ui()
+            self.set_status(message)
+            self.show_dialog("High Safety Flag", message)
+            return
         med["history"] = list(med.get("history") or []) + [[now, dose_value]]
         med["history"] = med["history"][-240:]
         med["last_taken_ts"] = now
         if dose_value > 0:
             med["dose_mg"] = dose_value
         self.save_data()
-        self.last_check_level = label
-        self.last_check_display = label
-        self.last_check_message = message
         self.refresh_ui()
         self.set_status(message)
-        if label == "High":
-            self.show_dialog("High Safety Flag", message)
 
     def on_log_dental_habit(self, habit: str) -> None:
         hygiene = dict(self.data_cache.get("dental_hygiene") or dental_hygiene_defaults())
@@ -7068,21 +7247,32 @@ class DesktopMedSafeApp:
     def _log_dose_for_med(self, med: Dict[str, Any], *, source_label: str = "dose") -> None:
         dose_value = max(0.0, safe_float(self.ids.dose_mg.text) or safe_float(med.get("dose_mg")))
         now = time.time()
+        duplicate_ts = recent_duplicate_log_ts(med, dose_value, now)
+        if duplicate_ts is not None:
+            self.last_check_level = "Medium"
+            self.last_check_display = "Already logged"
+            self.last_check_message = f"A matching dose was already logged {format_duration(now - duplicate_ts)} ago. It was not added again."
+            self.refresh_ui()
+            self.set_status(self.last_check_message)
+            return
         label, message = dose_safety_level(med, dose_value, now)
+        source_suffix = f" Logged for {source_label}." if source_label else ""
+        self.last_check_level = label
+        self.last_check_display = label
+        self.last_check_message = message + (source_suffix if label != "High" else "")
+        if label == "High":
+            self.refresh_ui()
+            self.set_status(message)
+            self.show_dialog("High Safety Flag", message)
+            return
         med["history"] = list(med.get("history") or []) + [[now, dose_value]]
         med["history"] = med["history"][-240:]
         med["last_taken_ts"] = now
         if dose_value > 0:
             med["dose_mg"] = dose_value
         self.save_data()
-        self.last_check_level = label
-        self.last_check_display = label
-        source_suffix = f" Logged for {source_label}." if source_label else ""
-        self.last_check_message = message + source_suffix
         self.refresh_ui()
         self.set_status(self.last_check_message)
-        if label == "High":
-            self.show_dialog("High Safety Flag", self.last_check_message)
 
     def on_checklist_take_dose(self, med_id: str, slot_label: str) -> None:
         self.selected_med_id = med_id
@@ -7119,7 +7309,7 @@ class DesktopMedSafeApp:
             summary_text = (
                 f"{sanitize_text(selected.get('name'), max_chars=120)}\n"
                 f"{medication_card_line(selected, now)}\n"
-                f"Last taken: {format_timestamp(safe_float(selected.get('last_taken_ts')))}\n"
+                f"Last taken: {format_timestamp(last_effective_taken_ts(selected))}\n"
                 f"Remaining planned slots today: {remaining_slots}\n"
                 f"Directions: {sanitize_text(selected.get('schedule_text') or 'No bottle directions saved yet.', max_chars=260)}"
             )
@@ -8115,7 +8305,7 @@ def _desktop_refresh_dashboard(self: DesktopMedSafeApp) -> None:
         summary_text = (
             f"{sanitize_text(selected.get('name'), max_chars=120)}\n"
             f"{medication_card_line(selected, now)}\n"
-            f"Last taken: {format_timestamp(safe_float(selected.get('last_taken_ts')))}\n"
+            f"Last taken: {format_timestamp(last_effective_taken_ts(selected))}\n"
             f"Remaining planned slots today: {remaining_slots}\n"
             f"Directions: {sanitize_text(selected.get('schedule_text') or 'No bottle directions saved yet.', max_chars=260)}"
         )
