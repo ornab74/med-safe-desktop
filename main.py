@@ -214,6 +214,7 @@ DEFAULT_SETTINGS = {
     "enable_native_image_input": True,
     "setup_complete": False,
     "startup_password_enabled": False,
+    "allow_checklist_uncheck": False,
 }
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 JSON_BLOCK_RE = re.compile(r"\{.*\}", re.S)
@@ -1042,8 +1043,25 @@ def ensure_vault_shape(raw: Any) -> Dict[str, Any]:
             continue
         history_rows = []
         for row in item.get("history", []) or []:
-            if isinstance(row, (list, tuple)) and len(row) >= 2:
-                history_rows.append([safe_float(row[0]), max(0.0, safe_float(row[1]))])
+            if isinstance(row, dict):
+                entry = [
+                    safe_float(row.get("timestamp") or row.get("taken_ts") or 0.0),
+                    max(0.0, safe_float(row.get("dose_mg") or row.get("amount_mg") or row.get("dose") or 0.0)),
+                ]
+                scheduled_ts = safe_float(row.get("scheduled_ts") or 0.0)
+                slot_key = sanitize_text(row.get("slot_key") or "", max_chars=64)
+                if scheduled_ts > 0.0 or slot_key:
+                    entry.extend([scheduled_ts, slot_key])
+                if entry[0] > 0.0 and entry[1] > 0.0:
+                    history_rows.append(entry)
+            elif isinstance(row, (list, tuple)) and len(row) >= 2:
+                entry = [safe_float(row[0]), max(0.0, safe_float(row[1]))]
+                scheduled_ts = safe_float(row[2]) if len(row) >= 3 else 0.0
+                slot_key = sanitize_text(row[3] if len(row) >= 4 else "", max_chars=64)
+                if scheduled_ts > 0.0 or slot_key:
+                    entry.extend([scheduled_ts, slot_key])
+                if entry[0] > 0.0 and entry[1] > 0.0:
+                    history_rows.append(entry)
         created_ts = safe_float(item.get("created_ts") or 0.0)
         if created_ts <= 0.0:
             created_ts = safe_float(item.get("last_taken_ts") or 0.0)
@@ -1408,6 +1426,7 @@ def load_settings(paths: Optional[AppPaths] = None) -> Dict[str, Any]:
     settings["enable_native_image_input"] = bool(settings.get("enable_native_image_input", True))
     settings["setup_complete"] = bool(settings.get("setup_complete", False))
     settings["startup_password_enabled"] = bool(settings.get("startup_password_enabled", False))
+    settings["allow_checklist_uncheck"] = bool(settings.get("allow_checklist_uncheck", False))
     return settings
 
 
@@ -1789,32 +1808,84 @@ def should_create_new_med_entry(existing_med: Optional[Dict[str, Any]], form_nam
     return bool(next_name and current_name and next_name != current_name)
 
 
+def medication_history_records(
+    med: Dict[str, Any],
+    *,
+    collapse_probable_duplicates: bool = True,
+    duplicate_window_seconds: float = DOSE_HISTORY_DUPLICATE_WINDOW_SECONDS,
+) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for raw_index, row in enumerate(med.get("history", []) or []):
+        timestamp = 0.0
+        dose_mg = 0.0
+        scheduled_ts = 0.0
+        slot_key = ""
+        if isinstance(row, dict):
+            timestamp = safe_float(row.get("timestamp") or row.get("taken_ts") or 0.0)
+            dose_mg = max(0.0, safe_float(row.get("dose_mg") or row.get("amount_mg") or row.get("dose") or 0.0))
+            scheduled_ts = safe_float(row.get("scheduled_ts") or 0.0)
+            slot_key = sanitize_text(row.get("slot_key") or "", max_chars=64)
+        elif isinstance(row, (list, tuple)) and len(row) >= 2:
+            timestamp = safe_float(row[0])
+            dose_mg = max(0.0, safe_float(row[1]))
+            scheduled_ts = safe_float(row[2]) if len(row) >= 3 else 0.0
+            slot_key = sanitize_text(row[3] if len(row) >= 4 else "", max_chars=64)
+        if timestamp <= 0.0 or dose_mg <= 0.0:
+            continue
+        records.append(
+            {
+                "timestamp": timestamp,
+                "dose_mg": dose_mg,
+                "scheduled_ts": max(0.0, scheduled_ts),
+                "slot_key": slot_key,
+                "raw_index": raw_index,
+            }
+        )
+    records.sort(key=lambda item: (safe_float(item.get("timestamp")), safe_float(item.get("scheduled_ts")), int(item.get("raw_index", 0))))
+    if not collapse_probable_duplicates:
+        return records
+    normalized: List[Dict[str, Any]] = []
+    for record in records:
+        if normalized:
+            prev = normalized[-1]
+            same_dose = abs(safe_float(prev.get("dose_mg")) - safe_float(record.get("dose_mg"))) <= 1e-6
+            same_slot = False
+            prev_key = sanitize_text(prev.get("slot_key") or "", max_chars=64)
+            next_key = sanitize_text(record.get("slot_key") or "", max_chars=64)
+            if prev_key and next_key and prev_key == next_key:
+                same_slot = True
+            else:
+                prev_scheduled = safe_float(prev.get("scheduled_ts"))
+                next_scheduled = safe_float(record.get("scheduled_ts"))
+                if prev_scheduled > 0.0 and next_scheduled > 0.0 and abs(prev_scheduled - next_scheduled) <= 60.0:
+                    same_slot = True
+            if same_dose and same_slot:
+                continue
+            if (
+                same_dose
+                and not prev_key
+                and not next_key
+                and (safe_float(record.get("timestamp")) - safe_float(prev.get("timestamp"))) <= duplicate_window_seconds
+            ):
+                continue
+        normalized.append(record)
+    return normalized
+
+
 def medication_history_rows(
     med: Dict[str, Any],
     *,
     collapse_probable_duplicates: bool = True,
     duplicate_window_seconds: float = DOSE_HISTORY_DUPLICATE_WINDOW_SECONDS,
 ) -> List[Tuple[float, float]]:
-    rows: List[Tuple[float, float]] = []
-    for row in med.get("history", []) or []:
-        if not isinstance(row, (list, tuple)) or len(row) < 2:
-            continue
-        ts = safe_float(row[0])
-        mg = max(0.0, safe_float(row[1]))
-        if ts <= 0 or mg <= 0:
-            continue
-        rows.append((ts, mg))
-    rows.sort(key=lambda item: item[0])
-    if not collapse_probable_duplicates:
-        return rows
-    normalized: List[Tuple[float, float]] = []
-    for ts, mg in rows:
-        if normalized:
-            prev_ts, prev_mg = normalized[-1]
-            if (ts - prev_ts) <= duplicate_window_seconds and abs(prev_mg - mg) <= 1e-6:
-                continue
-        normalized.append((ts, mg))
-    return normalized
+    return [
+        (safe_float(record.get("timestamp")), max(0.0, safe_float(record.get("dose_mg"))))
+        for record in medication_history_records(
+            med,
+            collapse_probable_duplicates=collapse_probable_duplicates,
+            duplicate_window_seconds=duplicate_window_seconds,
+        )
+    ]
 
 
 def last_effective_taken_ts(med: Dict[str, Any]) -> float:
@@ -1828,15 +1899,72 @@ def recent_duplicate_log_ts(med: Dict[str, Any], dose_mg: float, now_ts: float) 
     dose_value = max(0.0, dose_mg)
     if dose_value <= 0:
         return None
-    rows = medication_history_rows(med, collapse_probable_duplicates=False)
-    if not rows:
+    records = medication_history_records(med, collapse_probable_duplicates=False)
+    if not records:
         return None
-    last_ts, last_mg = rows[-1]
+    last_record = records[-1]
+    last_ts = safe_float(last_record.get("timestamp"))
+    last_mg = max(0.0, safe_float(last_record.get("dose_mg")))
     if abs(last_mg - dose_value) > 1e-6:
         return None
     if 0.0 <= (now_ts - last_ts) <= DOSE_RELOG_GUARD_SECONDS:
         return last_ts
     return None
+
+
+def append_medication_history_entry(
+    med: Dict[str, Any],
+    timestamp: float,
+    dose_mg: float,
+    *,
+    scheduled_ts: float = 0.0,
+    slot_key: str = "",
+) -> None:
+    entry = [safe_float(timestamp), max(0.0, safe_float(dose_mg))]
+    clean_scheduled = max(0.0, safe_float(scheduled_ts))
+    clean_slot_key = sanitize_text(slot_key or "", max_chars=64)
+    if clean_scheduled > 0.0 or clean_slot_key:
+        entry.extend([clean_scheduled, clean_slot_key])
+    med["history"] = list(med.get("history") or []) + [entry]
+    med["history"] = med["history"][-240:]
+    med["last_taken_ts"] = last_effective_taken_ts(med)
+
+
+def matching_medication_history_entry_for_slot(med: Dict[str, Any], slot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    slot_key = sanitize_text(slot.get("slot_key") or "", max_chars=64)
+    scheduled_ts = max(0.0, safe_float(slot.get("scheduled_ts")))
+    tolerance = max(60.0, medication_slot_match_tolerance_seconds(med))
+    records = medication_history_records(med, collapse_probable_duplicates=False)
+    if not records:
+        return None
+    if slot_key:
+        for record in reversed(records):
+            if sanitize_text(record.get("slot_key") or "", max_chars=64) == slot_key:
+                return record
+    if scheduled_ts > 0.0:
+        for record in reversed(records):
+            record_scheduled = max(0.0, safe_float(record.get("scheduled_ts")))
+            if record_scheduled > 0.0 and abs(record_scheduled - scheduled_ts) <= 60.0:
+                return record
+    if scheduled_ts > 0.0:
+        for record in reversed(records):
+            if abs(safe_float(record.get("timestamp")) - scheduled_ts) <= tolerance:
+                return record
+    return None
+
+
+def remove_medication_history_entry_for_slot(med: Dict[str, Any], slot: Dict[str, Any]) -> bool:
+    match = matching_medication_history_entry_for_slot(med, slot)
+    if match is None:
+        return False
+    raw_history = list(med.get("history") or [])
+    raw_index = int(match.get("raw_index", -1))
+    if raw_index < 0 or raw_index >= len(raw_history):
+        return False
+    del raw_history[raw_index]
+    med["history"] = raw_history[-240:]
+    med["last_taken_ts"] = last_effective_taken_ts(med)
+    return True
 
 
 def total_taken_last_24h(med: Dict[str, Any], now_ts: float) -> float:
@@ -2101,27 +2229,59 @@ def build_medication_daily_slots(
     tolerance = medication_slot_match_tolerance_seconds(med)
     day_start = clock_minutes_to_timestamp(target_day, 0)
     day_end = day_start + 24.0 * 3600.0
-    history_rows = [
-        (row_index, ts, amount)
-        for row_index, (ts, amount) in enumerate(medication_history_rows(med))
-        if (day_start - tolerance) <= ts < (day_end + tolerance)
-    ]
+    history_records = medication_history_records(med)
     used_rows = set()
     for slot in slots:
         best_match = None
-        for row_index, ts, amount in history_rows:
-            if row_index in used_rows or amount <= 0:
-                continue
-            gap = abs(ts - slot["scheduled_ts"])
-            if gap > tolerance:
-                continue
-            if best_match is None or gap < best_match[0]:
-                best_match = (gap, row_index, ts, amount)
+        slot_key = sanitize_text(slot.get("slot_key") or "", max_chars=64)
+        slot_scheduled_ts = safe_float(slot.get("scheduled_ts"))
+        if slot_key:
+            for record in history_records:
+                raw_index = int(record.get("raw_index", -1))
+                if raw_index in used_rows:
+                    continue
+                if sanitize_text(record.get("slot_key") or "", max_chars=64) != slot_key:
+                    continue
+                best_match = (0.0, raw_index, safe_float(record.get("timestamp")), max(0.0, safe_float(record.get("dose_mg"))), record)
+                break
+        if best_match is None and slot_scheduled_ts > 0.0:
+            for record in history_records:
+                raw_index = int(record.get("raw_index", -1))
+                if raw_index in used_rows:
+                    continue
+                record_scheduled_ts = max(0.0, safe_float(record.get("scheduled_ts")))
+                if record_scheduled_ts <= 0.0 or abs(record_scheduled_ts - slot_scheduled_ts) > 60.0:
+                    continue
+                gap = abs(safe_float(record.get("timestamp")) - slot_scheduled_ts)
+                if best_match is None or gap < best_match[0]:
+                    best_match = (
+                        gap,
+                        raw_index,
+                        safe_float(record.get("timestamp")),
+                        max(0.0, safe_float(record.get("dose_mg"))),
+                        record,
+                    )
+        if best_match is None:
+            for record in history_records:
+                raw_index = int(record.get("raw_index", -1))
+                ts = safe_float(record.get("timestamp"))
+                amount = max(0.0, safe_float(record.get("dose_mg")))
+                if raw_index in used_rows or amount <= 0:
+                    continue
+                if not ((day_start - tolerance) <= ts < (day_end + tolerance)):
+                    continue
+                gap = abs(ts - slot_scheduled_ts)
+                if gap > tolerance:
+                    continue
+                if best_match is None or gap < best_match[0]:
+                    best_match = (gap, raw_index, ts, amount, record)
         if best_match is not None:
-            _, row_index, taken_ts, taken_amount = best_match
+            _, row_index, taken_ts, taken_amount, record = best_match
             used_rows.add(row_index)
             slot["taken_ts"] = taken_ts
             slot["taken_amount"] = taken_amount
+            slot["history_raw_index"] = row_index
+            slot["logged_scheduled_ts"] = max(0.0, safe_float(record.get("scheduled_ts")))
 
     due_lead = medication_due_lead_seconds(med)
     miss_grace = medication_miss_grace_seconds(med)
@@ -2129,7 +2289,14 @@ def build_medication_daily_slots(
         scheduled_ts = slot["scheduled_ts"]
         if slot.get("taken_ts"):
             slot["status"] = "taken"
-            slot["status_text"] = f"Taken {time.strftime('%I:%M %p', time.localtime(slot['taken_ts'])).lstrip('0')}"
+            taken_text = time.strftime("%I:%M %p", time.localtime(slot["taken_ts"])).lstrip("0")
+            delta = safe_float(slot.get("taken_ts")) - scheduled_ts
+            if delta >= 30.0 * 60.0:
+                slot["status_text"] = f"Taken {taken_text} ({format_duration(delta)} late)"
+            elif delta <= -30.0 * 60.0:
+                slot["status_text"] = f"Taken {taken_text} ({format_duration(abs(delta))} early)"
+            else:
+                slot["status_text"] = f"Taken {taken_text}"
             continue
         if now < scheduled_ts - due_lead:
             slot["status"] = "upcoming"
@@ -2283,11 +2450,17 @@ def build_med_history_text(med: Optional[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def build_medication_schedule_text(med: Optional[Dict[str, Any]], now_ts: Optional[float] = None) -> str:
+def build_medication_schedule_text(
+    med: Optional[Dict[str, Any]],
+    now_ts: Optional[float] = None,
+    *,
+    target_day: Optional[date] = None,
+) -> str:
     if not med:
         return "Select a medication to see today's planned doses."
     now = now_ts or time.time()
-    slots = build_medication_daily_slots(med, datetime.fromtimestamp(now).date(), now)
+    active_day = target_day or datetime.fromtimestamp(now).date()
+    slots = build_medication_daily_slots(med, active_day, now)
     if not slots:
         next_slot = next_unchecked_medication_slot(med, now)
         if next_slot is not None:
@@ -5485,10 +5658,34 @@ class MedSafeApp(MDApp):
                     tone="warning",
                 ).grid(row=0, column=2, sticky="e", padx=(10, 0))
 
-    def _log_dose_for_med(self, med: Dict[str, Any], *, source_label: str = "dose") -> None:
+    def _log_dose_for_med(
+        self,
+        med: Dict[str, Any],
+        *,
+        source_label: str = "dose",
+        log_timestamp: Optional[float] = None,
+        scheduled_ts: float = 0.0,
+        slot_key: str = "",
+    ) -> None:
         dose_value = max(0.0, safe_float(self.ids.dose_mg.text) or safe_float(med.get("dose_mg")))
         now = time.time()
-        duplicate_ts = recent_duplicate_log_ts(med, dose_value, now)
+        effective_timestamp = safe_float(log_timestamp) if log_timestamp is not None else now
+        slot_info = {
+            "slot_key": sanitize_text(slot_key or "", max_chars=64),
+            "scheduled_ts": max(0.0, safe_float(scheduled_ts)),
+        }
+        existing_slot_record = matching_medication_history_entry_for_slot(med, slot_info) if (slot_info["slot_key"] or slot_info["scheduled_ts"] > 0.0) else None
+        if existing_slot_record is not None:
+            self.last_check_level = "Medium"
+            self.last_check_display = "Already checked"
+            self.last_check_message = f"{source_label or 'Dose'} was already recorded for this checklist slot."
+            self.refresh_ui()
+            self.set_status(self.last_check_message)
+            self.start_dose_safety_assessment(med, dose_value, source_label=f"{source_label} duplicate")
+            return
+        duplicate_ts = None
+        if not slot_info["slot_key"] and slot_info["scheduled_ts"] <= 0.0:
+            duplicate_ts = recent_duplicate_log_ts(med, dose_value, now)
         if duplicate_ts is not None:
             self.start_dose_safety_assessment(med, dose_value, source_label=f"{source_label} duplicate")
             return
@@ -5503,12 +5700,16 @@ class MedSafeApp(MDApp):
             self.show_dialog("High Safety Flag", message)
             self.start_dose_safety_assessment(med, dose_value, source_label=f"{source_label} blocked")
             return
-        assessment_med = self.clone_med_snapshot(med)
-        med["history"] = list(med.get("history") or []) + [[now, dose_value]]
-        med["history"] = med["history"][-240:]
-        med["last_taken_ts"] = now
+        append_medication_history_entry(
+            med,
+            effective_timestamp,
+            dose_value,
+            scheduled_ts=slot_info["scheduled_ts"],
+            slot_key=slot_info["slot_key"],
+        )
         if dose_value > 0:
             med["dose_mg"] = dose_value
+        assessment_med = self.clone_med_snapshot(med)
         self.save_data()
         self.refresh_ui()
         self.set_status(self.last_check_message)
@@ -6596,6 +6797,8 @@ class DesktopMedSafeApp:
         self.assistant_mode = "General"
         self.setup_password_var: Optional[tk.BooleanVar] = None
         self.setup_download_model_var: Optional[tk.BooleanVar] = None
+        self.allow_checklist_uncheck_var: Optional[tk.BooleanVar] = None
+        self.checklist_target_date_text = date.today().isoformat()
 
     def build(self) -> None:
         if ctk is None:
@@ -7455,9 +7658,24 @@ class DesktopMedSafeApp:
             segmented_button_fg_color=DESKTOP_SURFACE_ALT,
             segmented_button_selected_color=DESKTOP_ACCENT,
             segmented_button_selected_hover_color="#0d6b63",
+            segmented_button_unselected_color="#314455",
             segmented_button_unselected_hover_color="#223443",
+            text_color=DESKTOP_TEXT,
+            text_color_disabled=DESKTOP_MUTED,
         )
         tabview.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 18))
+        try:
+            tabview.configure(
+                segmented_button_fg_color=DESKTOP_SURFACE_ALT,
+                segmented_button_selected_color=DESKTOP_ACCENT,
+                segmented_button_selected_hover_color="#0d6b63",
+                segmented_button_unselected_color="#314455",
+                segmented_button_unselected_hover_color="#223443",
+                text_color=DESKTOP_TEXT,
+                text_color_disabled=DESKTOP_MUTED,
+            )
+        except Exception:
+            pass
 
         for tab_name in ("Dashboard", "Medications", "Vision", "Dental", "Exercise", "Recovery", "Assistant", "Settings"):
             tabview.add(tab_name)
@@ -7581,7 +7799,7 @@ class DesktopMedSafeApp:
         selected_summary = self._readonly_box(selection_card, height=135)
         selected_summary.widget.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 12))
         self._register("selected_med_summary", selected_summary)
-        ctk.CTkLabel(selection_card, text="Today's Dose Plan", anchor="w", text_color=DESKTOP_MUTED).grid(
+        ctk.CTkLabel(selection_card, text="Dose Plan", anchor="w", text_color=DESKTOP_MUTED).grid(
             row=2, column=0, sticky="w", padx=18
         )
         selected_schedule = self._readonly_box(selection_card, height=160)
@@ -7591,11 +7809,34 @@ class DesktopMedSafeApp:
         checklist_card = self._card(right)
         checklist_card.grid(row=2, column=0, sticky="nsew", pady=7)
         checklist_card.grid_columnconfigure(0, weight=1)
+        checklist_card.grid_columnconfigure(1, weight=0)
         ctk.CTkLabel(checklist_card, text="Meds Daily Checklist", anchor="w", text_color=DESKTOP_TEXT, font=ctk.CTkFont(size=18, weight="bold")).grid(
             row=0, column=0, sticky="w", padx=18, pady=(18, 10)
         )
-        checklist_hint = self._label(checklist_card, text="Check a slot when you take it. Missed slots get an X and elapsed time.", muted=True, wrap=520)
-        checklist_hint.widget.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 10))
+        checklist_date_label = self._label(checklist_card, text="Today", bold=True, wrap=220)
+        checklist_date_label.widget.grid(row=0, column=1, sticky="e", padx=18, pady=(18, 10))
+        self._register("daily_checklist_date_label", checklist_date_label)
+        checklist_controls = ctk.CTkFrame(checklist_card, fg_color="transparent")
+        checklist_controls.grid(row=1, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 8))
+        checklist_controls.grid_columnconfigure(0, weight=1)
+        checklist_date = self._entry(checklist_controls, placeholder="YYYY-MM-DD")
+        checklist_date.widget.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self._register("daily_checklist_date", checklist_date)
+        try:
+            checklist_date.widget.bind("<Return>", lambda _event: (self.on_checklist_date_go(), "break")[1])
+        except Exception:
+            pass
+        self._button(checklist_controls, text="Prev", command=self.on_checklist_date_prev, tone="neutral").grid(row=0, column=1, sticky="ew", padx=4)
+        self._button(checklist_controls, text="Today", command=self.on_checklist_date_today, tone="neutral").grid(row=0, column=2, sticky="ew", padx=4)
+        self._button(checklist_controls, text="Next", command=self.on_checklist_date_next, tone="neutral").grid(row=0, column=3, sticky="ew", padx=4)
+        self._button(checklist_controls, text="Go", command=self.on_checklist_date_go, tone="neutral").grid(row=0, column=4, sticky="ew", padx=(4, 0))
+        checklist_hint = self._label(
+            checklist_card,
+            text="Use the date picker to review earlier checklists. Check a slot when you take it; missed slots can be reconciled or taken now.",
+            muted=True,
+            wrap=520,
+        )
+        checklist_hint.widget.grid(row=2, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 10))
         self._register("daily_checklist_hint", checklist_hint)
         checklist_frame = ctk.CTkScrollableFrame(
             checklist_card,
@@ -7607,7 +7848,7 @@ class DesktopMedSafeApp:
             scrollbar_button_color="#314455",
             scrollbar_button_hover_color="#42586c",
         )
-        checklist_frame.grid(row=2, column=0, sticky="nsew", padx=18, pady=(0, 18))
+        checklist_frame.grid(row=3, column=0, columnspan=2, sticky="nsew", padx=18, pady=(0, 18))
         checklist_frame.grid_columnconfigure(0, weight=1)
         self._register("daily_checklist_frame", checklist_frame)
 
@@ -8226,6 +8467,47 @@ class DesktopMedSafeApp:
         self._button(security_buttons, text="Rotate Vault Key", command=self.on_rotate_vault_key, tone="warning").grid(
             row=0, column=2, sticky="ew", padx=(6, 0)
         )
+        checklist_preferences = ctk.CTkFrame(
+            security,
+            fg_color=DESKTOP_SURFACE_ALT,
+            border_width=1,
+            border_color=DESKTOP_BORDER,
+            corner_radius=14,
+        )
+        checklist_preferences.grid(row=4, column=0, sticky="ew", padx=18, pady=(0, 18))
+        checklist_preferences.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            checklist_preferences,
+            text="Checklist Safeguards",
+            anchor="w",
+            text_color=DESKTOP_TEXT,
+            font=ctk.CTkFont(size=16, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=16, pady=(14, 6))
+        self.allow_checklist_uncheck_var = tk.BooleanVar(value=bool(self.settings_data.get("allow_checklist_uncheck", False)))
+        checklist_uncheck_toggle = ctk.CTkCheckBox(
+            checklist_preferences,
+            text="Allow unchecking completed checklist rows",
+            variable=self.allow_checklist_uncheck_var,
+            onvalue=True,
+            offvalue=False,
+            command=self.on_toggle_checklist_uncheck,
+            fg_color=DESKTOP_ACCENT,
+            hover_color="#0d6b63",
+            border_color=DESKTOP_BORDER,
+            text_color=DESKTOP_TEXT,
+            font=ctk.CTkFont(size=14, weight="bold"),
+        )
+        checklist_uncheck_toggle.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 8))
+        self.ids["allow_checklist_uncheck_toggle"] = checklist_uncheck_toggle
+        ctk.CTkLabel(
+            checklist_preferences,
+            text="Off by default so stray clicks do not erase logged doses. Turn it on only if you want dashboard checklist undo.",
+            anchor="w",
+            justify="left",
+            wraplength=920,
+            text_color=DESKTOP_MUTED,
+            font=ctk.CTkFont(size=12),
+        ).grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 14))
 
     def set_status(self, text: str) -> None:
         self.ids.status_label.text = sanitize_text(text, max_chars=220)
@@ -8249,6 +8531,39 @@ class DesktopMedSafeApp:
         if force or not bool(getattr(widget, "focus", False)):
             if getattr(widget, "text", None) != next_text:
                 widget.text = next_text
+
+    def current_checklist_target_day(self, now_ts: Optional[float] = None) -> date:
+        today = datetime.fromtimestamp(now_ts or time.time()).date()
+        parsed = parse_date_string(self.checklist_target_date_text)
+        if parsed is None:
+            parsed = today
+            self.checklist_target_date_text = parsed.isoformat()
+        return parsed
+
+    def _set_checklist_target_day(self, target_day: date, *, announce: bool = False) -> None:
+        self.checklist_target_date_text = target_day.isoformat()
+        self.set_field_text("daily_checklist_date", self.checklist_target_date_text, force=True)
+        self.refresh_dashboard()
+        if announce:
+            self.set_status(f"Viewing checklist for {target_day.isoformat()}.")
+
+    def on_checklist_date_prev(self) -> None:
+        self._set_checklist_target_day(self.current_checklist_target_day() - timedelta(days=1), announce=True)
+
+    def on_checklist_date_today(self) -> None:
+        self._set_checklist_target_day(datetime.fromtimestamp(time.time()).date(), announce=True)
+
+    def on_checklist_date_next(self) -> None:
+        self._set_checklist_target_day(self.current_checklist_target_day() + timedelta(days=1), announce=True)
+
+    def on_checklist_date_go(self) -> None:
+        raw_value = sanitize_text(getattr(self.ids.get("daily_checklist_date"), "text", ""), max_chars=20)
+        parsed = parse_date_string(raw_value)
+        if parsed is None:
+            self.set_status("Use YYYY-MM-DD for the checklist date.")
+            self.set_field_text("daily_checklist_date", self.checklist_target_date_text, force=True)
+            return
+        self._set_checklist_target_day(parsed, announce=True)
 
     def refresh_from_disk(self) -> None:
         if not self.vault:
@@ -8396,16 +8711,40 @@ class DesktopMedSafeApp:
                     tone="warning",
                 ).grid(row=0, column=2, sticky="e", padx=(10, 0))
 
-    def _log_dose_for_med(self, med: Dict[str, Any], *, source_label: str = "dose") -> None:
+    def _log_dose_for_med(
+        self,
+        med: Dict[str, Any],
+        *,
+        source_label: str = "dose",
+        log_timestamp: Optional[float] = None,
+        scheduled_ts: float = 0.0,
+        slot_key: str = "",
+    ) -> None:
         dose_value = max(0.0, safe_float(self.ids.dose_mg.text) or safe_float(med.get("dose_mg")))
         now = time.time()
-        duplicate_ts = recent_duplicate_log_ts(med, dose_value, now)
-        if duplicate_ts is not None:
+        effective_timestamp = safe_float(log_timestamp) if log_timestamp is not None else now
+        slot_info = {
+            "slot_key": sanitize_text(slot_key or "", max_chars=64),
+            "scheduled_ts": max(0.0, safe_float(scheduled_ts)),
+        }
+        existing_slot_record = (
+            matching_medication_history_entry_for_slot(med, slot_info)
+            if (slot_info["slot_key"] or slot_info["scheduled_ts"] > 0.0)
+            else None
+        )
+        if existing_slot_record is not None:
             self.last_check_level = "Medium"
-            self.last_check_display = "Already logged"
-            self.last_check_message = f"A matching dose was already logged {format_duration(now - duplicate_ts)} ago. It was not added again."
+            self.last_check_display = "Already checked"
+            self.last_check_message = f"{source_label or 'Dose'} was already recorded for this checklist slot."
             self.refresh_ui()
             self.set_status(self.last_check_message)
+            self.start_dose_safety_assessment(med, dose_value, source_label=f"{source_label} duplicate")
+            return
+        duplicate_ts = None
+        if not slot_info["slot_key"] and slot_info["scheduled_ts"] <= 0.0:
+            duplicate_ts = recent_duplicate_log_ts(med, dose_value, now)
+        if duplicate_ts is not None:
+            self.start_dose_safety_assessment(med, dose_value, source_label=f"{source_label} duplicate")
             return
         label, message = dose_safety_level(med, dose_value, now)
         source_suffix = f" Logged for {source_label}." if source_label else ""
@@ -8416,15 +8755,22 @@ class DesktopMedSafeApp:
             self.refresh_ui()
             self.set_status(message)
             self.show_dialog("High Safety Flag", message)
+            self.start_dose_safety_assessment(med, dose_value, source_label=f"{source_label} blocked")
             return
-        med["history"] = list(med.get("history") or []) + [[now, dose_value]]
-        med["history"] = med["history"][-240:]
-        med["last_taken_ts"] = now
+        append_medication_history_entry(
+            med,
+            effective_timestamp,
+            dose_value,
+            scheduled_ts=slot_info["scheduled_ts"],
+            slot_key=slot_info["slot_key"],
+        )
         if dose_value > 0:
             med["dose_mg"] = dose_value
+        assessment_med = self.clone_med_snapshot(med)
         self.save_data()
         self.refresh_ui()
         self.set_status(self.last_check_message)
+        self.start_dose_safety_assessment(assessment_med, dose_value, source_label=source_label)
 
     def on_checklist_take_dose(self, med_id: str, slot_label: str) -> None:
         self.selected_med_id = med_id
@@ -8701,10 +9047,12 @@ class DesktopMedSafeApp:
         password_enabled = self.vault.is_key_protected()
         unlocked = self.vault.is_unlocked()
         setup_complete = bool(self.settings_data.get("setup_complete", False))
+        checklist_undo = "enabled" if self.settings_data.get("allow_checklist_uncheck", False) else "off"
         return (
             f"Startup password: {'enabled' if password_enabled else 'off'}\n"
             f"Vault session: {'unlocked for this session' if unlocked else 'locked'}\n"
             f"First-start setup: {'complete' if setup_complete else 'pending'}\n"
+            f"Checklist undo: {checklist_undo}\n"
             f"Key rotation: ready\n"
             f"Vault root: {self.paths.root}"
         )
@@ -8732,6 +9080,23 @@ class DesktopMedSafeApp:
         self.ids.dashboard_model_state.text = (
             f"Model: {'ready' if self.paths and self.paths.encrypted_model_path.exists() else 'not downloaded'}"
             f" | Vision {image_state} | Password {password_state}"
+        )
+        if self.allow_checklist_uncheck_var is not None:
+            try:
+                self.allow_checklist_uncheck_var.set(bool(settings.get("allow_checklist_uncheck", False)))
+            except Exception:
+                pass
+
+    def on_toggle_checklist_uncheck(self) -> None:
+        enabled = bool(self.allow_checklist_uncheck_var.get()) if self.allow_checklist_uncheck_var is not None else False
+        save_settings({"allow_checklist_uncheck": enabled}, self.paths)
+        self.settings_data = load_settings(self.paths)
+        self.refresh_model_status()
+        self.refresh_dashboard()
+        self.set_status(
+            "Checklist undo enabled. Taken rows can now be unchecked from the dashboard."
+            if enabled
+            else "Checklist undo disabled. Taken rows are locked again."
         )
 
     def reset_form_fields(self) -> None:
@@ -8995,6 +9360,46 @@ class DesktopMedSafeApp:
 
     def on_assistant_mode_change(self, value: str) -> None:
         self.assistant_mode = normalize_assistant_mode(value)
+        palette = {
+            "General": {
+                "menu_fg": DESKTOP_SURFACE_ALT,
+                "button": DESKTOP_ACCENT,
+                "hover": "#0d6b63",
+                "dropdown": DESKTOP_SURFACE_ALT,
+                "text": DESKTOP_TEXT,
+                "hint": DESKTOP_MUTED,
+            },
+            "Therapy": {
+                "menu_fg": "#3b2b31",
+                "button": "#b46e82",
+                "hover": "#8d5566",
+                "dropdown": "#3b2b31",
+                "text": "#fff4f7",
+                "hint": "#f4c9d7",
+            },
+            "Recovery Coach": {
+                "menu_fg": "#20372e",
+                "button": "#2f9d6a",
+                "hover": "#277c54",
+                "dropdown": "#20372e",
+                "text": "#eefcf5",
+                "hint": "#9fdfbf",
+            },
+        }.get(self.assistant_mode, {})
+        mode_menu = self.ids.get("assistant_mode_menu")
+        if mode_menu is not None and palette:
+            try:
+                mode_menu.configure(
+                    fg_color=palette["menu_fg"],
+                    button_color=palette["button"],
+                    button_hover_color=palette["hover"],
+                    dropdown_fg_color=palette["dropdown"],
+                    dropdown_hover_color=palette["hover"],
+                    text_color=palette["text"],
+                )
+                mode_menu.set(self.assistant_mode)
+            except Exception:
+                pass
         if "assistant_mode_hint" in self.ids:
             if self.assistant_mode == "Therapy":
                 self.ids.assistant_mode_hint.text = (
@@ -9008,6 +9413,8 @@ class DesktopMedSafeApp:
                 self.ids.assistant_mode_hint.text = (
                     "General mode focuses on schedule, wellness, dental, and practical vault guidance."
                 )
+            if palette:
+                self.ids.assistant_mode_hint.text_color = palette["hint"]
         self.set_status(f"Assistant mode set to {self.assistant_mode}.")
 
     def on_recovery_slider_change(self, field: str, value: float) -> None:
@@ -9641,6 +10048,10 @@ def _desktop_render_daily_checklist(self: DesktopMedSafeApp, meds: List[Dict[str
     for child in frame.winfo_children():
         child.destroy()
     frame.grid_columnconfigure(0, weight=1)
+    target_day = self.current_checklist_target_day(now)
+    today = datetime.fromtimestamp(now).date()
+    allow_uncheck = bool(self.settings_data.get("allow_checklist_uncheck", False))
+    can_log_for_day = target_day <= today
     if not meds:
         ctk.CTkLabel(
             frame,
@@ -9653,16 +10064,19 @@ def _desktop_render_daily_checklist(self: DesktopMedSafeApp, meds: List[Dict[str
         ).grid(row=0, column=0, sticky="ew", padx=12, pady=12)
         return
 
-    entries = build_dashboard_daily_checklist_entries(meds, datetime.fromtimestamp(now).date(), now)
+    entries = build_dashboard_daily_checklist_entries(meds, target_day, now)
     if not entries:
         next_rows = []
-        for med in meds:
-            next_slot = next_unchecked_medication_slot(med, now)
-            if next_slot is not None:
-                next_rows.append((safe_float(next_slot.get("scheduled_ts")) or float("inf"), med, next_slot))
-        next_rows.sort(key=lambda item: item[0])
-        message = "No planned medication slots for today yet. Add custom times or intervals to generate the checklist."
-        if next_rows:
+        if target_day == today:
+            for med in meds:
+                next_slot = next_unchecked_medication_slot(med, now)
+                if next_slot is not None:
+                    next_rows.append((safe_float(next_slot.get("scheduled_ts")) or float("inf"), med, next_slot))
+            next_rows.sort(key=lambda item: item[0])
+        message = f"No planned medication slots for {target_day.isoformat()} yet."
+        if target_day == today:
+            message = "No planned medication slots for today yet. Add custom times or intervals to generate the checklist."
+        if next_rows and target_day == today:
             _next_ts, med, next_slot = next_rows[0]
             message = (
                 f"Nothing left for today. Next planned dose: "
@@ -9696,15 +10110,34 @@ def _desktop_render_daily_checklist(self: DesktopMedSafeApp, meds: List[Dict[str
         checkbox.grid(row=0, column=0, sticky="w", padx=(4, 10))
         if entry.get("status") == "taken":
             checkbox.select()
-            checkbox.configure(state="disabled")
-        elif entry.get("status") == "missed":
-            checkbox.deselect()
-            checkbox.configure(state="disabled")
+            if allow_uncheck and can_log_for_day:
+                checkbox.configure(
+                    state="normal",
+                    command=lambda med_id=str(entry.get("med_id")), slot_key=str(entry.get("slot_key") or ""), scheduled_ts=safe_float(entry.get("scheduled_ts")), slot_label=str(entry.get("label") or ""): self.on_checklist_uncheck_dose(
+                        med_id,
+                        slot_key,
+                        scheduled_ts,
+                        slot_label,
+                    ),
+                )
+            else:
+                checkbox.configure(state="disabled")
         else:
             checkbox.deselect()
-            checkbox.configure(
-                command=lambda med_id=str(entry.get("med_id")), slot_label=str(entry.get("label")): self.on_checklist_take_dose(med_id, slot_label)
-            )
+            if can_log_for_day:
+                use_current_time = target_day == today and sanitize_text(entry.get("status") or "", max_chars=16).lower() in {"due", "upcoming"}
+                checkbox.configure(
+                    state="normal",
+                    command=lambda med_id=str(entry.get("med_id")), slot_key=str(entry.get("slot_key") or ""), scheduled_ts=safe_float(entry.get("scheduled_ts")), slot_label=str(entry.get("label") or ""), current_time=use_current_time: self.on_checklist_take_dose(
+                        med_id,
+                        slot_key,
+                        scheduled_ts,
+                        slot_label,
+                        current_time,
+                    ),
+                )
+            else:
+                checkbox.configure(state="disabled")
 
         details_text = f"{entry['med_name']} • {entry['dose_text']} • {entry['label']}"
         if selected_med and str(selected_med.get("id")) == str(entry.get("med_id")):
@@ -9742,27 +10175,82 @@ def _desktop_render_daily_checklist(self: DesktopMedSafeApp, meds: List[Dict[str
             font=ctk.CTkFont(size=13),
         ).grid(row=0, column=2, sticky="ew", padx=(10, 0))
 
-        if entry.get("status") == "missed":
+        if entry.get("status") == "missed" and target_day == today:
             self._button(
                 row,
                 text="Take Now",
-                command=lambda med_id=str(entry.get("med_id")), slot_label=str(entry.get("label")): self.on_checklist_take_dose(med_id, slot_label),
+                command=lambda med_id=str(entry.get("med_id")), slot_key=str(entry.get("slot_key") or ""), scheduled_ts=safe_float(entry.get("scheduled_ts")), slot_label=str(entry.get("label") or ""): self.on_checklist_take_dose(
+                    med_id,
+                    slot_key,
+                    scheduled_ts,
+                    slot_label,
+                    True,
+                ),
                 tone="warning",
             ).grid(row=0, column=3, sticky="e", padx=(10, 0))
 
 
-def _desktop_on_checklist_take_dose(self: DesktopMedSafeApp, med_id: str, slot_label: str) -> None:
+def _desktop_on_checklist_take_dose(
+    self: DesktopMedSafeApp,
+    med_id: str,
+    slot_key: str,
+    scheduled_ts: float,
+    slot_label: str,
+    use_current_time: bool = True,
+) -> None:
     self.selected_med_id = med_id
     self.refresh_form()
     med = self.current_selected_med()
     if not med:
         return
-    self._log_dose_for_med(med, source_label=slot_label)
+    target_timestamp = time.time() if use_current_time else max(0.0, safe_float(scheduled_ts)) or time.time()
+    self._log_dose_for_med(
+        med,
+        source_label=slot_label,
+        log_timestamp=target_timestamp,
+        scheduled_ts=scheduled_ts,
+        slot_key=slot_key,
+    )
+
+
+def _desktop_on_checklist_uncheck_dose(
+    self: DesktopMedSafeApp,
+    med_id: str,
+    slot_key: str,
+    scheduled_ts: float,
+    slot_label: str,
+) -> None:
+    if not bool(self.settings_data.get("allow_checklist_uncheck", False)):
+        self.set_status("Enable checklist undo in Settings before unchecking taken rows.")
+        return
+    self.selected_med_id = med_id
+    self.refresh_form()
+    med = self.current_selected_med()
+    if not med:
+        return
+    slot = {
+        "slot_key": sanitize_text(slot_key or "", max_chars=64),
+        "scheduled_ts": max(0.0, safe_float(scheduled_ts)),
+    }
+    if not remove_medication_history_entry_for_slot(med, slot):
+        self.set_status(f"Could not undo the recorded {slot_label} dose.")
+        return
+    self.data_cache["dose_safety_review"] = dose_safety_review_defaults()
+    self.save_data()
+    self.refresh_ui()
+    self.set_status(f"Removed the recorded {slot_label} dose.")
+    dose_value = max(0.0, safe_float(med.get("dose_mg")))
+    if dose_value > 0.0:
+        self.start_dose_safety_assessment(self.clone_med_snapshot(med), dose_value, source_label=f"{slot_label} undo")
+    else:
+        self._restore_saved_dose_safety_review()
 
 
 def _desktop_refresh_dashboard(self: DesktopMedSafeApp) -> None:
     now = time.time()
     meds = list(self.data_cache.get("meds") or [])
+    target_day = self.current_checklist_target_day(now)
+    today = datetime.fromtimestamp(now).date()
     med_statuses = [(medication_due_status(med, now), med) for med in meds]
     due_now = [med for status, med in med_statuses if status["due_now"] and not status["overdue"]]
     overdue = [med for status, med in med_statuses if status["overdue"]]
@@ -9782,22 +10270,22 @@ def _desktop_refresh_dashboard(self: DesktopMedSafeApp) -> None:
     summary_text = "No medication selected."
     schedule_text = "Today's dose plan will appear here."
     if selected:
-        selected_slots = build_medication_daily_slots(selected, datetime.fromtimestamp(now).date(), now)
+        selected_slots = build_medication_daily_slots(selected, target_day, now)
         remaining_slots = len([slot for slot in selected_slots if slot.get("status") != "taken"])
         selection_text = f"Focused med: {sanitize_text(selected.get('name'), max_chars=120)}"
         summary_text = (
             f"{sanitize_text(selected.get('name'), max_chars=120)}\n"
             f"{medication_card_line(selected, now)}\n"
             f"Last taken: {format_timestamp(last_effective_taken_ts(selected))}\n"
-            f"Remaining planned slots today: {remaining_slots}\n"
+            f"Remaining planned slots on {target_day.isoformat()}: {remaining_slots}\n"
             f"Directions: {sanitize_text(selected.get('schedule_text') or 'No bottle directions saved yet.', max_chars=260)}"
         )
-        schedule_text = build_medication_schedule_text(selected, now)
+        schedule_text = build_medication_schedule_text(selected, now, target_day=target_day)
 
     self.ids.dose_wheel.set_level(self.last_check_level)
     self.ids.dashboard_risk_title.text = self.last_check_display
     self.ids.dashboard_risk_caption.text = self.last_check_message
-    self.ids.today_due_count.text = f"{len(due_now)} active | {len(overdue)} missed"
+    self.ids.today_due_count.text = f"Due now: {len(due_now)} | Missed: {len(overdue)}"
     self.ids.today_next_due.text = next_due_text
     self.ids.today_timeline.text = build_timeline_text(meds, now)
     self.ids.dashboard_selection.text = selection_text
@@ -9809,9 +10297,17 @@ def _desktop_refresh_dashboard(self: DesktopMedSafeApp) -> None:
         self.current_recovery_support_state(),
         now,
     )
+    self.set_field_text("daily_checklist_date", target_day.isoformat())
+    if target_day == today:
+        checklist_label = "Viewing Today"
+    elif target_day < today:
+        checklist_label = f"Viewing {target_day.isoformat()}"
+    else:
+        checklist_label = f"Future Plan {target_day.isoformat()}"
+    self.ids.daily_checklist_date_label.text = checklist_label
     self.ids.daily_checklist_hint.text = (
-        "Each row shows the time, medication, and planned dose. Check it when you take it; "
-        "missed slots get an X and elapsed time."
+        "Each row shows the time, medication, and planned dose. Check rows for the selected day to reconcile them, "
+        "use Take Now for a current missed slot, and turn on checklist undo in Settings if you want reversible checkmarks."
     )
     self._render_daily_checklist(meds, selected, now)
 
@@ -10033,6 +10529,7 @@ DesktopMedSafeApp.on_reset_exercise_settings = _desktop_on_reset_exercise_settin
 
 DesktopMedSafeApp._render_daily_checklist = _desktop_render_daily_checklist
 DesktopMedSafeApp.on_checklist_take_dose = _desktop_on_checklist_take_dose
+DesktopMedSafeApp.on_checklist_uncheck_dose = _desktop_on_checklist_uncheck_dose
 DesktopMedSafeApp.refresh_dashboard = _desktop_refresh_dashboard
 
 
