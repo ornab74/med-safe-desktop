@@ -2096,8 +2096,14 @@ def matching_medication_history_entry_for_slot(med: Dict[str, Any], slot: Dict[s
             record_scheduled = max(0.0, safe_float(record.get("scheduled_ts")))
             if record_scheduled > 0.0 and abs(record_scheduled - scheduled_ts) <= 60.0:
                 return record
-    if scheduled_ts > 0.0:
+    # Only fall back to fuzzy timestamp matching for legacy rows that do not
+    # carry a stable slot key or scheduled timestamp.
+    if not slot_key and scheduled_ts > 0.0:
         for record in reversed(records):
+            if sanitize_text(record.get("slot_key") or "", max_chars=64):
+                continue
+            if max(0.0, safe_float(record.get("scheduled_ts"))) > 0.0:
+                continue
             if abs(safe_float(record.get("timestamp")) - scheduled_ts) <= tolerance:
                 return record
     return None
@@ -2397,7 +2403,7 @@ def build_medication_daily_slots(
     tolerance = medication_slot_match_tolerance_seconds(med)
     day_start = clock_minutes_to_timestamp(target_day, 0)
     day_end = day_start + 24.0 * 3600.0
-    history_records = medication_history_records(med)
+    history_records = medication_history_records(med, collapse_probable_duplicates=False)
     used_rows = set()
     for slot in slots:
         best_match = None
@@ -2429,12 +2435,16 @@ def build_medication_daily_slots(
                         max(0.0, safe_float(record.get("dose_mg"))),
                         record,
                     )
-        if best_match is None:
+        if best_match is None and not slot_key and slot_scheduled_ts <= 0.0:
             for record in history_records:
                 raw_index = int(record.get("raw_index", -1))
                 ts = safe_float(record.get("timestamp"))
                 amount = max(0.0, safe_float(record.get("dose_mg")))
                 if raw_index in used_rows or amount <= 0:
+                    continue
+                if sanitize_text(record.get("slot_key") or "", max_chars=64):
+                    continue
+                if max(0.0, safe_float(record.get("scheduled_ts"))) > 0.0:
                     continue
                 if not ((day_start - tolerance) <= ts < (day_end + tolerance)):
                     continue
@@ -2937,6 +2947,7 @@ def build_regimen_safety_context(meds: List[Dict[str, Any]], now_ts: float) -> D
     missed = 0
     grouped_times: Dict[str, List[str]] = {}
     lines: List[str] = []
+    safe_overlap_groups = 0
     for med, snapshot in zip(meds, snapshots):
         status = medication_due_status(med, now_ts)
         slot = status.get("slot") or {}
@@ -2966,6 +2977,9 @@ def build_regimen_safety_context(meds: List[Dict[str, Any]], now_ts: float) -> D
             if len(names) > 1
         ]
     )
+    for names in grouped_times.values():
+        if len(names) > 1:
+            safe_overlap_groups += 1
     context_text = "\n".join(
         [
             f"med_count={len(meds)}",
@@ -2977,13 +2991,14 @@ def build_regimen_safety_context(meds: List[Dict[str, Any]], now_ts: float) -> D
         ]
     )
     if top_action == "Unsafe":
-        message = "At least one medication schedule looks unsafe on its own, so the combined plan needs caution before another dose is logged."
-    elif overlapping:
-        message = f"Combined plan caution. Multiple medications share the same time window ({'; '.join(overlapping[:2])})."
+        message = "At least one medication schedule is already outside its stored limits, so the combined plan needs review before another dose is logged."
+    elif top_action == "Caution":
+        message = "At least one medication schedule already needs review on its own, so the combined plan stays on caution until that schedule is clarified."
+    elif due_now >= 3:
+        message = f"Combined plan caution. {due_now} medications land in the same current window, so do a quick double-check before logging."
         top_action = "Caution"
-    elif due_now > 1:
-        message = f"Combined plan caution. {due_now} medications are clustered in the current window."
-        top_action = "Caution"
+    elif safe_overlap_groups:
+        message = f"Combined plan looks stable. Shared planned windows are expected here ({'; '.join(overlapping[:2])}) and do not count as a caution by themselves."
     else:
         message = f"Combined plan looks stable across {len(meds)} medication schedules."
     return {
@@ -3006,9 +3021,8 @@ def assess_regimen_safety_with_llm(
         "You are MedSafe Regimen Safety Judge, a private local schedule-integration checker running on-device.\n"
         "Assess the combined medication plan only from the supplied schedule facts.\n"
         "Do not invent diagnoses, lab values, allergies, pharmacology, or clinician-only interaction claims.\n"
-        "If the listed plan looks individually safe and there is no obvious same-window duplication or overlap concern, answer SAFE.\n"
-        "If the plan is ambiguous or clustered, answer CAUTION.\n"
-        "If one or more listed schedules are already unsafe from their own stored limits, answer UNSAFE.\n"
+        "Shared planned dose windows across different medications are normal and are not a caution by themselves.\n"
+        "Only escalate when the stored facts show an actual schedule conflict, a missing structure problem, or a medication that is already unsafe on its own.\n"
         "Return exactly one action tag and one short summary tag."
     )
     prompt = (
@@ -3018,8 +3032,10 @@ def assess_regimen_safety_with_llm(
         f"{context['context_text']}\n"
         "Rules:\n"
         "- Use SAFE when the listed schedules look internally consistent together.\n"
-        "- Use CAUTION when several meds cluster into the same time window, the directions are unclear, or the combined plan deserves extra human review.\n"
+        "- Do not treat different medications sharing the same planned time window as a caution by itself.\n"
+        "- Use CAUTION only when the stored directions are unclear, several meds create a genuinely crowded current window, or a medication already needs review on its own.\n"
         "- Use UNSAFE when one or more schedules are already unsafe from their stored interval/max-daily rules.\n"
+        "- Mirror the deterministic context when it is clearly SAFE or UNSAFE.\n"
         "- Do not output JSON.\n"
         "- Return exactly two lines:\n"
         "[action]SAFE or CAUTION or UNSAFE[/action]\n"
