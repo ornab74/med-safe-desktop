@@ -223,10 +223,25 @@ DEFAULT_SETTINGS = {
     "setup_complete": False,
     "startup_password_enabled": False,
     "allow_checklist_uncheck": False,
+    "text_size": "Default",
+}
+TEXT_SIZE_OPTIONS: Tuple[str, ...] = ("Small", "Default", "Large", "Extra Large")
+TEXT_SIZE_SCALE_MAP: Dict[str, float] = {
+    "Small": 0.92,
+    "Default": 1.00,
+    "Large": 1.12,
+    "Extra Large": 1.24,
+}
+TEXT_SIZE_BASE_FONT_MAP: Dict[str, int] = {
+    "Small": 12,
+    "Default": 13,
+    "Large": 15,
+    "Extra Large": 17,
 }
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 JSON_BLOCK_RE = re.compile(r"\{.*\}", re.S)
 ACTION_BLOCK_RE = re.compile(r"\[action\]\s*([A-Za-z]+)\s*\[/action\]", re.I | re.S)
+MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 
 APP_PATHS: Optional["AppPaths"] = None
 litert_lm = None
@@ -342,6 +357,23 @@ def normalize_setting_choice(value: Any, options: Tuple[str, ...], default: str)
         if text.lower() == option.lower():
             return option
     return default
+
+
+def markdown_to_plain_text(value: Any, *, max_chars: int = 3000) -> str:
+    text = sanitize_text(value, max_chars=max_chars)
+    if not text:
+        return ""
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1 (\2)", text)
+    text = re.sub(r"^```[a-zA-Z0-9_-]*\s*$", "", text, flags=re.M)
+    text = text.replace("```", "")
+    text = re.sub(r"^#{1,6}\s*", "", text, flags=re.M)
+    text = re.sub(r"^\s*[-*+]\s+", "• ", text, flags=re.M)
+    text = re.sub(r"^\s*>\s?", "| ", text, flags=re.M)
+    for pattern in (r"\*\*(.+?)\*\*", r"__(.+?)__", r"\*(.+?)\*", r"_(.+?)_"):
+        text = re.sub(pattern, r"\1", text)
+    text = text.replace("`", "")
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -1131,10 +1163,60 @@ def safety_reviews_defaults() -> Dict[str, Any]:
     }
 
 
+def normalized_med_entry(item: Any, *, default_archived_ts: float = 0.0) -> Optional[Dict[str, Any]]:
+    if not isinstance(item, dict):
+        return None
+    history_rows = []
+    for row in item.get("history", []) or []:
+        if isinstance(row, dict):
+            entry = [
+                safe_float(row.get("timestamp") or row.get("taken_ts") or 0.0),
+                max(0.0, safe_float(row.get("dose_mg") or row.get("amount_mg") or row.get("dose") or 0.0)),
+            ]
+            scheduled_ts = safe_float(row.get("scheduled_ts") or 0.0)
+            slot_key = sanitize_text(row.get("slot_key") or "", max_chars=64)
+            if scheduled_ts > 0.0 or slot_key:
+                entry.extend([scheduled_ts, slot_key])
+            if entry[0] > 0.0 and entry[1] > 0.0:
+                history_rows.append(entry)
+        elif isinstance(row, (list, tuple)) and len(row) >= 2:
+            entry = [safe_float(row[0]), max(0.0, safe_float(row[1]))]
+            scheduled_ts = safe_float(row[2]) if len(row) >= 3 else 0.0
+            slot_key = sanitize_text(row[3] if len(row) >= 4 else "", max_chars=64)
+            if scheduled_ts > 0.0 or slot_key:
+                entry.extend([scheduled_ts, slot_key])
+            if entry[0] > 0.0 and entry[1] > 0.0:
+                history_rows.append(entry)
+    created_ts = safe_float(item.get("created_ts") or 0.0)
+    if created_ts <= 0.0:
+        created_ts = safe_float(item.get("last_taken_ts") or 0.0)
+    if created_ts <= 0.0 and not history_rows:
+        created_ts = time.time()
+    archived_ts = max(0.0, safe_float(item.get("archived_ts") or default_archived_ts))
+    return {
+        "id": sanitize_text(item.get("id") or uuid.uuid4().hex[:12], max_chars=32),
+        "name": sanitize_text(item.get("name") or "Medication", max_chars=120),
+        "dose_mg": max(0.0, safe_float(item.get("dose_mg"))),
+        "interval_hours": max(0.0, safe_float(item.get("interval_hours"))),
+        "max_daily_mg": max(0.0, safe_float(item.get("max_daily_mg"))),
+        "created_ts": created_ts,
+        "archived_ts": archived_ts,
+        "first_dose_time": sanitize_text(item.get("first_dose_time") or "", max_chars=20),
+        "custom_times_text": sanitize_text(item.get("custom_times_text") or "", max_chars=320),
+        "schedule_text": sanitize_text(item.get("schedule_text") or "", max_chars=240),
+        "notes": sanitize_text(item.get("notes") or "", max_chars=600),
+        "source": sanitize_text(item.get("source") or "manual", max_chars=40),
+        "source_photo": sanitize_text(item.get("source_photo") or "", max_chars=180),
+        "last_taken_ts": safe_float(item.get("last_taken_ts")),
+        "history": history_rows[-240:],
+    }
+
+
 def vault_defaults() -> Dict[str, Any]:
     return {
-        "version": 2,
+        "version": 3,
         "meds": [],
+        "med_archives": [],
         "assistant_history": [],
         "dose_safety_review": dose_safety_review_defaults(),
         "safety_reviews": safety_reviews_defaults(),
@@ -1153,53 +1235,19 @@ def ensure_vault_shape(raw: Any) -> Dict[str, Any]:
         return base
 
     meds: List[Dict[str, Any]] = []
+    med_archives: List[Dict[str, Any]] = []
     for item in raw.get("meds", []) or []:
-        if not isinstance(item, dict):
+        parsed_med = normalized_med_entry(item)
+        if parsed_med is None:
             continue
-        history_rows = []
-        for row in item.get("history", []) or []:
-            if isinstance(row, dict):
-                entry = [
-                    safe_float(row.get("timestamp") or row.get("taken_ts") or 0.0),
-                    max(0.0, safe_float(row.get("dose_mg") or row.get("amount_mg") or row.get("dose") or 0.0)),
-                ]
-                scheduled_ts = safe_float(row.get("scheduled_ts") or 0.0)
-                slot_key = sanitize_text(row.get("slot_key") or "", max_chars=64)
-                if scheduled_ts > 0.0 or slot_key:
-                    entry.extend([scheduled_ts, slot_key])
-                if entry[0] > 0.0 and entry[1] > 0.0:
-                    history_rows.append(entry)
-            elif isinstance(row, (list, tuple)) and len(row) >= 2:
-                entry = [safe_float(row[0]), max(0.0, safe_float(row[1]))]
-                scheduled_ts = safe_float(row[2]) if len(row) >= 3 else 0.0
-                slot_key = sanitize_text(row[3] if len(row) >= 4 else "", max_chars=64)
-                if scheduled_ts > 0.0 or slot_key:
-                    entry.extend([scheduled_ts, slot_key])
-                if entry[0] > 0.0 and entry[1] > 0.0:
-                    history_rows.append(entry)
-        created_ts = safe_float(item.get("created_ts") or 0.0)
-        if created_ts <= 0.0:
-            created_ts = safe_float(item.get("last_taken_ts") or 0.0)
-        if created_ts <= 0.0 and not history_rows:
-            created_ts = time.time()
-        meds.append(
-            {
-                "id": sanitize_text(item.get("id") or uuid.uuid4().hex[:12], max_chars=32),
-                "name": sanitize_text(item.get("name") or "Medication", max_chars=120),
-                "dose_mg": max(0.0, safe_float(item.get("dose_mg"))),
-                "interval_hours": max(0.0, safe_float(item.get("interval_hours"))),
-                "max_daily_mg": max(0.0, safe_float(item.get("max_daily_mg"))),
-                "created_ts": created_ts,
-                "first_dose_time": sanitize_text(item.get("first_dose_time") or "", max_chars=20),
-                "custom_times_text": sanitize_text(item.get("custom_times_text") or "", max_chars=320),
-                "schedule_text": sanitize_text(item.get("schedule_text") or "", max_chars=240),
-                "notes": sanitize_text(item.get("notes") or "", max_chars=600),
-                "source": sanitize_text(item.get("source") or "manual", max_chars=40),
-                "source_photo": sanitize_text(item.get("source_photo") or "", max_chars=180),
-                "last_taken_ts": safe_float(item.get("last_taken_ts")),
-                "history": history_rows[-240:],
-            }
-        )
+        if medication_is_archived(parsed_med):
+            med_archives.append(parsed_med)
+        else:
+            meds.append(parsed_med)
+    for item in raw.get("med_archives", []) or []:
+        parsed_med = normalized_med_entry(item, default_archived_ts=time.time())
+        if parsed_med is not None:
+            med_archives.append(parsed_med)
 
     assistant_history = []
     for item in raw.get("assistant_history", []) or []:
@@ -1430,6 +1478,7 @@ def ensure_vault_shape(raw: Any) -> Dict[str, Any]:
     recovery_support["history"] = recovery_history[-240:]
 
     base["meds"] = meds
+    base["med_archives"] = med_archives[-240:]
     base["assistant_history"] = assistant_history[-24:]
     base["dose_safety_review"] = dose_safety_review
     base["safety_reviews"] = safety_reviews
@@ -1576,6 +1625,7 @@ def load_settings(paths: Optional[AppPaths] = None) -> Dict[str, Any]:
     settings["setup_complete"] = bool(settings.get("setup_complete", False))
     settings["startup_password_enabled"] = bool(settings.get("startup_password_enabled", False))
     settings["allow_checklist_uncheck"] = bool(settings.get("allow_checklist_uncheck", False))
+    settings["text_size"] = normalize_setting_choice(settings.get("text_size"), TEXT_SIZE_OPTIONS, "Default")
     return settings
 
 
@@ -1956,6 +2006,84 @@ def should_create_new_med_entry(existing_med: Optional[Dict[str, Any]], form_nam
     next_name = normalized_med_name(form_name)
     current_name = normalized_med_name(existing_med.get("name") or "")
     return bool(next_name and current_name and next_name != current_name)
+
+
+def medication_archived_ts(med: Optional[Dict[str, Any]]) -> float:
+    return max(0.0, safe_float((med or {}).get("archived_ts")))
+
+
+def medication_is_archived(med: Optional[Dict[str, Any]]) -> bool:
+    return medication_archived_ts(med) > 0.0
+
+
+def active_medications(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [med for med in list(data.get("meds") or []) if isinstance(med, dict) and not medication_is_archived(med)]
+
+
+def archived_medications(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    archived = [med for med in list(data.get("med_archives") or []) if isinstance(med, dict)]
+    archived.extend(
+        med
+        for med in list(data.get("meds") or [])
+        if isinstance(med, dict) and medication_is_archived(med)
+    )
+    return archived
+
+
+def all_stored_medications(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return active_medications(data) + archived_medications(data)
+
+
+def medication_archive_label(med: Dict[str, Any]) -> str:
+    archived_ts = medication_archived_ts(med)
+    if archived_ts > 0.0:
+        archived_day = datetime.fromtimestamp(archived_ts).date().isoformat()
+        return f"Completed on {archived_day}"
+    return "Completed medication"
+
+
+def build_dashboard_med_picker_map(data: Dict[str, Any], now_ts: Optional[float] = None) -> Dict[str, str]:
+    now = now_ts or time.time()
+    option_map: Dict[str, str] = {"Choose medication": ""}
+    used_labels = {"Choose medication"}
+
+    active = sorted(
+        active_medications(data),
+        key=lambda med: (
+            0 if medication_due_status(med, now)["overdue"] else 1 if medication_due_status(med, now)["due_now"] else 2,
+            medication_due_status(med, now)["next_ts"] or float("inf"),
+            sanitize_text(med.get("name"), max_chars=120).lower(),
+        ),
+    )
+    archived = sorted(
+        archived_medications(data),
+        key=lambda med: (
+            -medication_archived_ts(med),
+            -last_effective_taken_ts(med),
+            sanitize_text(med.get("name"), max_chars=120).lower(),
+        ),
+    )
+
+    def add_option(prefix: str, med: Dict[str, Any], suffix: str = "") -> None:
+        med_id = sanitize_text(med.get("id") or "", max_chars=32)
+        if not med_id:
+            return
+        base = f"{prefix} | {sanitize_text(med.get('name') or 'Medication', max_chars=120)}"
+        if suffix:
+            base += f" | {suffix}"
+        label = base
+        if label in used_labels:
+            label = f"{base} | {med_id[:4]}"
+        used_labels.add(label)
+        option_map[label] = med_id
+
+    for med in active:
+        add_option("Current", med)
+    for med in archived:
+        archived_ts = medication_archived_ts(med)
+        suffix = datetime.fromtimestamp(archived_ts).date().isoformat() if archived_ts > 0.0 else "history"
+        add_option("Completed", med, suffix=suffix)
+    return option_map
 
 
 def medication_history_records(
@@ -2380,6 +2508,8 @@ def build_medication_daily_slots(
     target_day: date,
     now_ts: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
+    if medication_is_archived(med):
+        return []
     templates = resolved_medication_slot_templates(med)
     if not templates:
         return []
@@ -2516,6 +2646,8 @@ def build_dashboard_daily_checklist_entries(
 
 
 def next_unchecked_medication_slot(med: Dict[str, Any], now_ts: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    if medication_is_archived(med):
+        return None
     now = now_ts or time.time()
     today = datetime.fromtimestamp(now).date()
     for day_offset in range(0, 3):
@@ -2541,6 +2673,14 @@ def next_due_timestamp(med: Dict[str, Any]) -> Optional[float]:
 
 def medication_due_status(med: Dict[str, Any], now_ts: Optional[float] = None) -> Dict[str, Any]:
     now = now_ts or time.time()
+    if medication_is_archived(med):
+        return {
+            "state": "Completed",
+            "text": medication_archive_label(med),
+            "next_ts": None,
+            "due_now": False,
+            "overdue": False,
+        }
     slot = next_unchecked_medication_slot(med, now)
     if slot is not None:
         if slot.get("status") == "missed":
@@ -2586,6 +2726,10 @@ def medication_due_status(med: Dict[str, Any], now_ts: Optional[float] = None) -
 
 def medication_card_line(med: Dict[str, Any], now_ts: Optional[float] = None) -> str:
     now = now_ts or time.time()
+    if medication_is_archived(med):
+        history_count = len(medication_history_records(med))
+        last_taken = format_timestamp(last_effective_taken_ts(med))
+        return f"{medication_archive_label(med)} | Last taken {last_taken} | {history_count} logged dose(s)"
     status = medication_due_status(med, now)
     dose = max(0.0, safe_float(med.get("dose_mg")))
     interval = max(0.0, safe_float(med.get("interval_hours")))
@@ -2618,13 +2762,17 @@ def build_timeline_text(meds: List[Dict[str, Any]], now_ts: Optional[float] = No
 
 def build_med_history_text(med: Optional[Dict[str, Any]]) -> str:
     if not med:
-        return "Select a medication to see recent logs."
-    rows = medication_history_rows(med)[-5:]
-    if not rows:
+        return "Select a medication from the dashboard focus menu or Medication List to see dosage history."
+    records = medication_history_records(med)
+    if not records:
+        if medication_is_archived(med):
+            return medication_archive_label(med) + "\nNo doses were logged before this medication was completed."
         return "No doses logged for this medication yet."
     lines = []
-    for ts, amount in reversed(rows):
-        lines.append(f"{format_timestamp(safe_float(ts))} • {safe_float(amount):g} mg")
+    if medication_is_archived(med):
+        lines.append(medication_archive_label(med))
+    for record in reversed(records[-8:]):
+        lines.append(f"{format_timestamp(safe_float(record.get('timestamp')))} • {safe_float(record.get('dose_mg')):g} mg")
     return "\n".join(lines)
 
 
@@ -2636,6 +2784,11 @@ def build_medication_schedule_text(
 ) -> str:
     if not med:
         return "Select a medication to see today's planned doses."
+    if medication_is_archived(med):
+        return (
+            f"{medication_archive_label(med)}.\n"
+            "This medication is no longer part of the current regimen, so it stays visible for history only."
+        )
     now = now_ts or time.time()
     active_day = target_day or datetime.fromtimestamp(now).date()
     slots = build_medication_daily_slots(med, active_day, now)
@@ -2659,6 +2812,9 @@ def build_medication_schedule_text(
 def build_medication_nudge_text(med: Optional[Dict[str, Any]], now_ts: Optional[float] = None) -> str:
     if not med:
         return "Select a medication to see the next gentle reminder."
+    if medication_is_archived(med):
+        med_name = sanitize_text(med.get("name") or "This medication", max_chars=120)
+        return f"Gentle nudge: {med_name} is completed and kept visible for history."
     now = now_ts or time.time()
     slots = build_medication_daily_slots(med, datetime.fromtimestamp(now).date(), now)
     if not slots:
@@ -3260,6 +3416,29 @@ def assess_medication_plan_with_llm(
     }
 
 
+def medication_plan_process_worker(
+    result_queue: Any,
+    key: bytes,
+    med: Dict[str, Any],
+    now_ts: float,
+    settings: Dict[str, Any],
+) -> None:
+    try:
+        result_queue.put(
+            {
+                "ok": True,
+                "result": assess_medication_plan_with_llm(
+                    key,
+                    med,
+                    now_ts,
+                    settings,
+                ),
+            }
+        )
+    except Exception as exc:
+        result_queue.put({"ok": False, "error": sanitize_text(str(exc), max_chars=240)})
+
+
 def assess_dose_safety_with_llm(
     key: bytes,
     med: Dict[str, Any],
@@ -3343,6 +3522,31 @@ def dose_safety_process_worker(
                     now_ts,
                     settings,
                     source_label=source_label,
+                ),
+            }
+        )
+    except Exception as exc:
+        result_queue.put({"ok": False, "error": sanitize_text(str(exc), max_chars=240)})
+
+
+def all_meds_safety_process_worker(
+    result_queue: Any,
+    key: bytes,
+    meds: List[Dict[str, Any]],
+    now_ts: float,
+    settings: Dict[str, Any],
+    reason: str,
+) -> None:
+    try:
+        result_queue.put(
+            {
+                "ok": True,
+                "result": assess_all_medications_with_llm(
+                    key,
+                    meds,
+                    now_ts,
+                    settings,
+                    reason=reason,
                 ),
             }
         )
@@ -3840,7 +4044,8 @@ def build_recovery_support_context(state: Dict[str, Any], now_ts: Optional[float
 
 
 def build_schedule_context(data: Dict[str, Any], selected_med_id: Optional[str]) -> str:
-    meds = list(data.get("meds") or [])
+    meds = active_medications(data)
+    archived = archived_medications(data)
     now = time.time()
     lines = ["Local health schedule context:"]
     if meds:
@@ -3865,7 +4070,22 @@ def build_schedule_context(data: Dict[str, Any], selected_med_id: Optional[str])
                 )
             )
     else:
-        lines.append("- No medications are stored yet.")
+        lines.append("- No current medications are stored yet.")
+    if archived:
+        lines.append("")
+        lines.append("Completed medications kept for history:")
+        for med in archived[:6]:
+            marker = " [selected]" if str(med.get("id")) == selected_med_id else ""
+            lines.append(
+                "- {name}{marker}: archived={archived} last_taken={last_taken} total_logs={log_count} notes={notes}".format(
+                    name=sanitize_text(med.get("name"), max_chars=120),
+                    marker=marker,
+                    archived=medication_archive_label(med),
+                    last_taken=format_timestamp(last_effective_taken_ts(med)),
+                    log_count=len(medication_history_records(med)),
+                    notes=sanitize_text(med.get("notes") or "none", max_chars=180) or "none",
+                )
+            )
 
     hygiene = data.get("dental_hygiene") or dental_hygiene_defaults()
     lines.append("")
@@ -6189,7 +6409,7 @@ class MedSafeApp(MDApp):
             self.vault.save(self.data_cache)
 
     def current_selected_med(self) -> Optional[Dict[str, Any]]:
-        for med in self.data_cache.get("meds", []) or []:
+        for med in all_stored_medications(self.data_cache):
             if str(med.get("id")) == self.selected_med_id:
                 return med
         return None
@@ -6644,6 +6864,11 @@ class MedSafeApp(MDApp):
 
     def select_med(self, med_id: str) -> None:
         self.selected_med_id = med_id
+        self.refresh_ui()
+
+    def on_dashboard_med_select(self, label: str) -> None:
+        med_id = sanitize_text(self.dashboard_med_option_map.get(label) or "", max_chars=32)
+        self.selected_med_id = med_id or None
         self.refresh_ui()
 
     def on_new_med(self) -> None:
@@ -7382,6 +7607,18 @@ class DesktopListAdapter:
             child.destroy()
         self._row = 0
 
+    def add_section(self, title: str) -> None:
+        label = ctk.CTkLabel(
+            self.frame,
+            text=sanitize_text(title, max_chars=120),
+            anchor="w",
+            justify="left",
+            text_color=DESKTOP_MUTED,
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        label.grid(row=self._row, column=0, sticky="ew", padx=4, pady=(6 if self._row else 0, 8))
+        self._row += 1
+
     def add_widget(self, item: DesktopListItem) -> None:
         card = ctk.CTkFrame(
             self.frame,
@@ -7439,6 +7676,8 @@ class DesktopMedSafeApp:
         self.dose_ai_request_id = 0
         self.dose_ai_process: Optional[Any] = None
         self.dose_ai_queue: Optional[Any] = None
+        self.safety_scan_process: Optional[Any] = None
+        self.safety_scan_queue: Optional[Any] = None
         self.assistant_request_pending = False
         self.assistant_history_dirty = False
         self.background_save_request_id = 0
@@ -7450,6 +7689,7 @@ class DesktopMedSafeApp:
         self.startup_temp_cleanup_message = ""
         self.regimen_check_review: Dict[str, Any] = {}
         self.safety_scan_request_id = 0
+        self.dashboard_med_option_map: Dict[str, str] = {"Choose medication": ""}
 
     def build(self) -> None:
         if ctk is None:
@@ -7484,6 +7724,7 @@ class DesktopMedSafeApp:
             )
         self.vault = EncryptedVault(self.paths)
         self.settings_data = load_settings(self.paths)
+        self.apply_text_size_setting(self.settings_data.get("text_size"))
         if self.paths and self.vault and existing_app_install(self.paths) and not self.settings_data.get("setup_complete", False):
             save_settings(
                 {
@@ -7527,6 +7768,7 @@ class DesktopMedSafeApp:
             except Exception:
                 pass
         self._cleanup_dose_safety_process(terminate=True)
+        self._cleanup_safety_scan_process(terminate=True)
         if self.vault is not None:
             self.vault.clear_cached_key()
         if self.window is not None:
@@ -7580,6 +7822,16 @@ class DesktopMedSafeApp:
     def persist_data_async(self) -> None:
         self.save_data_async()
 
+    def apply_text_size_setting(self, text_size: Optional[str] = None) -> None:
+        choice = normalize_setting_choice(text_size or self.settings_data.get("text_size"), TEXT_SIZE_OPTIONS, "Default")
+        self.settings_data["text_size"] = choice
+        if ctk is None:
+            return
+        try:
+            ctk.set_widget_scaling(TEXT_SIZE_SCALE_MAP.get(choice, 1.0))
+        except Exception:
+            pass
+
     def _handle_save_error(self, message: str, show_dialog: bool = True) -> None:
         clean = sanitize_text(message, max_chars=260)
         if self.main_ui_started:
@@ -7592,6 +7844,31 @@ class DesktopMedSafeApp:
         queue_obj = self.dose_ai_queue
         self.dose_ai_process = None
         self.dose_ai_queue = None
+        if process is not None:
+            try:
+                if terminate and process.is_alive():
+                    process.terminate()
+            except Exception:
+                pass
+            try:
+                process.join(timeout=0.2)
+            except Exception:
+                pass
+        if queue_obj is not None:
+            try:
+                queue_obj.close()
+            except Exception:
+                pass
+            try:
+                queue_obj.join_thread()
+            except Exception:
+                pass
+
+    def _cleanup_safety_scan_process(self, *, terminate: bool = False) -> None:
+        process = self.safety_scan_process
+        queue_obj = self.safety_scan_queue
+        self.safety_scan_process = None
+        self.safety_scan_queue = None
         if process is not None:
             try:
                 if terminate and process.is_alive():
@@ -7689,24 +7966,94 @@ class DesktopMedSafeApp:
                 if not self.vault:
                     raise RuntimeError("Dose safety vault unavailable.")
                 key = self.vault.get_or_create_key()
-                result = assess_medication_plan_with_llm(
-                    key,
-                    med_snapshot,
-                    now_ts,
-                    settings,
+                ctx = mp.get_context("spawn")
+                result_queue = ctx.Queue()
+                process = ctx.Process(
+                    target=medication_plan_process_worker,
+                    args=(result_queue, key, med_snapshot, now_ts, settings),
+                    daemon=True,
                 )
+                process.start()
                 self.run_on_ui_thread(
-                    self._dose_safety_assessment_done,
+                    self._dose_safety_process_started,
                     request_id,
+                    process,
+                    result_queue,
                     med_snapshot,
                     dose_value,
+                    now_ts,
                     source_label,
-                    result,
                 )
             except Exception as exc:
                 self.run_on_ui_thread(self._dose_safety_assessment_failed, request_id, med_snapshot, dose_value, now_ts, str(exc))
 
         threading.Thread(target=launcher, daemon=True).start()
+
+    def _dose_safety_process_started(
+        self,
+        request_id: int,
+        process: Any,
+        result_queue: Any,
+        med: Dict[str, Any],
+        dose_value: float,
+        now_ts: float,
+        source_label: str,
+    ) -> None:
+        if request_id != self.dose_ai_request_id:
+            try:
+                if process.is_alive():
+                    process.terminate()
+            except Exception:
+                pass
+            try:
+                result_queue.close()
+            except Exception:
+                pass
+            return
+        self.dose_ai_process = process
+        self.dose_ai_queue = result_queue
+        self.run_on_ui_thread(self._poll_dose_safety_process, request_id, med, dose_value, now_ts, source_label, delay_ms=120)
+
+    def _poll_dose_safety_process(
+        self,
+        request_id: int,
+        med: Dict[str, Any],
+        dose_value: float,
+        now_ts: float,
+        source_label: str,
+    ) -> None:
+        if request_id != self.dose_ai_request_id:
+            self._cleanup_dose_safety_process(terminate=True)
+            return
+        process = self.dose_ai_process
+        result_queue = self.dose_ai_queue
+        if process is None or result_queue is None:
+            self._dose_safety_assessment_failed(request_id, med, dose_value, now_ts, "Dose safety worker did not start.")
+            return
+        try:
+            payload = result_queue.get_nowait()
+        except queue.Empty:
+            try:
+                alive = process.is_alive()
+            except Exception:
+                alive = False
+            if alive:
+                self.run_on_ui_thread(self._poll_dose_safety_process, request_id, med, dose_value, now_ts, source_label, delay_ms=120)
+            else:
+                self._cleanup_dose_safety_process(terminate=False)
+                self._dose_safety_assessment_failed(request_id, med, dose_value, now_ts, "Dose safety worker ended unexpectedly.")
+            return
+        self._cleanup_dose_safety_process(terminate=False)
+        if payload.get("ok"):
+            self._dose_safety_assessment_done(request_id, med, dose_value, source_label, dict(payload.get("result") or {}))
+        else:
+            self._dose_safety_assessment_failed(
+                request_id,
+                med,
+                dose_value,
+                now_ts,
+                sanitize_text(payload.get("error") or "Dose safety worker failed.", max_chars=240),
+            )
 
     def _dose_safety_assessment_done(
         self,
@@ -7762,6 +8109,54 @@ class DesktopMedSafeApp:
         self.save_data_async()
         self.refresh_dashboard()
         self.set_status(self.last_check_message)
+
+    def _safety_scan_process_started(self, request_id: int, process: Any, result_queue: Any, announce: bool = False) -> None:
+        if request_id != self.safety_scan_request_id:
+            try:
+                if process.is_alive():
+                    process.terminate()
+            except Exception:
+                pass
+            try:
+                result_queue.close()
+            except Exception:
+                pass
+            return
+        self.safety_scan_process = process
+        self.safety_scan_queue = result_queue
+        self.run_on_ui_thread(self._poll_safety_scan_process, request_id, announce, delay_ms=140)
+
+    def _poll_safety_scan_process(self, request_id: int, announce: bool = False) -> None:
+        if request_id != self.safety_scan_request_id:
+            self._cleanup_safety_scan_process(terminate=True)
+            return
+        process = self.safety_scan_process
+        result_queue = self.safety_scan_queue
+        if process is None or result_queue is None:
+            self._safety_scan_failed(request_id, "Safety scan worker did not start.", announce)
+            return
+        try:
+            payload = result_queue.get_nowait()
+        except queue.Empty:
+            try:
+                alive = process.is_alive()
+            except Exception:
+                alive = False
+            if alive:
+                self.run_on_ui_thread(self._poll_safety_scan_process, request_id, announce, delay_ms=140)
+            else:
+                self._cleanup_safety_scan_process(terminate=False)
+                self._safety_scan_failed(request_id, "Safety scan worker ended unexpectedly.", announce)
+            return
+        self._cleanup_safety_scan_process(terminate=False)
+        if payload.get("ok"):
+            self._safety_scan_done(request_id, dict(payload.get("result") or {}), announce)
+        else:
+            self._safety_scan_failed(
+                request_id,
+                sanitize_text(payload.get("error") or "Safety scan worker failed.", max_chars=240),
+                announce,
+            )
 
     def _register(self, name: str, adapter: Any) -> Any:
         self.ids[name] = adapter
@@ -8185,6 +8580,11 @@ class DesktopMedSafeApp:
         self._build_layout()
         self.main_ui_started = True
         self.refresh_from_disk()
+        if hasattr(self, "sync_text_size_widgets"):
+            try:
+                self.sync_text_size_widgets()
+            except Exception:
+                pass
         if self.startup_temp_cleanup_message:
             self.set_status(self.startup_temp_cleanup_message)
             self.startup_temp_cleanup_message = ""
@@ -8428,17 +8828,47 @@ class DesktopMedSafeApp:
         selection_card = self._card(right)
         selection_card.grid(row=1, column=0, sticky="nsew", pady=7)
         selection_card.grid_columnconfigure(0, weight=1)
-        dashboard_selection = self._label(selection_card, text="Select a medication to log doses.", bold=True, wrap=520)
+        dashboard_selection = self._label(selection_card, text="Choose a medication from Dashboard focus.", bold=True, wrap=520)
         dashboard_selection.widget.grid(row=0, column=0, sticky="ew", padx=18, pady=(18, 10))
         self._register("dashboard_selection", dashboard_selection)
+        picker_row = ctk.CTkFrame(selection_card, fg_color="transparent")
+        picker_row.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 12))
+        picker_row.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(picker_row, text="Dashboard focus", anchor="w", text_color=DESKTOP_MUTED).grid(row=0, column=0, sticky="w", padx=(0, 12))
+        dashboard_picker = ctk.CTkOptionMenu(
+            picker_row,
+            values=["Choose medication"],
+            command=self.on_dashboard_med_select,
+            fg_color=DESKTOP_SURFACE_ALT,
+            button_color=DESKTOP_ACCENT,
+            button_hover_color="#0d6b63",
+            dropdown_fg_color=DESKTOP_SURFACE_ALT,
+            dropdown_hover_color="#223443",
+            text_color=DESKTOP_TEXT,
+            corner_radius=12,
+        )
+        dashboard_picker.grid(row=0, column=1, sticky="ew")
+        try:
+            dashboard_picker.set("Choose medication")
+        except Exception:
+            pass
+        self.ids["dashboard_med_picker"] = dashboard_picker
+        dashboard_focus_hint = self._label(
+            selection_card,
+            text="Current regimen and completed history both appear in the focus picker.",
+            muted=True,
+            wrap=520,
+        )
+        dashboard_focus_hint.widget.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 10))
+        self._register("dashboard_focus_hint", dashboard_focus_hint)
         selected_summary = self._readonly_box(selection_card, height=135)
-        selected_summary.widget.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 12))
+        selected_summary.widget.grid(row=3, column=0, sticky="nsew", padx=18, pady=(0, 12))
         self._register("selected_med_summary", selected_summary)
         ctk.CTkLabel(selection_card, text="Dose Plan", anchor="w", text_color=DESKTOP_MUTED).grid(
-            row=2, column=0, sticky="w", padx=18
+            row=4, column=0, sticky="w", padx=18
         )
         selected_schedule = self._readonly_box(selection_card, height=160)
-        selected_schedule.widget.grid(row=3, column=0, sticky="nsew", padx=18, pady=(6, 18))
+        selected_schedule.widget.grid(row=5, column=0, sticky="nsew", padx=18, pady=(6, 18))
         self._register("selected_med_schedule", selected_schedule)
 
         checklist_card = self._card(right)
@@ -8513,11 +8943,19 @@ class DesktopMedSafeApp:
 
         list_card = self._card(scroll)
         list_card.grid(row=0, column=0, sticky="nsew", padx=(14, 7), pady=14)
-        list_card.grid_rowconfigure(1, weight=1)
+        list_card.grid_rowconfigure(2, weight=1)
         list_card.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(list_card, text="Medication List", anchor="w", text_color=DESKTOP_TEXT, font=ctk.CTkFont(size=18, weight="bold")).grid(
             row=0, column=0, sticky="w", padx=18, pady=(18, 10)
         )
+        med_list_summary = self._label(
+            list_card,
+            text="Current regimen entries and completed medication history stay visible here.",
+            muted=True,
+            wrap=420,
+        )
+        med_list_summary.widget.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 10))
+        self._register("med_list_summary", med_list_summary)
         med_list_frame = ctk.CTkScrollableFrame(
             list_card,
             fg_color="transparent",
@@ -8525,7 +8963,7 @@ class DesktopMedSafeApp:
             scrollbar_button_hover_color="#42586c",
             height=620,
         )
-        med_list_frame.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 18))
+        med_list_frame.grid(row=2, column=0, sticky="nsew", padx=18, pady=(0, 18))
         self._register("med_list", DesktopListAdapter(med_list_frame))
 
         form_card = ctk.CTkScrollableFrame(
@@ -8599,9 +9037,17 @@ class DesktopMedSafeApp:
         buttons.grid_columnconfigure((0, 1, 2, 3, 4), weight=1)
         self._button(buttons, text="New", command=self.on_new_med, tone="neutral").grid(row=0, column=0, sticky="ew", padx=(0, 6))
         self._button(buttons, text="Save", command=self.on_save_med).grid(row=0, column=1, sticky="ew", padx=6)
-        self._button(buttons, text="Delete", command=self.on_delete_med, tone="danger").grid(row=0, column=2, sticky="ew", padx=6)
+        self._button(buttons, text="Complete / Archive", command=self.on_delete_med, tone="danger").grid(row=0, column=2, sticky="ew", padx=6)
         self._button(buttons, text="Run Safety Check", command=self.on_run_safety_check, tone="neutral").grid(row=0, column=3, sticky="ew", padx=6)
         self._button(buttons, text="Log Dose", command=self.on_log_dose, tone="warning").grid(row=0, column=4, sticky="ew", padx=(6, 0))
+        form_hint = self._label(
+            form_card,
+            text="Completing a medication removes it from the current regimen and keeps its dose history in the encrypted vault.",
+            muted=True,
+            wrap=720,
+        )
+        form_hint.widget.grid(row=15, column=0, columnspan=3, sticky="ew", padx=18, pady=(0, 18))
+        self._register("med_form_hint", form_hint)
 
     def _build_vision_tab(self, tab: Any) -> None:
         tab.grid_columnconfigure(0, weight=1)
@@ -8868,12 +9314,20 @@ class DesktopMedSafeApp:
         assistant_history = self._readonly_box(card, height=340)
         assistant_history.widget.grid(row=5, column=0, sticky="nsew", padx=18, pady=(0, 12))
         self._register("assistant_history", assistant_history)
-        assistant_input = self._edit_box(card, height=110)
+        assistant_input = self._edit_box(card, height=126)
         assistant_input.widget.grid(row=6, column=0, sticky="ew", padx=18, pady=(0, 12))
         self._register("assistant_input", assistant_input)
         self._bind_assistant_input_shortcuts(assistant_input)
+        compose_hint = self._label(
+            card,
+            text="Markdown is supported here: headings, bullets, links, quotes, and fenced code blocks render in the conversation.",
+            muted=True,
+            wrap=980,
+        )
+        compose_hint.widget.grid(row=7, column=0, sticky="ew", padx=18, pady=(0, 10))
+        self._register("assistant_compose_hint", compose_hint)
         buttons = ctk.CTkFrame(card, fg_color="transparent")
-        buttons.grid(row=7, column=0, sticky="ew", padx=18, pady=(0, 18))
+        buttons.grid(row=8, column=0, sticky="ew", padx=18, pady=(0, 18))
         buttons.grid_columnconfigure((0, 1), weight=1)
         self._button(buttons, text="Send", command=self.on_assistant_send).grid(row=0, column=0, sticky="ew", padx=(0, 6))
         self._button(buttons, text="Clear Chat", command=self.on_assistant_clear, tone="danger").grid(row=0, column=1, sticky="ew", padx=(6, 0))
@@ -9143,6 +9597,55 @@ class DesktopMedSafeApp:
             text_color=DESKTOP_MUTED,
             font=ctk.CTkFont(size=12),
         ).grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 14))
+        accessibility_preferences = ctk.CTkFrame(
+            security,
+            fg_color=DESKTOP_SURFACE_ALT,
+            border_width=1,
+            border_color=DESKTOP_BORDER,
+            corner_radius=14,
+        )
+        accessibility_preferences.grid(row=5, column=0, sticky="ew", padx=18, pady=(0, 18))
+        accessibility_preferences.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(
+            accessibility_preferences,
+            text="Accessibility",
+            anchor="w",
+            text_color=DESKTOP_TEXT,
+            font=ctk.CTkFont(size=16, weight="bold"),
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=16, pady=(14, 6))
+        ctk.CTkLabel(
+            accessibility_preferences,
+            text="Text size",
+            anchor="w",
+            text_color=DESKTOP_MUTED,
+        ).grid(row=1, column=0, sticky="w", padx=(16, 12), pady=(0, 10))
+        text_size_menu = ctk.CTkOptionMenu(
+            accessibility_preferences,
+            values=list(TEXT_SIZE_OPTIONS),
+            command=self.on_text_size_change,
+            fg_color=DESKTOP_SURFACE,
+            button_color=DESKTOP_ACCENT,
+            button_hover_color="#0d6b63",
+            dropdown_fg_color=DESKTOP_SURFACE_ALT,
+            dropdown_hover_color="#223443",
+            text_color=DESKTOP_TEXT,
+            corner_radius=12,
+        )
+        text_size_menu.grid(row=1, column=1, sticky="ew", padx=(0, 16), pady=(0, 10))
+        try:
+            text_size_menu.set(self.settings_data.get("text_size", "Default"))
+        except Exception:
+            pass
+        self.ids["text_size_menu"] = text_size_menu
+        ctk.CTkLabel(
+            accessibility_preferences,
+            text="Adjust the interface text live and keep the preference saved on this device.",
+            anchor="w",
+            justify="left",
+            wraplength=920,
+            text_color=DESKTOP_MUTED,
+            font=ctk.CTkFont(size=12),
+        ).grid(row=2, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 14))
 
     def set_status(self, text: str) -> None:
         self.ids.status_label.text = sanitize_text(text, max_chars=220)
@@ -11057,7 +11560,8 @@ def _desktop_on_checklist_uncheck_dose(
 
 def _desktop_refresh_dashboard(self: DesktopMedSafeApp) -> None:
     now = time.time()
-    meds = list(self.data_cache.get("meds") or [])
+    meds = list(active_medications(self.data_cache))
+    archived = list(archived_medications(self.data_cache))
     target_day = self.current_checklist_target_day(now)
     today = datetime.fromtimestamp(now).date()
     med_statuses = [(medication_due_status(med, now), med) for med in meds]
@@ -11074,7 +11578,11 @@ def _desktop_refresh_dashboard(self: DesktopMedSafeApp) -> None:
         next_due_ts, med = next_due_items[0]
         next_due_text = f"{sanitize_text(med.get('name'), max_chars=120)} | {format_relative_due(next_due_ts, now)}"
 
-    selected = self.current_selected_med()
+    selected = self.med_by_id(self.selected_med_id or "") if self.selected_med_id else None
+    if self.selected_med_id and selected is None:
+        self.selected_med_id = None
+    picker_values = build_dashboard_med_picker_map(self.data_cache, now)
+    self.dashboard_med_option_map = picker_values
     safety_state = effective_safety_reviews_state(self.data_cache.get("safety_reviews"), meds, now)
     regimen_review = dict(safety_state.get("regimen") or {})
     safety_action = "Assessing" if bool(safety_state.get("pending", False)) else normalize_dose_action_text(regimen_review.get("action") or "", "Caution")
@@ -11083,20 +11591,31 @@ def _desktop_refresh_dashboard(self: DesktopMedSafeApp) -> None:
         max_chars=160,
     )
     safety_message = build_dashboard_safety_summary_text(safety_state, meds)
-    selection_text = "Select a medication to log doses."
-    summary_text = "No medication selected."
+    selection_text = "Select a medication from Dashboard focus to review current and completed history."
+    summary_text = "Use Dashboard focus to choose a medication from the current regimen or completed history."
     schedule_text = "Today's dose plan will appear here."
     if selected:
-        selected_slots = build_medication_daily_slots(selected, target_day, now)
-        remaining_slots = len([slot for slot in selected_slots if slot.get("status") != "taken"])
-        selection_text = f"Focused med: {sanitize_text(selected.get('name'), max_chars=120)}"
-        summary_text = (
-            f"{sanitize_text(selected.get('name'), max_chars=120)}\n"
-            f"{medication_card_line(selected, now)}\n"
-            f"Last taken: {format_timestamp(last_effective_taken_ts(selected))}\n"
-            f"Remaining planned slots on {target_day.isoformat()}: {remaining_slots}\n"
-            f"Directions: {sanitize_text(selected.get('schedule_text') or 'No bottle directions saved yet.', max_chars=260)}"
-        )
+        med_name = sanitize_text(selected.get("name"), max_chars=120)
+        selection_text = f"Focused med: {med_name}"
+        if medication_is_archived(selected):
+            selection_text = f"Focused med: {med_name} (Completed)"
+            summary_text = (
+                f"{med_name}\n"
+                f"{medication_card_line(selected, now)}\n"
+                f"Last taken: {format_timestamp(last_effective_taken_ts(selected))}\n"
+                f"Status: {medication_archive_label(selected)}\n"
+                f"Directions: {sanitize_text(selected.get('schedule_text') or 'No bottle directions were saved for this medication.', max_chars=260)}"
+            )
+        else:
+            selected_slots = build_medication_daily_slots(selected, target_day, now)
+            remaining_slots = len([slot for slot in selected_slots if slot.get("status") != "taken"])
+            summary_text = (
+                f"{med_name}\n"
+                f"{medication_card_line(selected, now)}\n"
+                f"Last taken: {format_timestamp(last_effective_taken_ts(selected))}\n"
+                f"Remaining planned slots on {target_day.isoformat()}: {remaining_slots}\n"
+                f"Directions: {sanitize_text(selected.get('schedule_text') or 'No bottle directions saved yet.', max_chars=260)}"
+            )
         schedule_text = build_medication_schedule_text(selected, now, target_day=target_day)
 
     self.ids.dose_wheel.set_level(safety_action)
@@ -11113,6 +11632,33 @@ def _desktop_refresh_dashboard(self: DesktopMedSafeApp) -> None:
     self.ids.selected_med_summary.text = summary_text
     self.ids.selected_med_schedule.text = schedule_text
     self.ids.selected_med_history.text = build_med_history_text(selected)
+    if "dashboard_focus_hint" in self.ids:
+        if selected and medication_is_archived(selected):
+            self.ids.dashboard_focus_hint.text = (
+                f"Viewing completed medication history. Completed meds stay visible here, but they do not appear in the active checklist."
+            )
+        else:
+            self.ids.dashboard_focus_hint.text = (
+                f"Current regimen: {len(meds)} | Completed history: {len(archived)}. "
+                "Choose any medication here to review schedule details and past doses."
+            )
+    dashboard_picker = self.ids.get("dashboard_med_picker")
+    if dashboard_picker is not None:
+        current_label = "Choose medication"
+        selected_id = sanitize_text((selected or {}).get("id") or "", max_chars=32)
+        if selected_id:
+            for label, med_id in picker_values.items():
+                if med_id == selected_id:
+                    current_label = label
+                    break
+        try:
+            dashboard_picker.configure(values=list(picker_values.keys()))
+        except Exception:
+            pass
+        try:
+            dashboard_picker.set(current_label)
+        except Exception:
+            pass
     self.ids.dashboard_nudge.text = build_dashboard_nudge_text(
         selected,
         self.current_recovery_support_state(),
@@ -11135,7 +11681,7 @@ def _desktop_refresh_dashboard(self: DesktopMedSafeApp) -> None:
 
 def _desktop_med_by_id(self: DesktopMedSafeApp, med_id: str) -> Optional[Dict[str, Any]]:
     target = sanitize_text(med_id, max_chars=32)
-    for med in self.data_cache.get("meds", []) or []:
+    for med in all_stored_medications(self.data_cache):
         if str(med.get("id")) == target:
             return med
     return None
@@ -11250,7 +11796,7 @@ def _desktop_refresh_safety_ui(self: DesktopMedSafeApp) -> None:
 
 
 def _desktop_trigger_safety_scan(self: DesktopMedSafeApp, reason: str = "manual safety scan", *, announce: bool = False) -> None:
-    meds = [self.clone_med_snapshot(med) for med in list(self.data_cache.get("meds") or [])]
+    meds = [self.clone_med_snapshot(med) for med in list(active_medications(self.data_cache))]
     state = safety_reviews_defaults()
     state["timestamp"] = time.time()
     state["signature"] = regimen_signature(meds)
@@ -11259,6 +11805,7 @@ def _desktop_trigger_safety_scan(self: DesktopMedSafeApp, reason: str = "manual 
     self.data_cache["safety_reviews"] = state
     self.safety_scan_request_id += 1
     request_id = self.safety_scan_request_id
+    self._cleanup_safety_scan_process(terminate=True)
     self.refresh_dashboard()
     self.refresh_safety_ui()
     if not meds:
@@ -11276,17 +11823,24 @@ def _desktop_trigger_safety_scan(self: DesktopMedSafeApp, reason: str = "manual 
     if announce:
         self.set_status(f"Scanning safety for {len(meds)} medication(s)...")
 
-    def worker() -> None:
+    def launcher() -> None:
         try:
             if not self.vault:
                 raise RuntimeError("Dose safety vault unavailable.")
             key = self.vault.get_or_create_key()
-            result = assess_all_medications_with_llm(key, meds, time.time(), settings, reason=reason)
-            self.run_on_ui_thread(self._safety_scan_done, request_id, result, announce)
+            ctx = mp.get_context("spawn")
+            result_queue = ctx.Queue()
+            process = ctx.Process(
+                target=all_meds_safety_process_worker,
+                args=(result_queue, key, meds, time.time(), settings, sanitize_text(reason, max_chars=160)),
+                daemon=True,
+            )
+            process.start()
+            self.run_on_ui_thread(self._safety_scan_process_started, request_id, process, result_queue, announce)
         except Exception as exc:
             self.run_on_ui_thread(self._safety_scan_failed, request_id, str(exc), announce)
 
-    threading.Thread(target=worker, daemon=True).start()
+    threading.Thread(target=launcher, daemon=True).start()
 
 
 def _desktop_safety_scan_done(self: DesktopMedSafeApp, request_id: int, result: Dict[str, Any], announce: bool = False) -> None:
@@ -11525,6 +12079,499 @@ def _desktop_on_reset_exercise_settings(self: DesktopMedSafeApp) -> None:
     self.set_status("Exercise reminder defaults restored.")
 
 
+def _desktop_refresh_from_disk(self: DesktopMedSafeApp) -> None:
+    if not self.vault:
+        return
+    try:
+        self.data_cache = ensure_vault_shape(self.vault.load())
+    except RuntimeError as exc:
+        self.data_cache = vault_defaults()
+        if self.main_ui_started:
+            self.set_status(str(exc))
+        return
+    if self.selected_med_id and self.med_by_id(self.selected_med_id) is None:
+        self.selected_med_id = None
+    if not self.selected_med_id:
+        ranked_active = sorted(
+            active_medications(self.data_cache),
+            key=lambda med: (
+                0 if medication_due_status(med)["overdue"] else 1 if medication_due_status(med)["due_now"] else 2,
+                medication_due_status(med)["next_ts"] or float("inf"),
+                sanitize_text(med.get("name"), max_chars=120).lower(),
+            ),
+        )
+        if ranked_active:
+            self.selected_med_id = str(ranked_active[0].get("id"))
+        else:
+            ranked_archived = sorted(
+                archived_medications(self.data_cache),
+                key=lambda med: (
+                    -medication_archived_ts(med),
+                    -last_effective_taken_ts(med),
+                    sanitize_text(med.get("name"), max_chars=120).lower(),
+                ),
+            )
+            if ranked_archived:
+                self.selected_med_id = str(ranked_archived[0].get("id"))
+    self._restore_saved_dose_safety_review()
+    self.refresh_ui()
+
+
+def _desktop_refresh_med_list(self: DesktopMedSafeApp) -> None:
+    med_list = self.ids.med_list
+    med_list.clear_widgets()
+    now = time.time()
+    active = sorted(
+        active_medications(self.data_cache),
+        key=lambda item: (
+            0 if medication_due_status(item, now)["overdue"] else 1 if medication_due_status(item, now)["due_now"] else 2,
+            medication_due_status(item, now)["next_ts"] or float("inf"),
+            sanitize_text(item.get("name"), max_chars=120).lower(),
+        ),
+    )
+    archived = sorted(
+        archived_medications(self.data_cache),
+        key=lambda item: (
+            -medication_archived_ts(item),
+            -last_effective_taken_ts(item),
+            sanitize_text(item.get("name"), max_chars=120).lower(),
+        ),
+    )
+    if active:
+        med_list.add_section("Current Regimen")
+        for med in active:
+            title = sanitize_text(med.get("name"), max_chars=120)
+            prefix = "Selected | " if str(med.get("id")) == self.selected_med_id else ""
+            med_list.add_widget(
+                DesktopListItem(
+                    text=prefix + title,
+                    secondary_text=medication_card_line(med, now),
+                    on_release=lambda _widget, med_id=str(med.get("id")): self.select_med(med_id),
+                )
+            )
+    if archived:
+        med_list.add_section("Completed / History")
+        for med in archived:
+            title = sanitize_text(med.get("name"), max_chars=120)
+            prefix = "Selected | " if str(med.get("id")) == self.selected_med_id else ""
+            med_list.add_widget(
+                DesktopListItem(
+                    text=prefix + title,
+                    secondary_text=medication_card_line(med, now),
+                    on_release=lambda _widget, med_id=str(med.get("id")): self.select_med(med_id),
+                )
+            )
+    if not active and not archived:
+        med_list.add_section("No medications saved yet")
+    if "med_list_summary" in self.ids:
+        self.ids.med_list_summary.text = (
+            f"Current regimen: {len(active)} | Completed history: {len(archived)}. "
+            "Select any item to review it on the dashboard or in the medication editor."
+        )
+
+
+def _desktop_refresh_form(self: DesktopMedSafeApp) -> None:
+    med = self.current_selected_med()
+    selected_any = self.med_by_id(self.selected_med_id or "") if self.selected_med_id else None
+    if med is None:
+        self.last_form_med_id = None
+        if selected_any is not None and medication_is_archived(selected_any):
+            med_name = sanitize_text(selected_any.get("name") or "Medication", max_chars=120)
+            self.ids.form_selection.text = f"Completed: {med_name}"
+            self.ids.form_schedule_preview.text = (
+                f"{medication_archive_label(selected_any)}\n"
+                "This medication is kept for history only. Use New Medication to add a current regimen entry."
+            )
+            if "med_form_hint" in self.ids:
+                self.ids.med_form_hint.text = (
+                    "Completed medications are read-only in this editor so their history stays intact. "
+                    "Use New Medication to add something back into the current regimen."
+                )
+        else:
+            self.ids.form_selection.text = "Creating a new medication"
+            self.ids.form_schedule_preview.text = "Saved schedules appear below."
+            if "med_form_hint" in self.ids:
+                self.ids.med_form_hint.text = (
+                    "Create a current regimen entry here. When a medication is finished, use Complete / Archive to keep its history."
+                )
+        self.set_field_text("med_name", "", force=True)
+        self.set_field_text("dose_mg", "", force=True)
+        self.set_field_text("interval_h", "", force=True)
+        self.set_field_text("max_daily", "", force=True)
+        self.set_field_text("first_dose_time", "", force=True)
+        self.set_field_text("custom_times_text", "", force=True)
+        self.set_field_text("schedule_text", "", force=True)
+        self.set_field_text("med_notes", "", force=True)
+        return
+    med_id = str(med.get("id"))
+    force_sync = med_id != self.last_form_med_id
+    self.ids.form_selection.text = f"Editing: {sanitize_text(med.get('name'), max_chars=120)}"
+    self.set_field_text("med_name", sanitize_text(med.get("name") or "", max_chars=120), force=force_sync)
+    self.set_field_text("dose_mg", f"{safe_float(med.get('dose_mg')):g}" if safe_float(med.get("dose_mg")) else "", force=force_sync)
+    self.set_field_text("interval_h", f"{safe_float(med.get('interval_hours')):g}" if safe_float(med.get("interval_hours")) else "", force=force_sync)
+    self.set_field_text("max_daily", f"{safe_float(med.get('max_daily_mg')):g}" if safe_float(med.get("max_daily_mg")) else "", force=force_sync)
+    self.set_field_text("first_dose_time", sanitize_text(med.get("first_dose_time") or "", max_chars=20), force=force_sync)
+    self.set_field_text("custom_times_text", sanitize_text(med.get("custom_times_text") or "", max_chars=320), force=force_sync)
+    self.set_field_text("schedule_text", sanitize_text(med.get("schedule_text") or "", max_chars=240), force=force_sync)
+    self.set_field_text("med_notes", sanitize_text(med.get("notes") or "", max_chars=500), force=force_sync)
+    self.ids.form_schedule_preview.text = medication_card_line(med) + "\n" + build_medication_schedule_text(med)
+    if "med_form_hint" in self.ids:
+        self.ids.med_form_hint.text = (
+            "Save edits, run a focused safety check, log a dose, or complete/archive this medication when it leaves the current regimen."
+        )
+    self.last_form_med_id = med_id
+
+
+def _desktop_text_size_base_font_size(self: DesktopMedSafeApp) -> int:
+    choice = normalize_setting_choice(self.settings_data.get("text_size"), TEXT_SIZE_OPTIONS, "Default")
+    return int(TEXT_SIZE_BASE_FONT_MAP.get(choice, TEXT_SIZE_BASE_FONT_MAP["Default"]))
+
+
+def _desktop_sync_text_size_widgets(self: DesktopMedSafeApp) -> None:
+    if ctk is None:
+        return
+    base = self.text_size_base_font_size()
+    for value in list(self.ids.values()):
+        widget = getattr(value, "widget", value)
+        if widget is None:
+            continue
+        class_name = widget.__class__.__name__
+        try:
+            if class_name == "CTkTextbox":
+                widget.configure(font=ctk.CTkFont(size=base))
+            elif class_name == "CTkEntry":
+                widget.configure(font=ctk.CTkFont(size=max(12, base)))
+            elif class_name == "CTkOptionMenu":
+                widget.configure(font=ctk.CTkFont(size=max(12, base)))
+            elif class_name == "CTkButton":
+                widget.configure(font=ctk.CTkFont(size=max(12, base), weight="bold"))
+        except Exception:
+            continue
+    assistant_box = getattr(self.ids.get("assistant_history"), "widget", None)
+    if assistant_box is not None:
+        self.configure_markdown_textbox(assistant_box)
+
+
+def _desktop_configure_markdown_textbox(self: DesktopMedSafeApp, textbox: Any, *, base_size: Optional[int] = None) -> None:
+    try:
+        text_widget = textbox._textbox
+    except Exception:
+        return
+    size = max(11, min(24, int(base_size or self.text_size_base_font_size())))
+    meta_size = max(9, size - 2)
+    code_size = max(10, size - 1)
+    text_widget.configure(
+        font=("DejaVu Sans", size),
+        foreground=DESKTOP_TEXT,
+        background=DESKTOP_SURFACE_ALT,
+        insertbackground=DESKTOP_TEXT,
+        spacing1=1,
+        spacing2=1,
+        spacing3=5,
+    )
+    text_widget.tag_config("md_you_header", foreground=DESKTOP_WARNING, font=("DejaVu Sans", size, "bold"))
+    text_widget.tag_config("md_assistant_header", foreground=DESKTOP_ACCENT, font=("DejaVu Sans", size, "bold"))
+    text_widget.tag_config("md_meta", foreground=DESKTOP_MUTED, font=("DejaVu Sans", meta_size))
+    text_widget.tag_config("md_h1", foreground=DESKTOP_ACCENT, font=("DejaVu Sans", size + 4, "bold"), spacing1=8, spacing3=6)
+    text_widget.tag_config("md_h2", foreground=DESKTOP_WARNING, font=("DejaVu Sans", size + 2, "bold"), spacing1=6, spacing3=4)
+    text_widget.tag_config("md_h3", foreground="#7fd0c6", font=("DejaVu Sans", size + 1, "bold"), spacing1=4, spacing3=3)
+    text_widget.tag_config("md_bold", foreground=DESKTOP_TEXT, font=("DejaVu Sans", size, "bold"))
+    text_widget.tag_config("md_italic", foreground="#dce9e6", font=("DejaVu Sans", size, "italic"))
+    text_widget.tag_config("md_code_inline", foreground="#ffdd8f", background="#0f1922", font=("DejaVu Sans Mono", code_size))
+    text_widget.tag_config(
+        "md_code_block",
+        foreground="#9fe7d9",
+        background="#0f1922",
+        font=("DejaVu Sans Mono", code_size),
+        lmargin1=14,
+        lmargin2=14,
+        spacing1=4,
+        spacing3=6,
+    )
+    text_widget.tag_config("md_quote_bar", foreground="#6fb9c1", font=("DejaVu Sans Mono", size, "bold"))
+    text_widget.tag_config("md_quote", foreground="#cfe6eb", font=("DejaVu Sans", size, "italic"), lmargin1=16, lmargin2=16)
+    text_widget.tag_config("md_link", foreground="#84c8ff", underline=True)
+    text_widget.tag_config("md_list_marker", foreground=DESKTOP_ACCENT, font=("DejaVu Sans Mono", size, "bold"))
+    text_widget.tag_config("md_list_text", foreground=DESKTOP_TEXT, font=("DejaVu Sans", size), lmargin2=24)
+    text_widget.tag_config("md_hr", foreground=DESKTOP_MUTED, font=("DejaVu Sans Mono", meta_size), spacing1=6, spacing3=8)
+    for tag_name in ("md_bold", "md_italic", "md_code_inline", "md_link"):
+        try:
+            text_widget.tag_raise(tag_name)
+        except Exception:
+            pass
+
+
+def _desktop_clear_markdown_widgets(self: DesktopMedSafeApp, textbox: Any) -> None:
+    for widget in getattr(textbox, "_markdown_widgets", []):
+        try:
+            widget.destroy()
+        except Exception:
+            pass
+    setattr(textbox, "_markdown_widgets", [])
+
+
+def _desktop_copy_text_to_clipboard(self: DesktopMedSafeApp, value: str, label: str = "Text") -> None:
+    if self.window is None:
+        return
+    try:
+        self.window.clipboard_clear()
+        self.window.clipboard_append(sanitize_text(value, max_chars=20000))
+        self.window.update_idletasks()
+        self.set_status(f"{label} copied to clipboard.")
+    except Exception:
+        pass
+
+
+def _desktop_insert_markdown_copy_button(
+    self: DesktopMedSafeApp,
+    textbox: Any,
+    text_widget: Any,
+    value: str,
+    label: str = "Copy",
+) -> None:
+    button = tk.Button(
+        text_widget,
+        text=label,
+        command=lambda copy_value=value, copy_label=label: self.copy_text_to_clipboard(copy_value, copy_label),
+        bg=DESKTOP_ACCENT,
+        fg="#041310",
+        activebackground="#2eb5ab",
+        activeforeground="#041310",
+        relief="flat",
+        bd=0,
+        padx=8,
+        pady=2,
+        cursor="hand2",
+        font=("DejaVu Sans", 9, "bold"),
+    )
+    widgets = getattr(textbox, "_markdown_widgets", [])
+    widgets.append(button)
+    setattr(textbox, "_markdown_widgets", widgets)
+    text_widget.window_create("end", window=button, padx=8)
+
+
+def _desktop_insert_markdown_inline(
+    self: DesktopMedSafeApp,
+    text_widget: Any,
+    line: str,
+    *,
+    default_tag: Optional[str] = None,
+) -> None:
+    token_re = re.compile(
+        r"(!\[[^\]]*\]\([^)]+\)|\[[^\]]+\]\([^)]+\)|`[^`\n]+`|\*\*[^*\n]+?\*\*|__[^_\n]+?__|(?<!\*)\*[^*\n]+?\*(?!\*)|(?<!_)_[^_\n]+?_(?!_))"
+    )
+    pos = 0
+    for match in token_re.finditer(line):
+        if match.start() > pos:
+            text_widget.insert("end", line[pos:match.start()], (default_tag,) if default_tag else ())
+        token = match.group(0)
+        image = re.match(r"!\[([^\]]*)\]\(([^)]+)\)", token)
+        link = MARKDOWN_LINK_RE.match(token)
+        if image:
+            alt, url = image.groups()
+            text_widget.insert("end", f"[image: {alt or 'untitled'}]", ("md_link",))
+            text_widget.insert("end", f" ({url})", ("md_meta",))
+        elif link:
+            label, url = link.groups()
+            text_widget.insert("end", label, ("md_link",))
+            text_widget.insert("end", f" ({url})", ("md_meta",))
+        elif token.startswith("`") and token.endswith("`"):
+            tags = ("md_code_inline", default_tag) if default_tag else ("md_code_inline",)
+            text_widget.insert("end", token[1:-1], tags)
+        elif token.startswith(("**", "__")) and token.endswith(("**", "__")):
+            tags = ("md_bold", default_tag) if default_tag else ("md_bold",)
+            text_widget.insert("end", token[2:-2], tags)
+        elif token.startswith(("*", "_")) and token.endswith(("*", "_")):
+            tags = ("md_italic", default_tag) if default_tag else ("md_italic",)
+            text_widget.insert("end", token[1:-1], tags)
+        else:
+            text_widget.insert("end", token, (default_tag,) if default_tag else ())
+        pos = match.end()
+    if pos < len(line):
+        text_widget.insert("end", line[pos:], (default_tag,) if default_tag else ())
+
+
+def _desktop_insert_markdown_text(self: DesktopMedSafeApp, textbox: Any, value: Any, *, max_chars: int = 12000) -> None:
+    try:
+        text_widget = textbox._textbox
+    except Exception:
+        textbox.insert("end", markdown_to_plain_text(value, max_chars=max_chars))
+        return
+    text = sanitize_text(value, max_chars=max_chars).replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+    if not text:
+        return
+    lines = text.split("\n")
+    line_index = 0
+    while line_index < len(lines):
+        raw_line = lines[line_index]
+        stripped = raw_line.strip()
+        fence = re.match(r"^```([\w.+-]*)\s*$", stripped)
+        if fence:
+            line_index += 1
+            code_lines: List[str] = []
+            while line_index < len(lines):
+                if re.match(r"^```[\w.+-]*\s*$", lines[line_index].strip()):
+                    break
+                code_lines.append(lines[line_index])
+                line_index += 1
+            code_text = "\n".join(code_lines).rstrip("\n")
+            label = fence.group(1).strip() or "text"
+            text_widget.insert("end", f" code: {label} ", ("md_meta",))
+            if code_text:
+                self.insert_markdown_copy_button(textbox, text_widget, code_text, "Copy code")
+            text_widget.insert("end", "\n", ("md_meta",))
+            if code_text:
+                text_widget.insert("end", code_text + "\n", ("md_code_block",))
+            else:
+                text_widget.insert("end", "[empty code block]\n", ("md_meta",))
+            if line_index < len(lines):
+                line_index += 1
+            text_widget.insert("end", "\n")
+            continue
+        if re.fullmatch(r"\s*([-*_])(?:\s*\1){2,}\s*", raw_line):
+            text_widget.insert("end", "─" * 54 + "\n", ("md_hr",))
+            line_index += 1
+            continue
+        heading = re.match(r"^(#{1,6})\s+(.+)$", raw_line)
+        if heading:
+            level = min(len(heading.group(1)), 3)
+            text_widget.insert("end", heading.group(2).strip() + "\n", (f"md_h{level}",))
+            line_index += 1
+            continue
+        quote = re.match(r"^\s*>\s?(.*)$", raw_line)
+        if quote:
+            text_widget.insert("end", "┃ ", ("md_quote_bar",))
+            self.insert_markdown_inline(text_widget, quote.group(1), default_tag="md_quote")
+            text_widget.insert("end", "\n")
+            line_index += 1
+            continue
+        unordered = re.match(r"^(\s*)([-+*])\s+(.+)$", raw_line)
+        if unordered:
+            text_widget.insert("end", unordered.group(1) + "• ", ("md_list_marker",))
+            self.insert_markdown_inline(text_widget, unordered.group(3), default_tag="md_list_text")
+            text_widget.insert("end", "\n")
+            line_index += 1
+            continue
+        ordered = re.match(r"^(\s*)(\d+)\.\s+(.+)$", raw_line)
+        if ordered:
+            text_widget.insert("end", f"{ordered.group(1)}{ordered.group(2)}. ", ("md_list_marker",))
+            self.insert_markdown_inline(text_widget, ordered.group(3), default_tag="md_list_text")
+            text_widget.insert("end", "\n")
+            line_index += 1
+            continue
+        self.insert_markdown_inline(text_widget, raw_line)
+        text_widget.insert("end", "\n")
+        line_index += 1
+
+
+def _desktop_refresh_assistant_history(self: DesktopMedSafeApp) -> None:
+    history = list(self.data_cache.get("assistant_history") or [])
+    box = getattr(self.ids.get("assistant_history"), "widget", None)
+    if box is None:
+        return
+    try:
+        box.configure(state="normal")
+        self.clear_markdown_widgets(box)
+        box.delete("1.0", tk.END)
+        self.configure_markdown_textbox(box)
+        text_widget = box._textbox
+    except Exception:
+        self.ids.assistant_history.text = "No assistant messages yet." if not history else "\n\n".join(
+            markdown_to_plain_text(item.get("content") or "", max_chars=1200) for item in history[-12:]
+        )
+        return
+    if not history:
+        text_widget.insert("end", "No assistant messages yet.\n", ("md_meta",))
+    else:
+        visible_history = history[-12:]
+        for index, item in enumerate(visible_history):
+            speaker = "You" if item.get("role") == "user" else "MedSafe"
+            header_tag = "md_you_header" if item.get("role") == "user" else "md_assistant_header"
+            mode = normalize_assistant_mode(item.get("mode") or "General")
+            timestamp = safe_float(item.get("timestamp") or 0.0)
+            when = time.strftime("%I:%M %p", time.localtime(timestamp)).lstrip("0") if timestamp > 0 else ""
+            text_widget.insert("end", speaker, (header_tag,))
+            if mode != "General":
+                text_widget.insert("end", f" | {mode}", ("md_meta",))
+            if when:
+                text_widget.insert("end", f" | {when}", ("md_meta",))
+            text_widget.insert("end", "\n")
+            self.insert_markdown_text(box, item.get("content") or "", max_chars=2000)
+            if index != len(visible_history) - 1:
+                text_widget.insert("end", "─" * 54 + "\n\n", ("md_hr",))
+    try:
+        box.see("end")
+    except Exception:
+        pass
+    try:
+        box.configure(state="disabled")
+    except Exception:
+        pass
+
+
+def _desktop_on_delete_med(self: DesktopMedSafeApp) -> None:
+    med = self.current_selected_med()
+    if not med:
+        selected_any = self.med_by_id(self.selected_med_id or "") if self.selected_med_id else None
+        if selected_any is not None and medication_is_archived(selected_any):
+            self.set_status("This medication is already completed and kept in history.")
+        else:
+            self.set_status("Select a current medication first.")
+        return
+    original_data = self.clone_data_snapshot()
+    original_selected_id = self.selected_med_id
+    name = sanitize_text(med.get("name"), max_chars=120)
+    archived_med = normalized_med_entry(self.clone_med_snapshot(med), default_archived_ts=time.time())
+    if archived_med is None:
+        self.set_status("Could not archive that medication right now.")
+        return
+    archived_med["archived_ts"] = max(time.time(), medication_archived_ts(archived_med))
+    med_id = str(med.get("id"))
+    self.data_cache["meds"] = [item for item in self.data_cache.get("meds", []) or [] if str(item.get("id")) != med_id]
+    archives = [item for item in list(self.data_cache.get("med_archives") or []) if str(item.get("id")) != med_id]
+    archives.append(archived_med)
+    archives.sort(
+        key=lambda item: (
+            medication_archived_ts(item),
+            last_effective_taken_ts(item),
+            sanitize_text(item.get("name"), max_chars=120).lower(),
+        )
+    )
+    self.data_cache["med_archives"] = archives[-240:]
+    self.selected_med_id = med_id
+    self.last_form_med_id = None
+    self.last_check_level = "Medium"
+    self.last_check_display = "Medication completed"
+    self.last_check_message = f"{name} was removed from the current regimen and kept in history."
+    if not self.save_data():
+        self.data_cache = original_data
+        self.selected_med_id = original_selected_id
+        self.refresh_ui()
+        return
+    self.refresh_ui()
+    self.trigger_safety_scan("medication removal", announce=False)
+    self.set_status(f"Completed {name}. Past doses are still saved in history.")
+
+
+def _desktop_on_text_size_change(self: DesktopMedSafeApp, choice: str) -> None:
+    normalized = normalize_setting_choice(choice, TEXT_SIZE_OPTIONS, self.settings_data.get("text_size", "Default"))
+    self.apply_text_size_setting(normalized)
+    if self.paths is not None:
+        save_settings({"text_size": normalized}, self.paths)
+        self.settings_data = load_settings(self.paths)
+    else:
+        self.settings_data["text_size"] = normalized
+    if "text_size_menu" in self.ids:
+        try:
+            self.ids.text_size_menu.set(normalized)
+        except Exception:
+            pass
+    if self.main_ui_started:
+        self.sync_text_size_widgets()
+        self.refresh_ui()
+    self.set_status(f"Text size set to {normalized}.")
+
+
 DesktopMedSafeApp._build_exercise_tab = _desktop_build_exercise_tab
 DesktopMedSafeApp.refresh_exercise_ui = _desktop_refresh_exercise_ui
 DesktopMedSafeApp.on_log_exercise_habit = _desktop_on_log_exercise_habit
@@ -11543,6 +12590,20 @@ DesktopMedSafeApp.on_checklist_take_dose = _desktop_on_checklist_take_dose
 DesktopMedSafeApp.on_checklist_uncheck_dose = _desktop_on_checklist_uncheck_dose
 DesktopMedSafeApp.refresh_dashboard = _desktop_refresh_dashboard
 DesktopMedSafeApp.med_by_id = _desktop_med_by_id
+DesktopMedSafeApp.refresh_from_disk = _desktop_refresh_from_disk
+DesktopMedSafeApp.refresh_med_list = _desktop_refresh_med_list
+DesktopMedSafeApp.refresh_form = _desktop_refresh_form
+DesktopMedSafeApp.text_size_base_font_size = _desktop_text_size_base_font_size
+DesktopMedSafeApp.sync_text_size_widgets = _desktop_sync_text_size_widgets
+DesktopMedSafeApp.configure_markdown_textbox = _desktop_configure_markdown_textbox
+DesktopMedSafeApp.clear_markdown_widgets = _desktop_clear_markdown_widgets
+DesktopMedSafeApp.copy_text_to_clipboard = _desktop_copy_text_to_clipboard
+DesktopMedSafeApp.insert_markdown_copy_button = _desktop_insert_markdown_copy_button
+DesktopMedSafeApp.insert_markdown_inline = _desktop_insert_markdown_inline
+DesktopMedSafeApp.insert_markdown_text = _desktop_insert_markdown_text
+DesktopMedSafeApp.refresh_assistant_history = _desktop_refresh_assistant_history
+DesktopMedSafeApp.on_delete_med = _desktop_on_delete_med
+DesktopMedSafeApp.on_text_size_change = _desktop_on_text_size_change
 
 
 MedSafeApp = DesktopMedSafeApp
