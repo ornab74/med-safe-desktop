@@ -19,32 +19,34 @@ This README is intentionally long. It is both a practical operating manual and a
 3. [Core Principles](#core-principles)
 4. [What The App Does](#what-the-app-does)
 5. [Feature Inventory](#feature-inventory)
-6. [Screens, Tabs, And Workflow Philosophy](#screens-tabs-and-workflow-philosophy)
-7. [Architecture](#architecture)
-8. [System Diagrams](#system-diagrams)
-9. [Platform Support](#platform-support)
-10. [Quick Start](#quick-start)
-11. [Installation Guides](#installation-guides)
-12. [First-Start Flow](#first-start-flow)
-13. [User Guide](#user-guide)
-14. [Medication Scheduling Model](#medication-scheduling-model)
-15. [Bottle Photo Import](#bottle-photo-import)
-16. [Dental Workflow](#dental-workflow)
-17. [Exercise And Walking Reminder System](#exercise-and-walking-reminder-system)
-18. [Assistant Workflow](#assistant-workflow)
-19. [Settings And Runtime Controls](#settings-and-runtime-controls)
-20. [Security Model](#security-model)
-21. [Data Layout](#data-layout)
-22. [Dependency Locking](#dependency-locking)
-23. [Development Notes](#development-notes)
-24. [Troubleshooting](#troubleshooting)
-25. [FAQ](#faq)
-26. [Science Monograph](#science-monograph)
-27. [Appendix A: Mathematical Symbols](#appendix-a-mathematical-symbols)
-28. [Appendix B: Example Vault Shapes](#appendix-b-example-vault-shapes)
-29. [Appendix C: File And Folder Map](#appendix-c-file-and-folder-map)
-30. [Appendix D: Operational Checklists](#appendix-d-operational-checklists)
-31. [Safety Note](#safety-note)
+6. [Advanced Feature Map](#advanced-feature-map)
+7. [Screens, Tabs, And Workflow Philosophy](#screens-tabs-and-workflow-philosophy)
+8. [Architecture](#architecture)
+9. [System Diagrams](#system-diagrams)
+10. [Platform Support](#platform-support)
+11. [Quick Start](#quick-start)
+12. [Installation Guides](#installation-guides)
+13. [First-Start Flow](#first-start-flow)
+14. [User Guide](#user-guide)
+15. [Medication Scheduling Model](#medication-scheduling-model)
+16. [Medication Safety Workflow](#medication-safety-workflow)
+17. [Bottle Photo Import](#bottle-photo-import)
+18. [Dental Workflow](#dental-workflow)
+19. [Exercise And Walking Reminder System](#exercise-and-walking-reminder-system)
+20. [Chat Workflow](#chat-workflow)
+21. [Settings And Runtime Controls](#settings-and-runtime-controls)
+22. [Security Model](#security-model)
+23. [Data Layout](#data-layout)
+24. [Dependency Locking](#dependency-locking)
+25. [Development Notes](#development-notes)
+26. [Troubleshooting](#troubleshooting)
+27. [FAQ](#faq)
+28. [Science Monograph](#science-monograph)
+29. [Appendix A: Mathematical Symbols](#appendix-a-mathematical-symbols)
+30. [Appendix B: Example Vault Shapes](#appendix-b-example-vault-shapes)
+31. [Appendix C: File And Folder Map](#appendix-c-file-and-folder-map)
+32. [Appendix D: Operational Checklists](#appendix-d-operational-checklists)
+33. [Safety Note](#safety-note)
 
 ## Executive Summary
 
@@ -52,14 +54,17 @@ MedSafe Desktop is a desktop application built with `customtkinter` and a local 
 
 At a high level, the application provides:
 
-- A medication planner with named dose times, interval logic, max-per-day tracking, and a daily checklist.
-- A dashboard that shows due, missed, upcoming, and recently completed items in a human-readable format.
-- Bottle-photo support for turning label text and packaging context into medication entries and review notes.
-- Dental hygiene reminders for brushing, flossing, and rinsing.
-- Dental recovery journaling for post-procedure monitoring.
-- Exercise reminders for walking, light exercise, and stretching.
-- An optional offline Gemma runtime for local text and image-assisted workflow support.
-- Startup password protection and local vault key rotation controls.
+- A medication planner with named dose times, interval logic, rolling 24-hour totals, max-per-day tracking, and date-aware checklist review.
+- A Care Compass dashboard that combines meds, regimen safety, routines, privacy state, and the best next workflow action.
+- Focused per-medication safety checks plus all-medication integration scans with deterministic fallback.
+- Bottle-photo support for medication import and review, including native image input when the local runtime supports it.
+- Dental hygiene reminders for brushing, flossing, and rinsing, plus dental photo review and recovery notes.
+- A recovery support studio with clean-day tracking, points, milestones, mood/craving check-ins, resets, reminders, and a coping plan.
+- Exercise reminders for walking, light exercise, and stretching with daily minute goals.
+- A local Gemma assistant with General, Therapy, and Recovery Coach modes, quick prompts, context preview, markdown rendering, and non-blocking subprocess inference.
+- A Help and Flow Guide with an A-K workflow path, feature help, and a best-path simulation.
+- A command palette for fast navigation and cross-workflow actions.
+- Startup password protection, local vault key rotation, text-size controls, checklist undo policy, backend selection, and model sealing controls.
 
 The app is not intended to diagnose disease, prescribe treatment, or replace instructions from a clinician, pharmacist, or dentist. It is a local organization and reminder system.
 
@@ -121,8 +126,10 @@ MedSafe Desktop currently combines several operational domains in one workflow s
 - Store medication name, dose amount, interval, max daily amount, bottle directions, notes, first dose anchor, and optional custom daily times.
 - Build daily slots such as `Breakfast`, `Lunch`, `Dinner`, and `Nighttime`.
 - Show due-now, upcoming, and missed state based on the computer clock.
-- Provide a daily checklist with explicit row state and dose logging.
-- Track recent history and daily progression without forcing the user to reconstruct the day mentally.
+- Provide a date-aware daily checklist with explicit row state, dose logging, missed-slot reconciliation, and optional undo.
+- Track active medications and completed/archived medication history without forcing the user to reconstruct the day mentally.
+- Run focused per-medication safety checks and keep a saved safety review in the encrypted vault.
+- Integrate all active medications into a regimen-level safety scan after changes or on demand.
 
 ### Bottle Review
 
@@ -134,13 +141,20 @@ MedSafe Desktop currently combines several operational domains in one workflow s
 
 - Track brushing, flossing, and rinsing cadence.
 - Save hygiene intervals locally.
-- Support photo-based hygiene review workflows.
+- Support photo-based hygiene review workflows with local risk summaries and trend text.
 
 ### Dental Recovery
 
 - Save procedure type and date.
 - Maintain recovery notes and check-in images.
 - Preserve local review summaries and trend context.
+
+### Recovery Support
+
+- Save a recovery focus, clean-since date, motivation, coping plan, and reminder time.
+- Track clean days, points, next milestones, mood, craving level, and recent recovery history.
+- Log daily check-ins or relapse/restart events without losing the larger recovery timeline.
+- Feed recovery context into the local assistant's Recovery Coach mode.
 
 ### Exercise
 
@@ -149,36 +163,85 @@ MedSafe Desktop currently combines several operational domains in one workflow s
 - Provide gentle reminder rhythm for stretching.
 - Track daily minute goals and recently logged sessions.
 
-### Local Assistant
+### Local Chat Assistant
 
 - Offer an optional local assistant context window that can summarize user-entered workflow state and discuss schedule context.
+- Switch between General, Therapy, and Recovery Coach modes.
+- Use quick prompts such as Summarize Today, What Next, Check Safety, and Draft Questions.
+- Preview what vault facts and local context metadata the assistant will emphasize before sending.
+- Run assistant generation in a spawned worker process so the desktop UI stays responsive while Gemma thinks.
 
 ### Settings And Runtime
 
 - Download and seal the model locally.
 - Verify model integrity.
-- Cycle inference backend preference.
+- Cycle inference backend preference across Auto, CPU, and GPU.
 - Toggle native image input support.
 - Add or remove startup-password protection.
 - Rotate the local vault key.
+- Change text size.
+- Control whether checklist rows can be unchecked.
+- Delete the plain model cache after sealing.
 
 ## Feature Inventory
 
 | Area | Capability | Current intent |
 | --- | --- | --- |
-| Dashboard | Cross-domain overview | Present today’s situation quickly |
+| Dashboard | Care Compass | Pick a best next action across medication, routines, safety, and privacy state |
+| Dashboard | Dose Safety card | Show focused dose-safety status and the latest explanatory message |
+| Dashboard | All-Meds Integration | Surface regimen-level safety state beside per-medication checks |
+| Dashboard | Timeline and checklist | Reconstruct the day with due, missed, upcoming, and taken rows |
+| Dashboard | Date-aware checklist | Review earlier or future checklist dates using Prev, Today, Next, and Go |
+| Dashboard | Dashboard focus picker | Inspect active medications and completed medication history from one place |
+| Dashboard | Gentle Nudge and flow snapshot | Keep a short next-step summary and best-path hint visible |
 | Medications | Interval schedule logic | Keep dose timing deterministic |
 | Medications | Named daily slots | Map text directions into real life |
+| Medications | Custom daily times | Override inferred timing with user-authored slots |
 | Medications | Checklist logging | Externalize memory into visible rows |
-| Medications | Missed-dose display | Reduce ambiguity around lateness |
-| Vision | Bottle-photo import | Seed or review medication context |
-| Dental | Hygiene reminders | Support routine continuity |
-| Dental | Recovery journal | Support daily post-procedure tracking |
+| Medications | Missed-dose reconciliation | Reduce ambiguity around lateness and late logging |
+| Medications | Complete / Archive | Remove a medication from the current regimen while preserving dose history |
+| Safety | Focused safety check | Review one selected medication with local model support and stored-rule fallback |
+| Safety | All-meds safety scan | Integrate active regimen context after medication changes or manual scans |
+| Safety | Deterministic fallback | Preserve useful safety summaries even when the model is missing or unavailable |
+| Pill Bottle Scanner | Bottle-photo import | Seed or review medication context from local image files |
+| Pill Bottle Scanner | Native image toggle | Use model-native pixels when supported, or validated image metadata otherwise |
+| Dental | Hygiene reminders | Support brush, floss, and rinse continuity |
+| Dental | Hygiene photo review | Save local review score, rating, summary, and trend context |
+| Dental | Recovery journal | Support post-procedure notes, aftercare context, and photo review |
 | Exercise | Walk/light/stretch reminders | Encourage gentle movement continuity |
-| Assistant | Local context response | Support interpretation without cloud-first assumptions |
+| Exercise | Daily movement goals | Track minutes logged today against user-set goals |
+| Recovery | Recovery support plan | Store motivation, coping plan, reminder time, and clean-since date |
+| Recovery | Check-ins and resets | Track daily notes, relapse/restart events, mood, craving, and timeline history |
+| Recovery | Points and milestones | Show clean days, points, next milestone, and milestone shelf |
+| Chat | Local context response | Support interpretation without cloud-first assumptions |
+| Chat | Mode switching | Tune replies for General, Therapy-style, or Recovery Coach support |
+| Chat | Context preview | Show prompt health, route, selected facts, and local context metadata before sending |
+| Chat | Non-blocking inference | Run Gemma replies in a worker process so the GUI remains responsive |
+| Help | A-K flow guide | Explain the intended workflow from Dashboard through Settings |
+| Help | Best-path simulation | Suggest a next workflow hop from current app state |
+| Commands | Command palette | Jump to common workflows with `Ctrl+K` |
 | Settings | Model runtime controls | Keep offline runtime visible and manageable |
+| Settings | Backend selection | Choose Auto, CPU, or GPU with automatic fallback where possible |
 | Settings | Startup password | Add a second barrier for vault unlock |
-| Settings | Key rotation | Refresh local encryption material |
+| Settings | Key rotation | Refresh local encryption material and reseal protected files |
+| Settings | Text and checklist settings | Adjust text size and checklist undo policy |
+
+## Advanced Feature Map
+
+This section is the short version of what has grown beyond a basic tracker.
+
+- `Care Compass`: a dashboard decision layer that watches due meds, missed meds, routine due states, password state, and model readiness, then points the user to the next useful tab.
+- `Dose Safety`: deterministic medication-schedule checks for intervals, duplicate logs, and rolling 24-hour totals, with optional local model summaries layered on top.
+- `All-Meds Safety`: a regimen scan that compares the active medication set and stores the result for Dashboard and Safety tab review.
+- `Recovery Support Studio`: clean-day counter, points, milestones, mood/craving sliders, reminder time, daily check-ins, relapse/restart logging, motivation, and coping-plan text.
+- `Chat Modes`: General for practical summaries, Therapy for reflective support, and Recovery Coach for recovery-protective next steps.
+- `Chat Context Preview`: prompt-health feedback plus selected medication, dental, movement, recovery, safety, and recent chat facts before the model runs.
+- `Local Context Metadata`: a quantum-inspired local signal packet derived from vault context and system metrics. It is used only to route and structure assistant/safety prompts, not as clinical evidence.
+- `Non-Blocking Model Work`: assistant replies, safety scans, and model tasks run through background workers or spawned subprocesses so long-running inference does not freeze the main window.
+- `Command Palette`: `Ctrl+K` opens direct actions for Review Today, Run Safety Scan, Add Medication, Bottle Photo Import, Recovery Check-In, Open Chat, Security Status, and Settings.
+- `Help & Flow Guide`: an A-K workflow path and feature guide that explain where to go next when the app feels dense.
+- `Security Controls`: first-start setup, unlock screen, startup-password wrapping, add/change/remove password flows, key rotation, encrypted vault, encrypted model sealing, and plain-cache deletion.
+- `Usability Controls`: scrollable control-heavy tabs, screen-aware window sizing, text-size scaling, explicit checklist buttons, and optional checklist undo.
 
 ## Screens, Tabs, And Workflow Philosophy
 
@@ -186,7 +249,11 @@ The interface is organized into tabs because the tasks are related but not ident
 
 - a dashboard for overview,
 - dedicated tabs for structured editing,
+- a safety tab for regimen review,
 - domain-specific tabs for dental and movement,
+- a recovery tab for check-ins, milestones, and coping context,
+- a chat tab for local summaries and reflection,
+- a help tab for flow guidance,
 - a settings area for runtime and security controls.
 
 This separation is deliberate. A user should be able to:
@@ -210,6 +277,8 @@ At the broadest level, the system has five interacting layers:
 
 The presentation layer is responsible for screens, cards, forms, and text visibility. The structured state layer holds medication records, habit reminders, recovery notes, movement logs, and assistant history. The deterministic logic layer computes due states and safety context. The optional model layer contributes parsing and summarization where appropriate. The persistence layer stores encrypted or sealed local data.
 
+The current desktop build also uses a background execution layer for heavier work. Safety scans, assistant replies, model download/sealing, and image-based reviews are launched away from the Tk event loop, and the UI receives results through callbacks or queue polling. This is important because local inference can take long enough that a normal GUI thread would otherwise feel frozen.
+
 ## System Diagrams
 
 ### High-Level Architecture
@@ -219,20 +288,29 @@ flowchart LR
     User[User] --> UI[CustomTkinter UI]
     UI --> Dashboard[Dashboard]
     UI --> Meds[Medication Tab]
-    UI --> Vision[Vision Tab]
+    UI --> Safety[Safety Tab]
+    UI --> Scanner[Pill Bottle Scanner Tab]
     UI --> Dental[Dental Tab]
     UI --> Exercise[Exercise Tab]
-    UI --> Assistant[Assistant Tab]
+    UI --> Recovery[Recovery Tab]
+    UI --> Chat[Chat Tab]
+    UI --> Help[Help Tab]
     UI --> Settings[Settings Tab]
     Meds --> Rules[Deterministic Schedule Rules]
+    Safety --> Rules
     Dental --> Rules
     Exercise --> Rules
-    Vision --> Runtime[Offline Runtime]
-    Assistant --> Runtime
+    Recovery --> Rules
+    Scanner --> Runtime[Offline Runtime]
+    Chat --> Runtime
+    Safety --> Runtime
+    Runtime --> Workers[Background Workers And Subprocesses]
+    Workers --> UI
     Runtime --> Rules
     Rules --> Vault[Encrypted Vault]
     Settings --> Vault
     Settings --> ModelCache[Encrypted Model Store]
+    Help --> Rules
 ```
 
 ### First-Start Flow
@@ -450,15 +528,21 @@ It is not just a landing page. It is a compressed daily control surface.
 
 The dashboard currently includes:
 
+- a Care Compass card,
 - a dose safety card,
+- focused and all-meds safety actions,
 - today’s due and missed counts,
 - a next-due summary,
 - a timeline view,
 - a focused medication summary,
 - a daily checklist,
+- a date selector for checklist review,
 - recent dose history,
 - a dashboard nudge,
+- a best-flow snapshot,
 - model and password status summary.
+
+Care Compass is the dashboard's routing layer. It watches medication due state, missed doses, routine due counts, safety state, password state, and model readiness. The `Act On Best Step` button sends the user to the tab that most likely needs attention: Dashboard, Dental, Exercise, Recovery, Settings, or Safety.
 
 The checklist is especially important. Each row now includes:
 
@@ -466,9 +550,12 @@ The checklist is especially important. Each row now includes:
 - the medication name,
 - the planned dose,
 - the slot label,
-- and the due, taken, or missed state.
+- the due, taken, future, or missed state,
+- and an explicit button for the action available on that row.
 
 This design is intentional. Users should not have to remember which medicine corresponds to which time bucket while scanning the day.
+
+The checklist can also review another date. This makes it useful for checking what happened yesterday, reconciling a missed slot, or previewing the planned slots for a future day. Future checklist rows are visible as planning context but cannot be logged as taken.
 
 ### The Medications Tab
 
@@ -487,9 +574,32 @@ Each medication can include:
 
 The application then uses this structure to generate a daily plan. If custom times are provided, they win. If not, the application tries to infer named slots from text directions. If that also fails, it falls back to interval-derived slots anchored to a first dose time.
 
-### The Vision Tab
+The tab also includes:
 
-The Vision tab is the bottle-photo workspace. It is meant to take local images and preserve the resulting review locally. It is intentionally scrollable so that image review text and import controls remain reachable even on smaller screens.
+- a current regimen list,
+- completed medication history,
+- a saved schedule preview,
+- `Complete / Archive` for moving a medication out of the current regimen while keeping history,
+- `Run Safety Check` for the selected medication,
+- and `Log Dose` for manual dose logging.
+
+### The Safety Tab
+
+The Safety tab is the central place for regimen review. It complements the Dashboard's compact safety cards with a larger view of:
+
+- overall regimen status,
+- the last all-meds scan,
+- the per-medication safety summaries,
+- deterministic fallback results,
+- and local model-enhanced scan output when the model is available.
+
+The focused medication safety check reviews one selected medication. The all-meds scan reviews the active regimen as a set. Both are intentionally conservative: deterministic schedule rules provide the baseline, and the local model can summarize but does not silently replace the schedule math.
+
+### The Pill Bottle Scanner Tab
+
+The Pill Bottle Scanner tab is the bottle-photo workspace. It is meant to take local images and preserve the resulting review locally. It is intentionally scrollable so that image review text and import controls remain reachable even on smaller screens.
+
+The workflow validates image files before use. If native model image input is enabled and supported, the runtime can receive the image path directly. If not, MedSafe still attaches validated image metadata so the local prompt can preserve filename, type, size, hash, and security context without pretending to inspect pixels.
 
 ### The Dental Tab
 
@@ -499,6 +609,8 @@ The Dental tab combines two related but distinct workflows:
 - recovery journaling.
 
 The hygiene area tracks routine cadence for brushing, flossing, and rinsing. The recovery area tracks procedure metadata, aftercare notes, and recovery photo review context.
+
+Dental hygiene review can save a score, rating, summary, risk level, and trend context. Dental recovery review can preserve procedure context, symptom notes, aftercare notes, and local review summaries. These features are organizational support, not dental diagnosis.
 
 ### The Exercise Tab
 
@@ -516,9 +628,48 @@ Each movement type has:
 - a history log,
 - a visible due-state card.
 
-### The Assistant Tab
+The Dashboard also counts due movement routines as part of Care Compass. That means movement does not disappear just because medication state is quiet.
 
-The Assistant tab is scrollable for the same visibility reason as the Vision tab. On smaller displays, chat history can get tall quickly, and the input area should remain accessible without requiring fullscreen mode.
+### The Chat Tab
+
+The Chat tab is laid out as a larger conversation workspace with a collapsible context panel. On smaller displays, chat history can get tall quickly, and the input area should remain accessible without requiring fullscreen mode.
+
+The assistant supports three modes:
+
+- `General`: practical schedule and workflow summaries.
+- `Therapy`: reflective, emotionally grounded support using the same local vault context.
+- `Recovery Coach`: relapse-prevention and recovery-support framing that uses the Recovery tab's clean-day, mood, craving, reminder, and coping-plan context.
+
+The chat tab also includes:
+
+- quick prompt buttons,
+- prompt health feedback,
+- a local context preview,
+- recent chat memory,
+- markdown rendering,
+- copy buttons for assistant text,
+- Enter-to-send and Shift+Enter-for-newline behavior,
+- and a disabled send state while a reply is running.
+
+Chat generation runs in a spawned worker process. The main desktop window polls for completion and streams deltas when the local runtime exposes them, so the rest of the UI should remain usable while the model replies.
+
+### The Help Tab
+
+The Help tab explains the app's intended A-K workflow:
+
+1. Dashboard triage.
+2. Medication shaping.
+3. Checklist reconciliation.
+4. Safety review.
+5. Bottle-photo import.
+6. Dental routines.
+7. Movement.
+8. Recovery.
+9. Chat.
+10. Settings.
+11. Secure closeout.
+
+It also includes a best-path simulation and feature guide. This is useful when the app has enough features that the next good move is no longer obvious.
 
 ### The Settings Tab
 
@@ -529,7 +680,26 @@ The old `Model` label has been renamed to `Settings` because the tab now include
 - native image input toggle,
 - startup password management,
 - key rotation,
-- model/plain-cache cleanup.
+- model/plain-cache cleanup,
+- text-size scaling,
+- startup setup status,
+- checklist undo policy,
+- and a security status summary.
+
+### The Command Palette
+
+Press `Ctrl+K` to open the command palette. It offers direct jumps and actions for:
+
+- Review Today,
+- Run Safety Scan,
+- Add Medication,
+- Bottle Photo Import,
+- Recovery Check-In,
+- Open Chat,
+- Chat: What Next?,
+- Security Status,
+- Help & Flow Guide,
+- Settings & Security.
 
 ## Medication Scheduling Model
 
@@ -592,6 +762,47 @@ The model should not replace the schedule math.
 ### Daily Checklist Logic
 
 The daily checklist is generated from today’s slots across saved medications. It sorts rows by scheduled time and displays the medication name alongside the slot label and dose. Logging a row first selects the corresponding medication context, then records the event, then recomputes the dashboard.
+
+The checklist is now date-aware. The date picker can move backward, return to today, move forward, or jump to a typed date. Past and present rows can be reconciled through explicit row actions. Future rows are shown as planning context, not as loggable events.
+
+Checklist undo is controlled from Settings. When enabled, a taken checklist row can be unchecked, which removes the matching recorded dose event for that planned slot. When disabled, completed rows stay locked to reduce accidental history changes.
+
+## Medication Safety Workflow
+
+Medication safety in MedSafe is deliberately layered.
+
+### Deterministic Baseline
+
+The deterministic baseline checks facts the app can compute directly:
+
+- stored dose amount,
+- interval hours,
+- max daily amount,
+- last taken time,
+- rolling 24-hour total,
+- duplicate-log window,
+- due and missed slot state,
+- and whether schedule details are missing.
+
+This baseline produces a `Safe`, `Caution`, or `Unsafe` style action before the local model is considered.
+
+### Focused Safety Check
+
+A focused check reviews one selected medication. It is available from Dashboard and Medications. The result is saved so the Dashboard can show the latest selected-med safety message.
+
+### All-Meds Safety Scan
+
+An all-meds scan reviews the active regimen as a set. It is available from Dashboard, Safety, and the command palette. The scan records:
+
+- overall regimen action,
+- overall message,
+- per-medication summaries,
+- pending state while the worker runs,
+- and fallback context if the local model is unavailable.
+
+### Local Model Role
+
+The local model may summarize schedule context and help make the review easier to read. It should not invent clinical facts, override stored bottle instructions, or replace professional advice. If the model cannot run, MedSafe falls back to deterministic schedule rules.
 
 ## Bottle Photo Import
 
@@ -670,16 +881,50 @@ This app does not try to estimate VO2 max, training load, or sports recovery. It
 - support light daily movement,
 - and give the user a local log that can be reviewed alongside the rest of the day.
 
-## Assistant Workflow
+## Chat Workflow
 
 The assistant workflow is an optional interpretation layer for the user’s own structured data and local notes. It is most useful when the user wants a readable synthesis of:
 
 - stored medication plans,
 - recent reminder state,
 - routine continuity,
+- recovery support state,
+- dental and movement status,
+- recent safety summaries,
 - or locally saved note context.
 
 The assistant is more useful as a contextual explainer than as a controller.
+
+### Modes
+
+The assistant has three modes:
+
+- `General`: concise, practical help with medication, routine, and workflow summaries.
+- `Therapy`: reflective support for making the next step feel emotionally realistic.
+- `Recovery Coach`: recovery-specific support that references clean days, points, mood, craving, reminders, milestones, and coping-plan context when relevant.
+
+### Quick Prompts
+
+Quick prompts load common messages into the compose box so the user can edit before sending. The labels adapt by mode. For example, `Summarize Today` becomes more reflective in Therapy mode and more protective in Recovery Coach mode.
+
+### Context Preview
+
+Before a message is sent, the chat tab shows prompt health and a context preview. The preview includes selected facts such as:
+
+- selected medication,
+- due and missed medication counts,
+- saved safety review state,
+- dental routine state,
+- movement routine state,
+- recovery check-in state,
+- recent assistant memory,
+- and a local context route.
+
+The local context route is derived from a quantum-inspired signal packet. It is best understood as routing metadata for prompt structure. It is not clinical evidence, not a diagnosis, and not proof of risk.
+
+### Non-Blocking Inference
+
+Chat replies run in a spawned process. The main window sets the chat UI to a pending state, polls a result queue, streams text deltas when available, then restores the compose controls when the reply arrives. This prevents local Gemma inference from locking the entire GUI while it works.
 
 ## Settings And Runtime Controls
 
@@ -691,7 +936,37 @@ The Settings tab contains:
 - native image toggle,
 - startup-password management,
 - key rotation,
-- local security summary.
+- local security summary,
+- text size,
+- checklist undo policy,
+- model/plain-cache cleanup,
+- and startup setup status.
+
+### Runtime Controls
+
+Runtime controls include:
+
+- `Download and Seal` for fetching Gemma and storing it encrypted on disk.
+- `Verify SHA` for checking the sealed or plain model against the expected hash.
+- `Cycle Backend` for rotating between Auto, CPU, and GPU.
+- `Toggle Image Input` for native image input support.
+- `Delete Plain Cache` for removing leftover unsealed model cache.
+- `Refresh` for re-reading model and security status.
+
+### Security Controls
+
+Security controls include:
+
+- `Require startup password on launch`.
+- `Add / Change Password`.
+- `Remove Password`.
+- `Rotate Vault Key`.
+
+Changing or removing a startup password asks for the current password when the key is already protected. Key rotation reseals the vault and protected model files with fresh key material.
+
+### Accessibility And Workflow Controls
+
+The app also exposes text-size scaling and checklist undo behavior. Text size is useful on dense desktop layouts. Checklist undo is deliberately a setting because some users prefer correction flexibility and others prefer history rows that are harder to alter accidentally.
 
 ### Why Rename `Model` To `Settings`
 
@@ -710,6 +985,8 @@ The security model is pragmatic rather than theatrical.
 - the sealed model,
 - the stored key material when wrapped by a startup password.
 
+The app also keeps temporary model and encryption work files in a local temp area and cleans stale MedSafe temp artifacts on startup.
+
 ### What The Startup Password Does
 
 The startup password wraps the local vault key. It does not replace encryption. It creates an additional barrier between local files at rest and an unlocked session.
@@ -721,6 +998,12 @@ Large model files are not encrypted in one giant monolithic payload because that
 ### Key Rotation
 
 Key rotation generates a fresh vault key, decrypts and re-encrypts the vault with it, and reseals the encrypted model if present. That means rotation is a real state transition, not a cosmetic toggle.
+
+The rotation flow keeps the original vault and key material available until the replacement succeeds. If rotation fails, MedSafe attempts to restore the previous vault/key state and reports the failure rather than silently leaving the user in a half-rotated state.
+
+### Vault Read Protection
+
+If the encrypted vault cannot be read, MedSafe blocks saving instead of replacing unreadable encrypted data with defaults. This is a data-preservation guard: a broken unlock or corrupted read should not quietly overwrite the existing vault.
 
 ### Threat Model Scope
 
@@ -758,6 +1041,8 @@ The application uses platform-appropriate storage roots.
 - media staging area,
 - temporary files.
 
+Temporary files use MedSafe-specific prefixes and stale temp artifacts are cleaned on startup. The app avoids keeping a plain model file after sealing unless an explicit cache remains and the user has not deleted it yet.
+
 ## Dependency Locking
 
 This repository includes `requirements.in` and `.github/workflows/lock-requirements.yml`.
@@ -791,11 +1076,16 @@ The code is concentrated in `main.py`. This is practical for rapid iteration but
 
 - `vault.py`
 - `scheduler.py`
+- `safety.py`
 - `desktop_ui.py`
 - `vision.py`
 - `dental.py`
 - `exercise.py`
+- `recovery.py`
+- `assistant.py`
 - `runtime.py`
+
+Even before that refactor, the current pattern separates long-running tasks from immediate UI events. Model download/sealing uses task callbacks, safety scans use spawned process workers and queues, and assistant replies now use the same subprocess style so local inference cannot monopolize the Tk event loop.
 
 ### Testing Direction
 
@@ -804,9 +1094,16 @@ The most valuable near-term tests would be:
 - medication slot generation tests,
 - due/missed-state transition tests,
 - max-daily boundary tests,
+- duplicate dose guard tests,
+- checklist date navigation tests,
+- checklist undo tests,
 - key-wrap roundtrip tests,
+- key-rotation rollback tests,
 - chunked model encryption roundtrip tests,
 - exercise reminder interval tests.
+- recovery milestone and point tests,
+- assistant process lifecycle tests,
+- all-meds safety fallback tests.
 
 ## Troubleshooting
 
@@ -848,6 +1145,29 @@ Re-check:
 
 The checklist only reflects the stored structured data.
 
+### The assistant says it is already working
+
+The assistant intentionally allows one active reply at a time. Wait for the pending reply to finish, or clear the chat if you want to cancel the current conversation state. The GUI should remain usable while the worker process runs.
+
+### The assistant returns a worker error
+
+Check:
+
+- whether the Gemma model is downloaded and sealed,
+- whether the vault is unlocked,
+- whether the selected backend works on the current machine,
+- and whether the local runtime dependencies are installed.
+
+If inference fails, the error is added to the chat instead of freezing the app.
+
+### A safety scan falls back to stored schedule rules
+
+That means the local model worker could not complete, but deterministic schedule logic still produced a usable review. Verify model readiness in Settings, then run the scan again if model-supported wording matters.
+
+### Text is too small or dense
+
+Open Settings and change the text size. The app supports Small, Default, Large, and Extra Large scaling.
+
 ## FAQ
 
 ### Is this a medical device?
@@ -861,6 +1181,22 @@ No. It helps with organization and review, not clinical authority.
 ### Can the app work without the offline model?
 
 Yes. Many features are deterministic and local without the runtime.
+
+### Why does the app still show safety results when the model fails?
+
+Because the schedule rules are the baseline. Model output is helpful for summarization, but dose timing, duplicate checks, and 24-hour totals should remain inspectable and available.
+
+### Does Recovery Coach replace therapy, sponsorship, or clinical care?
+
+No. Recovery Coach mode is a local reflection and planning surface. It can help organize next steps and coping-plan context, but it is not professional treatment.
+
+### What does the quantum-inspired context metadata mean?
+
+It is local routing metadata used to structure prompts and summaries. It is not a quantum medical diagnosis, not a validated clinical score, and not evidence by itself.
+
+### Why does the assistant run in a separate process?
+
+Local inference can be slow and some runtimes can hold the Python interpreter long enough to make Tk feel frozen. A worker process keeps the main desktop event loop responsive.
 
 ### Why keep the schedule logic deterministic?
 
@@ -1222,6 +1558,26 @@ $$
 
 This is useful because the user’s real task is not merely to remember times. The user must also remember what the time refers to. By showing the time, medication, dose, and state on one row, the system reduces cross-item ambiguity.
 
+### 8.1 Care Compass Routing
+
+The Care Compass is a small workflow-router built on top of the same state primitives. It considers:
+
+- missed medication slots,
+- due medication slots,
+- due dental routines,
+- due movement routines,
+- due recovery check-in state,
+- local model readiness,
+- and startup-password state.
+
+Its output is not a medical recommendation. It is a navigation recommendation: which part of the app probably deserves attention next. In simple terms:
+
+$$
+\text{next\_tab} = r(\text{meds}, \text{safety}, \text{routines}, \text{recovery}, \text{privacy}, \text{runtime})
+$$
+
+where $r$ is a priority function biased toward missed meds, due meds, routine continuity, then setup/security readiness.
+
 ## 9. Habit Reminder Theory
 
 For a non-medication habit such as brushing, walking, or stretching, the system uses a simpler structure.
@@ -1367,6 +1723,14 @@ $$
 
 This is intentionally simple and robust rather than ambitious.
 
+The runtime is also isolated from the UI for long-running work. The assistant and safety scans use worker processes and result queues. In conceptual form:
+
+$$
+\text{UI event} \rightarrow \text{worker launch} \rightarrow \text{queue polling} \rightarrow \text{UI update}
+$$
+
+This prevents the desktop event loop from being held hostage by model inference.
+
 ## 13. Human Factors Model
 
 The software is designed under a simple human-factors premise: clarity reduces stress.
@@ -1449,6 +1813,14 @@ Images are staged locally, passed into local analysis workflows, and summarized 
 
 Movement reminders reuse habit-interval logic rather than inventing a separate subsystem. This keeps the code and the user mental model aligned.
 
+### 15.5 Recovery Workflow Method
+
+Recovery support stores clean-day anchoring, motivation, coping-plan text, reminder time, mood, craving, check-in notes, resets, points, and milestones as local structured state. The assistant can read that context in Recovery Coach mode, but the timeline itself remains deterministic vault data.
+
+### 15.6 Chat Workflow Method
+
+The assistant receives a bounded prompt assembled from vault facts, recent assistant memory, selected medication context, recovery state, and local routing metadata. It runs in a spawned worker process and returns a text result to the UI through a result queue.
+
 ## 16. Research Questions
 
 The project suggests several research questions worth future study.
@@ -1469,6 +1841,14 @@ Does a local-first desktop form factor improve perceived privacy and control for
 
 Can gentle movement reminders coexist productively with medication and dental routines in one shared daily workspace without overwhelming the user?
 
+### RQ5
+
+Does an explicit best-next-action router reduce navigation friction in a multi-domain health workflow app?
+
+### RQ6
+
+Does subprocess isolation for local inference improve perceived responsiveness enough to make offline assistance feel practical?
+
 ## 17. Proposed Evaluation Framework
 
 No formal study is claimed in the current repository, but a future evaluation could consider:
@@ -1481,6 +1861,8 @@ No formal study is claimed in the current repository, but a future evaluation co
 - time to locate startup-security controls,
 - time to recover from a missed-dose scenario,
 - movement reminder adherence over a short observation period.
+- time to locate the correct next workflow through Care Compass or Help,
+- perceived responsiveness during local assistant replies.
 
 Example composite usability score:
 
@@ -1608,14 +1990,19 @@ Several next directions are already visible.
 - richer merged timeline across all domains,
 - backup/export tools,
 - more explicit per-medication notification settings,
-- more sophisticated movement streak summaries.
+- more sophisticated movement streak summaries,
+- richer recovery trend visualizations,
+- import/export for assistant history and recovery summaries,
+- optional keyboard shortcuts beyond the command palette.
 
 ### 24.2 Engineering Work
 
 - modular refactor of `main.py`,
 - targeted unit tests for schedule logic,
 - more robust UI regression checks,
-- stronger import/export story.
+- stronger import/export story,
+- dedicated worker supervision and timeout policy,
+- screenshot-based regression checks for dense desktop layouts.
 
 ### 24.3 Research Work
 
@@ -1724,6 +2111,51 @@ These are illustrative shapes, not authoritative schemas for every future versio
 }
 ```
 
+### Recovery Support Example
+
+```json
+{
+  "goal_name": "Recovery",
+  "clean_start_date": "2024-04-01",
+  "motivation": "Stay present and protect the next day.",
+  "coping_plan": "Call support, drink water, walk for 10 minutes, avoid known triggers.",
+  "reminder_time": "8:00 PM",
+  "latest_mood": 6.0,
+  "latest_craving": 2.0,
+  "points": 75,
+  "history": [
+    {
+      "timestamp": 1713043600.0,
+      "type": "checkin",
+      "note": "Craving passed after a short walk.",
+      "mood": 6.0,
+      "craving": 2.0
+    }
+  ]
+}
+```
+
+### Chat History Example
+
+```json
+{
+  "assistant_history": [
+    {
+      "role": "user",
+      "mode": "Recovery Coach",
+      "content": "What is the next recovery-protective action today?",
+      "timestamp": 1713043600.0
+    },
+    {
+      "role": "assistant",
+      "mode": "Recovery Coach",
+      "content": "Start with the next 10 minutes: lower friction and use the coping plan.",
+      "timestamp": 1713043620.0
+    }
+  ]
+}
+```
+
 ## Appendix C: File And Folder Map
 
 ### Repository-Level Files
@@ -1761,6 +2193,7 @@ These are illustrative shapes, not authoritative schemas for every future versio
 - Decide whether to enable a startup password.
 - Decide whether to download the local model immediately.
 - Create the first medication entry.
+- Open Settings and confirm backend, text size, and checklist undo preference.
 - Confirm the daily checklist shows understandable rows.
 
 ### Medication Entry Checklist
@@ -1772,14 +2205,28 @@ These are illustrative shapes, not authoritative schemas for every future versio
 - Add a first planned time or custom named slots.
 - Save bottle directions verbatim when useful.
 - Review the generated daily plan before relying on it.
+- Run a focused safety check if the schedule changed.
+- Run an all-meds scan after adding or completing medications.
+
+### Safety Review Checklist
+
+- Confirm the selected medication is the one you intend to review.
+- Check dose amount, interval, and max daily amount first.
+- Run the focused safety check for selected-med questions.
+- Run the all-meds safety scan after regimen changes.
+- Treat model text as a summary layer over deterministic stored facts.
 
 ### Recovery Tracking Checklist
 
+- Save recovery focus, clean-since date, motivation, and coping plan.
+- Set a check-in reminder time.
+- Log mood and craving honestly.
 - Save procedure type.
 - Save procedure date.
 - Add symptom and aftercare notes.
 - Review recovery entries daily if the workflow is active.
 - Use professional guidance if symptoms conflict with app summaries.
+- Use Recovery Coach mode for next-step reflection, not as a substitute for care.
 
 ### Movement Reminder Checklist
 
@@ -1789,6 +2236,14 @@ These are illustrative shapes, not authoritative schemas for every future versio
 - Set daily goals.
 - Log movement sessions as they happen.
 - Review evening totals rather than chasing constant perfection.
+
+### Chat Checklist
+
+- Pick the mode that matches the task.
+- Use a quick prompt when you want structure.
+- Check the context preview before sending sensitive or complex requests.
+- Wait for the pending reply to finish before sending another message.
+- Keep clinical decisions anchored to professional instructions and stored label facts.
 
 ## Safety Note
 

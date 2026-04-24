@@ -257,23 +257,23 @@ HELP_FLOW_STEPS: Tuple[Tuple[str, str, str, str], ...] = (
     ("B", "Medications", "Shape The Regimen", "Add, edit, archive, and review medication history."),
     ("C", "Dashboard", "Check The Slots", "Use the daily checklist to reconcile what happened today."),
     ("D", "Safety", "Review Risk", "Run focused or all-meds safety checks before relying on changes."),
-    ("E", "Vision", "Import Context", "Use bottle photos when label details can reduce manual typing."),
+    ("E", "Pill Bottle Scanner", "Import Context", "Use bottle photos when label details can reduce manual typing."),
     ("F", "Dental", "Keep Routines Visible", "Track brushing, flossing, rinsing, hygiene review, and recovery."),
     ("G", "Exercise", "Maintain Movement", "Log walking, light exercise, and stretching rhythms."),
     ("H", "Recovery", "Protect Momentum", "Save recovery plans, check-ins, resets, milestones, and reminders."),
-    ("I", "Assistant", "Ask Locally", "Use the local assistant for summaries and practical next steps."),
-    ("J", "Settings", "Tune The Runtime", "Adjust model, backend, vision, text size, and privacy settings."),
+    ("I", "Chat", "Ask Locally", "Use the local chat for summaries and practical next steps."),
+    ("J", "Settings", "Tune The Runtime", "Adjust model, backend, image input, text size, and privacy settings."),
     ("K", "Settings", "Close Securely", "Leave the vault encrypted and the next launch policy clear."),
 )
 HELP_FEATURE_GUIDE: Tuple[Tuple[str, str], ...] = (
     ("Dashboard", "Start here for due/missed meds, the daily checklist, timeline, nudge, and selected-med history."),
     ("Medications", "Use this to create current regimen entries and complete/archive finished meds without losing past doses."),
     ("Safety", "Run local regimen checks when meds change or when you want one place to review per-medication risk."),
-    ("Vision", "Import from a bottle photo, then manually confirm name, dose, interval, max daily amount, and directions."),
+    ("Pill Bottle Scanner", "Import from a bottle photo, then manually confirm name, dose, interval, max daily amount, and directions."),
     ("Dental", "Keep hygiene habits, visible review notes, and dental recovery information together in the encrypted vault."),
     ("Exercise", "Set gentle walking, movement, and stretch intervals with daily minute goals."),
     ("Recovery", "Track streaks, check-ins, relapse resets, points, milestones, reminders, and a coping plan."),
-    ("Assistant", "Ask the local assistant for practical summaries; switch modes for general, therapy-style, or recovery support."),
+    ("Chat", "Ask the local chat for practical summaries; switch modes for general, therapy-style, or recovery support."),
     ("Settings", "Control model download, backend, image input, text size, checklist undo, key rotation, and startup unlock."),
 )
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -377,6 +377,13 @@ def sanitize_text(value: Any, *, max_chars: int = 4000) -> str:
     text = CONTROL_CHARS_RE.sub("", str(value or "")).strip()
     if len(text) > max_chars:
         return text[:max_chars].rstrip()
+    return text
+
+
+def sanitize_stream_delta(value: Any, *, max_chars: int = 4000) -> str:
+    text = CONTROL_CHARS_RE.sub("", str(value or ""))
+    if len(text) > max_chars:
+        return text[:max_chars]
     return text
 
 
@@ -1378,7 +1385,7 @@ def ensure_vault_shape(raw: Any) -> Dict[str, Any]:
             {
                 "role": sanitize_text(item.get("role") or "assistant", max_chars=16) or "assistant",
                 "mode": normalize_assistant_mode(item.get("mode") or "General"),
-                "content": sanitize_text(item.get("content") or "", max_chars=3000),
+                "content": sanitize_text(item.get("content") or "", max_chars=10000),
                 "timestamp": safe_float(item.get("timestamp") or time.time()),
             }
         )
@@ -1947,7 +1954,18 @@ def response_to_text(response: dict) -> str:
     for item in parts:
         if isinstance(item, dict) and item.get("type") == "text":
             texts.append(item.get("text", ""))
-    return sanitize_text("".join(texts), max_chars=6000)
+    return sanitize_text("".join(texts), max_chars=10000)
+
+
+def response_to_stream_text(response: Any) -> str:
+    if not isinstance(response, dict):
+        return sanitize_stream_delta(response, max_chars=10000)
+    parts = response.get("content", [])
+    texts: List[str] = []
+    for item in parts:
+        if isinstance(item, dict) and item.get("type") == "text":
+            texts.append(str(item.get("text", "")))
+    return sanitize_stream_delta("".join(texts), max_chars=10000)
 
 
 def create_user_message(user_text: str, image_path: Optional[str] = None) -> Any:
@@ -2073,6 +2091,105 @@ def litert_chat_blocking(
             messages = create_default_messages(system_text)
             with engine.create_conversation(messages=messages) as conversation:
                 return response_to_text(conversation.send_message(create_user_message(prompt_text, model_image_path)))
+
+
+def litert_chat_streaming(
+    key: bytes,
+    user_text: str,
+    *,
+    system_text: Optional[str] = None,
+    image_path: Optional[str] = None,
+    native_image_input: bool = False,
+    inference_backend: str = "Auto",
+    on_delta: Optional[Callable[[str], None]] = None,
+) -> Tuple[str, bool]:
+    safe_image_path = validate_image_path(image_path) if image_path else None
+    native_allowed = bool(safe_image_path) and native_image_input and configured_model_supports_native_image_input()
+    prompt_text = sanitize_text(user_text, max_chars=12000)
+    model_image_path = str(safe_image_path) if native_allowed and safe_image_path else None
+    if safe_image_path is not None and not native_allowed:
+        prompt_text += image_metadata_prompt(
+            safe_image_path,
+            native_requested=native_image_input,
+            native_allowed=native_allowed,
+        )
+
+    with unlocked_model_path(key) as model_path, temporary_litert_cache() as cache_dir:
+        engine = load_litert_engine(
+            model_path,
+            cache_dir=cache_dir,
+            enable_vision=bool(model_image_path),
+            inference_backend=inference_backend,
+        )
+        with engine:
+            messages = create_default_messages(system_text)
+            with engine.create_conversation(messages=messages) as conversation:
+                user_message = create_user_message(prompt_text, model_image_path)
+                stream_sender = None
+                for method_name in (
+                    "send_message_stream",
+                    "send_message_streaming",
+                    "stream_message",
+                    "send_message_async",
+                ):
+                    candidate = getattr(conversation, method_name, None)
+                    if callable(candidate):
+                        stream_sender = candidate
+                        break
+                if not callable(stream_sender):
+                    return response_to_text(conversation.send_message(user_message)), False
+
+                accumulated = ""
+                emitted = False
+
+                def ingest_chunk(chunk: Any) -> None:
+                    nonlocal accumulated, emitted
+                    chunk_text = response_to_stream_text(chunk)
+                    if not chunk_text:
+                        return
+                    if chunk_text.startswith(accumulated):
+                        delta = chunk_text[len(accumulated) :]
+                        accumulated = chunk_text
+                    else:
+                        delta = chunk_text
+                        accumulated += chunk_text
+                    if delta:
+                        emitted = True
+                        if on_delta is not None:
+                            on_delta(sanitize_stream_delta(delta, max_chars=2000))
+
+                try:
+                    stream_result = stream_sender(user_message)
+                except TypeError:
+                    return response_to_text(conversation.send_message(user_message)), False
+                if isinstance(stream_result, dict):
+                    return response_to_text(stream_result), False
+                if hasattr(stream_result, "__aiter__") or hasattr(stream_result, "__await__"):
+                    import asyncio
+
+                    async def consume_async_stream() -> Tuple[str, bool]:
+                        nonlocal accumulated, emitted
+                        async_source = stream_result
+                        if hasattr(async_source, "__await__") and not hasattr(async_source, "__aiter__"):
+                            async_source = await async_source
+                        if hasattr(async_source, "__aiter__"):
+                            async for async_chunk in async_source:
+                                ingest_chunk(async_chunk)
+                            return sanitize_text(accumulated, max_chars=10000), emitted
+                        final_text = response_to_text(async_source)
+                        return sanitize_text(final_text, max_chars=10000), False
+
+                    return asyncio.run(consume_async_stream())
+
+                try:
+                    iterator = iter(stream_result)
+                except TypeError:
+                    final_text = response_to_text(stream_result)
+                    return sanitize_text(final_text, max_chars=10000), False
+
+                for chunk in iterator:
+                    ingest_chunk(chunk)
+                return sanitize_text(accumulated, max_chars=10000), emitted
 
 
 def download_model_httpx(
@@ -3737,20 +3854,33 @@ def assistant_request_process_worker(
     mode: str,
 ) -> None:
     try:
+        streamed = False
+
+        def emit_delta(delta: str) -> None:
+            nonlocal streamed
+            clean = sanitize_stream_delta(delta, max_chars=2000)
+            if not clean:
+                return
+            streamed = True
+            result_queue.put({"ok": True, "delta": clean})
+
+        reply = run_assistant_request(
+            key,
+            data,
+            prompt,
+            selected_med_id,
+            settings,
+            mode=mode,
+            on_delta=emit_delta,
+        )
         result_queue.put(
             {
                 "ok": True,
                 "reply": sanitize_text(
-                    run_assistant_request(
-                        key,
-                        data,
-                        prompt,
-                        selected_med_id,
-                        settings,
-                        mode=mode,
-                    ),
-                    max_chars=3000,
+                    reply,
+                    max_chars=10000,
                 ),
+                "streamed": streamed,
             }
         )
     except Exception as exc:
@@ -4337,7 +4467,7 @@ def build_flow_simulation_report(
             usefulness += 18.0 if recovery.get("enabled") or bool(recovery_due.get("due_now")) else 7.0
             seamless += 8.0 if assistant_count else 4.0
             backend += 8.0 if model_ready else -8.0
-            reason = "The assistant has better context after plans, streaks, and check-ins are saved."
+            reason = "Chat has better context after plans, streaks, and check-ins are saved."
         elif edge == "I->J":
             usefulness += 13.0 if not model_ready or text_scale != 1.0 else 6.0
             seamless += 10.0
@@ -4558,11 +4688,11 @@ def workflow_surface_hint(tab_name: str) -> str:
         "Dashboard": "Dashboard: start with Care Compass, then reconcile due or missed rows before changing the regimen.",
         "Medications": "Medications: select an entry to edit, or start a new one and confirm dose, interval, max daily amount, and timing.",
         "Safety": "Safety: run an all-meds scan after regimen changes, then review any caution before logging.",
-        "Vision": "Vision: import bottle photos as draft context, then manually confirm the label details before saving.",
+        "Pill Bottle Scanner": "Pill Bottle Scanner: import bottle photos as draft context, then manually confirm the label details before saving.",
         "Dental": "Dental: log habits, review photos when useful, and keep recovery notes close to the actual timeline.",
         "Exercise": "Exercise: use small movement logs and intervals to keep recovery-friendly routines visible.",
         "Recovery": "Recovery: check mood and craving, protect the next 24 hours, and update the coping plan when patterns change.",
-        "Assistant": "Assistant: pick a mode, use a quick prompt when stuck, and use the context preview to see what the reply will emphasize.",
+        "Chat": "Chat: pick a mode, use a quick prompt when stuck, and use the context preview to see what the reply will emphasize.",
         "Help": "Help: open the best path or choose a feature topic when the next workflow is unclear.",
         "Settings": "Settings: confirm model readiness, backend, text size, checklist undo, and startup password policy.",
     }
@@ -4617,6 +4747,7 @@ def run_assistant_request(
     selected_med_id: Optional[str],
     settings: Dict[str, Any],
     mode: str = "General",
+    on_delta: Optional[Callable[[str], None]] = None,
 ) -> str:
     active_mode = normalize_assistant_mode(mode)
     if active_mode == "Therapy":
@@ -4680,12 +4811,24 @@ def run_assistant_request(
             final_instruction,
         ]
     )
+    inference_backend = settings.get("inference_backend", "Auto")
+    if on_delta is not None:
+        reply, _streamed = litert_chat_streaming(
+            key,
+            user_text,
+            system_text=system_text,
+            native_image_input=False,
+            inference_backend=inference_backend,
+            on_delta=on_delta,
+        )
+        return reply
+
     return litert_chat_blocking(
         key,
         user_text,
         system_text=system_text,
         native_image_input=False,
-        inference_backend=settings.get("inference_backend", "Auto"),
+        inference_backend=inference_backend,
     )
 
 
@@ -5926,7 +6069,7 @@ MDScreen:
 
             MDBottomNavigationItem:
                 name: "vision"
-                text: "Vision"
+                text: "Scanner"
                 icon: "camera-outline"
 
                 ScrollView:
@@ -6551,7 +6694,7 @@ MDScreen:
 
             MDBottomNavigationItem:
                 name: "assistant"
-                text: "Assistant"
+                text: "Chat"
                 icon: "chat-processing-outline"
 
                 ScrollView:
@@ -6584,7 +6727,7 @@ MDScreen:
                                 size: self.parent.size
 
                                 MDLabel:
-                                    text: "Local Gemma Assistant"
+                                    text: "Local Gemma Chat"
                                     theme_text_color: "Custom"
                                     text_color: 0.95, 0.99, 0.97, 1
                                     bold: True
@@ -6728,7 +6871,7 @@ MDScreen:
                                         on_release: app.on_cycle_backend()
 
                                     GradientButton:
-                                        text: "Toggle Vision"
+                                        text: "Toggle Image Input"
                                         start_color: 0.94, 0.65, 0.30, 1
                                         end_color: 0.72, 0.44, 0.16, 1
                                         on_release: app.on_toggle_native_image_input()
@@ -7311,7 +7454,7 @@ class MedSafeApp(MDApp):
         image_state = "on" if settings.get("enable_native_image_input", True) else "off"
         self.root.ids.model_status.text = self.model_state_summary()
         self.root.ids.model_backend_label.text = f"Backend: {backend_note} • Native image input: {image_state}"
-        self.root.ids.dashboard_model_state.text = f"Model: {'ready' if self.paths and self.paths.encrypted_model_path.exists() else 'not downloaded'} • Vision {image_state}"
+        self.root.ids.dashboard_model_state.text = f"Model: {'ready' if self.paths and self.paths.encrypted_model_path.exists() else 'not downloaded'} • Image input {image_state}"
 
     def reset_form_fields(self) -> None:
         self.root.ids.med_name.text = ""
@@ -7605,20 +7748,20 @@ class MedSafeApp(MDApp):
             try:
                 reply = run_assistant_request(key, snapshot, prompt, self.selected_med_id, settings)
             except Exception as exc:
-                reply = f"Assistant unavailable: {exc}"
+                reply = f"Chat unavailable: {exc}"
             Clock.schedule_once(lambda _dt: self._assistant_done(reply), 0)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _assistant_done(self, reply: str) -> None:
         self.append_assistant_message("assistant", reply)
-        self.set_status("Assistant reply ready.")
+        self.set_status("Chat reply ready.")
 
     def on_assistant_clear(self) -> None:
         self.data_cache["assistant_history"] = []
         self.save_data()
         self.refresh_assistant_history()
-        self.set_status("Assistant chat cleared.")
+        self.set_status("Chat cleared.")
 
     def _start_image_analysis(self, image_path: Path) -> None:
         if not self.vault:
@@ -8147,6 +8290,13 @@ class DesktopMedSafeApp:
         self.assistant_history_dirty = False
         self.assistant_context_refresh_request_id = 0
         self.assistant_quick_prompt_buttons = {}
+        self.assistant_context_visible = True
+        self.assistant_chat_font_delta = 2
+        self.assistant_reply_streaming = False
+        self.assistant_stream_request_id = 0
+        self.assistant_stream_text = ""
+        self.assistant_stream_index = 0
+        self.assistant_stream_message_index = -1
         self.background_save_request_id = 0
         self.assistant_mode = "General"
         self.help_selected_topic = ""
@@ -8196,27 +8346,37 @@ class DesktopMedSafeApp:
         self.vault = EncryptedVault(self.paths)
         self.settings_data = load_settings(self.paths)
         self.apply_text_size_setting(self.settings_data.get("text_size"))
-        if self.vault and self.vault.key_status() == "invalid":
+        if self.vault:
+            self.vault.clear_cached_key()
+        key_status = self.vault.key_status() if self.vault else "missing"
+        if self.vault and key_status == "invalid":
             self._build_blocked_startup(
                 "Invalid Vault Key",
                 "The local vault key file is unreadable or malformed. MedSafe blocked startup to avoid corrupting or overwriting encrypted data.",
+            )
+            return
+        if self.paths and self.vault and key_status == "missing" and self.paths.vault_path.exists():
+            self._build_blocked_startup(
+                "Missing Vault Key",
+                "The encrypted medication vault exists, but its local key file is missing. MedSafe blocked startup to avoid opening or overwriting protected data.",
             )
             return
         if self.paths and self.vault and existing_app_install(self.paths) and not self.settings_data.get("setup_complete", False):
             save_settings(
                 {
                     "setup_complete": True,
-                    "startup_password_enabled": self.vault.is_key_protected(),
+                    "startup_password_enabled": self.vault.is_key_protected()
+                    or bool(self.settings_data.get("startup_password_enabled", False)),
                 },
                 self.paths,
             )
             self.settings_data = load_settings(self.paths)
 
-        if self.vault and self.vault.is_key_protected():
-            if not bool(self.settings_data.get("startup_password_enabled", True)) and self.paths is not None:
+        if self._startup_gate_required():
+            if self.vault and self.vault.is_key_protected() and not bool(self.settings_data.get("startup_password_enabled", True)) and self.paths is not None:
                 save_settings({"startup_password_enabled": True}, self.paths)
                 self.settings_data = load_settings(self.paths)
-            self._build_unlock_flow()
+            self._build_startup_gate()
             return
         if not self.settings_data.get("setup_complete", False):
             self._build_first_boot_flow()
@@ -8821,6 +8981,28 @@ class DesktopMedSafeApp:
             except Exception:
                 pass
 
+    def _startup_gate_required(self) -> bool:
+        if not self.vault:
+            return False
+        key_status = self.vault.key_status()
+        if key_status == "protected":
+            return True
+        return key_status in {"raw", "missing"} and bool(self.settings_data.get("startup_password_enabled", False))
+
+    def _startup_gate_satisfied(self) -> bool:
+        if not self._startup_gate_required() or not self.vault:
+            return True
+        return self.vault.key_status() == "protected" and self.vault.is_unlocked()
+
+    def _build_startup_gate(self) -> None:
+        if not self.vault:
+            return
+        if self.vault.key_status() == "protected":
+            self.vault.clear_cached_key()
+            self._build_unlock_flow()
+            return
+        self._build_startup_password_repair_flow()
+
     def _build_first_boot_flow(self) -> None:
         if self.window is None:
             return
@@ -9066,6 +9248,68 @@ class DesktopMedSafeApp:
         )
         self.run_on_ui_thread(self._show_unlock_popup, delay_ms=80)
 
+    def _build_startup_password_repair_flow(self) -> None:
+        if self.window is None:
+            return
+        self._clear_window_content()
+        self.window.grid_rowconfigure(0, weight=1)
+        self.window.grid_rowconfigure(1, weight=0)
+
+        shell = ctk.CTkFrame(self.window, fg_color="transparent")
+        shell.grid(row=0, column=0, sticky="nsew", padx=24, pady=24)
+        shell.grid_columnconfigure(0, weight=1)
+        shell.grid_rowconfigure(0, weight=1)
+
+        card = self._card(shell)
+        card.grid(row=0, column=0, sticky="n", pady=40)
+        card.grid_columnconfigure(0, weight=1)
+        card.configure(width=720)
+
+        ctk.CTkLabel(
+            card,
+            text="Startup Protection Needs Repair",
+            anchor="w",
+            text_color=DESKTOP_TEXT,
+            font=ctk.CTkFont(size=28, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=24, pady=(24, 8))
+        ctk.CTkLabel(
+            card,
+            text=(
+                "Settings require a startup password, but the local key is not password-wrapped. "
+                "Set a startup password before MedSafe opens the encrypted vault for this session."
+            ),
+            anchor="w",
+            justify="left",
+            wraplength=620,
+            text_color=DESKTOP_MUTED,
+            font=ctk.CTkFont(size=14),
+        ).grid(row=1, column=0, sticky="ew", padx=24, pady=(0, 10))
+        ctk.CTkLabel(
+            card,
+            text=f"Vault location: {self.paths.root if self.paths else default_storage_root()}",
+            anchor="w",
+            text_color=DESKTOP_MUTED,
+            font=ctk.CTkFont(size=12),
+        ).grid(row=2, column=0, sticky="w", padx=24, pady=(0, 18))
+        status = self._label(
+            card,
+            text="The dashboard stays closed until startup protection is repaired.",
+            muted=True,
+            wrap=620,
+        )
+        status.widget.grid(row=3, column=0, sticky="ew", padx=24, pady=(0, 18))
+        self._register("startup_repair_status_label", status)
+        self._button(card, text="Set Startup Password", command=self._show_startup_password_repair_popup).grid(
+            row=4, column=0, sticky="ew", padx=24, pady=(0, 24)
+        )
+        self.run_on_ui_thread(self._show_startup_password_repair_popup, delay_ms=80)
+
+    def _drop_popup_topmost(self, popup: Any) -> None:
+        try:
+            popup.attributes("-topmost", False)
+        except Exception:
+            pass
+
     def _show_unlock_popup(self) -> None:
         if self.window is None:
             return
@@ -9085,7 +9329,6 @@ class DesktopMedSafeApp:
         popup.protocol("WM_DELETE_WINDOW", self.on_close)
         try:
             popup.transient(self.window)
-            popup.grab_set()
         except Exception:
             pass
 
@@ -9101,6 +9344,17 @@ class DesktopMedSafeApp:
             popup.geometry(f"{width}x{height}+{x}+{y}")
         except Exception:
             popup.geometry(f"{width}x{height}")
+        try:
+            popup.lift()
+            popup.focus_force()
+            popup.attributes("-topmost", True)
+            popup.after(450, lambda: self._drop_popup_topmost(popup))
+        except Exception:
+            pass
+        try:
+            popup.grab_set()
+        except Exception:
+            pass
 
         popup.grid_columnconfigure(0, weight=1)
         card = self._card(popup)
@@ -9155,6 +9409,110 @@ class DesktopMedSafeApp:
         except Exception:
             pass
 
+    def _show_startup_password_repair_popup(self) -> None:
+        if self.window is None:
+            return
+        if self.unlock_popup is not None:
+            try:
+                self.unlock_popup.lift()
+                self.unlock_popup.focus_force()
+                return
+            except Exception:
+                self.unlock_popup = None
+
+        popup = ctk.CTkToplevel(self.window)
+        self.unlock_popup = popup
+        popup.title("Set Startup Password")
+        popup.configure(fg_color=DESKTOP_BG)
+        popup.resizable(False, False)
+        popup.protocol("WM_DELETE_WINDOW", self.on_close)
+        try:
+            popup.transient(self.window)
+        except Exception:
+            pass
+
+        width = 600
+        height = 410
+        try:
+            root_x = int(self.window.winfo_rootx())
+            root_y = int(self.window.winfo_rooty())
+            root_w = int(self.window.winfo_width())
+            root_h = int(self.window.winfo_height())
+            x = root_x + max(0, (root_w - width) // 2)
+            y = root_y + max(0, (root_h - height) // 3)
+            popup.geometry(f"{width}x{height}+{x}+{y}")
+        except Exception:
+            popup.geometry(f"{width}x{height}")
+        try:
+            popup.lift()
+            popup.focus_force()
+            popup.attributes("-topmost", True)
+            popup.after(450, lambda: self._drop_popup_topmost(popup))
+        except Exception:
+            pass
+        try:
+            popup.grab_set()
+        except Exception:
+            pass
+
+        popup.grid_columnconfigure(0, weight=1)
+        card = self._card(popup)
+        card.grid(row=0, column=0, sticky="nsew", padx=18, pady=18)
+        card.grid_columnconfigure(0, weight=1)
+        card.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            card,
+            text="Set Startup Password",
+            anchor="w",
+            text_color=DESKTOP_TEXT,
+            font=ctk.CTkFont(size=24, weight="bold"),
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=20, pady=(20, 8))
+        ctk.CTkLabel(
+            card,
+            text="MedSafe will wrap the local vault key before opening the dashboard.",
+            anchor="w",
+            justify="left",
+            wraplength=520,
+            text_color=DESKTOP_MUTED,
+            font=ctk.CTkFont(size=13),
+        ).grid(row=1, column=0, columnspan=2, sticky="ew", padx=20, pady=(0, 14))
+
+        password_entry = self._password_entry(card, placeholder="Create startup password")
+        password_entry.widget.grid(row=2, column=0, sticky="ew", padx=(20, 8), pady=(0, 12))
+        self._register("startup_repair_password", password_entry)
+        confirm_entry = self._password_entry(card, placeholder="Confirm startup password")
+        confirm_entry.widget.grid(row=2, column=1, sticky="ew", padx=(8, 20), pady=(0, 12))
+        self._register("startup_repair_password_confirm", confirm_entry)
+        for entry in (password_entry, confirm_entry):
+            try:
+                entry.widget.bind("<Return>", lambda _event: (self._repair_startup_password_and_open(), "break")[1])
+            except Exception:
+                pass
+
+        repair_status = self._label(
+            card,
+            text="Use at least 6 characters. The vault stays closed until this is saved.",
+            muted=True,
+            wrap=520,
+        )
+        repair_status.widget.grid(row=3, column=0, columnspan=2, sticky="ew", padx=20, pady=(0, 14))
+        self._register("startup_repair_status_label", repair_status)
+
+        repair_buttons = ctk.CTkFrame(card, fg_color="transparent")
+        repair_buttons.grid(row=4, column=0, columnspan=2, sticky="ew", padx=20, pady=(0, 20))
+        repair_buttons.grid_columnconfigure((0, 1), weight=1)
+        self._button(repair_buttons, text="Save Password And Open", command=self._repair_startup_password_and_open).grid(
+            row=0, column=0, sticky="ew", padx=(0, 6)
+        )
+        self._button(repair_buttons, text="Exit", command=self.on_close, tone="neutral").grid(
+            row=0, column=1, sticky="ew", padx=(6, 0)
+        )
+        try:
+            popup.after(120, lambda: password_entry.widget.focus_set())
+        except Exception:
+            pass
+
     def _close_unlock_popup(self) -> None:
         popup = self.unlock_popup
         self.unlock_popup = None
@@ -9186,8 +9544,39 @@ class DesktopMedSafeApp:
             self.ids.unlock_password.text = ""
             self._set_start_screen_status("unlock_status_label", "That password did not unlock the encrypted vault. Please try again.")
 
+    def _repair_startup_password_and_open(self) -> None:
+        if not self.vault:
+            return
+        password = sanitize_text(getattr(self.ids.get("startup_repair_password"), "text", ""), max_chars=256)
+        confirm = sanitize_text(getattr(self.ids.get("startup_repair_password_confirm"), "text", ""), max_chars=256)
+        if len(password) < 6:
+            self._set_start_screen_status("startup_repair_status_label", "Choose a startup password with at least 6 characters.")
+            return
+        if password != confirm:
+            self._set_start_screen_status("startup_repair_status_label", "Startup password and confirmation do not match yet.")
+            return
+        try:
+            if self.vault.key_status() not in {"raw", "missing"}:
+                self._close_unlock_popup()
+                self._build_startup_gate()
+                return
+            self.vault.enable_password(password)
+            self._save_security_settings()
+            self._close_unlock_popup()
+            self._enter_main_app()
+            self.set_status("Startup password repaired and vault unlocked for this session.")
+        except Exception:
+            if "startup_repair_password" in self.ids:
+                self.ids.startup_repair_password.text = ""
+            if "startup_repair_password_confirm" in self.ids:
+                self.ids.startup_repair_password_confirm.text = ""
+            self._set_start_screen_status("startup_repair_status_label", "Could not wrap the vault key. Please try again.")
+
     def _enter_main_app(self, *, start_model_download: bool = False) -> None:
         if self.window is None:
+            return
+        if not self._startup_gate_satisfied():
+            self._build_startup_gate()
             return
         self._clear_window_content()
         self.window.grid_rowconfigure(0, weight=0)
@@ -9352,17 +9741,17 @@ class DesktopMedSafeApp:
 
         self.ids["main_tabs"] = tabview
 
-        for tab_name in ("Dashboard", "Medications", "Safety", "Vision", "Dental", "Exercise", "Recovery", "Assistant", "Help", "Settings"):
+        for tab_name in ("Dashboard", "Medications", "Safety", "Pill Bottle Scanner", "Dental", "Exercise", "Recovery", "Chat", "Help", "Settings"):
             tabview.add(tab_name)
 
         self._build_dashboard_tab(tabview.tab("Dashboard"))
         self._build_medications_tab(tabview.tab("Medications"))
         self._build_safety_tab(tabview.tab("Safety"))
-        self._build_vision_tab(tabview.tab("Vision"))
+        self._build_vision_tab(tabview.tab("Pill Bottle Scanner"))
         self._build_dental_tab(tabview.tab("Dental"))
         self._build_exercise_tab(tabview.tab("Exercise"))
         self._build_recovery_tab(tabview.tab("Recovery"))
-        self._build_assistant_tab(tabview.tab("Assistant"))
+        self._build_assistant_tab(tabview.tab("Chat"))
         self._build_help_tab(tabview.tab("Help"))
         self._build_model_tab(tabview.tab("Settings"))
 
@@ -9783,7 +10172,7 @@ class DesktopMedSafeApp:
         card.grid(row=0, column=0, sticky="ew")
         card.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(card, text="Bottle Photo Import", anchor="w", text_color=DESKTOP_TEXT, font=ctk.CTkFont(size=18, weight="bold")).grid(
+        ctk.CTkLabel(card, text="Pill Bottle Scanner", anchor="w", text_color=DESKTOP_TEXT, font=ctk.CTkFont(size=18, weight="bold")).grid(
             row=0, column=0, sticky="w", padx=18, pady=(18, 10)
         )
         vision_last = self._label(card, text="Last image: none", muted=True, wrap=980)
@@ -9799,18 +10188,8 @@ class DesktopMedSafeApp:
         self._button(button_row, text="Choose Bottle Photo", command=self.on_pick_bottle_photo).grid(row=0, column=0, sticky="ew", padx=(0, 6))
         self._button(button_row, text="Import From Computer", command=self.on_take_bottle_photo, tone="neutral").grid(row=0, column=1, sticky="ew", padx=(6, 0))
 
-        ctk.CTkLabel(
-            card,
-            text="Scroll if the analysis result runs longer than your current window height.",
-            anchor="w",
-            justify="left",
-            wraplength=980,
-            text_color=DESKTOP_MUTED,
-            font=ctk.CTkFont(size=12),
-        ).grid(row=4, column=0, sticky="ew", padx=18, pady=(0, 10))
-
         vision_result = self._readonly_box(card, height=420)
-        vision_result.widget.grid(row=5, column=0, sticky="nsew", padx=18, pady=(0, 18))
+        vision_result.widget.grid(row=4, column=0, sticky="nsew", padx=18, pady=(0, 18))
         self._register("vision_result", vision_result)
 
     def _build_dental_tab(self, tab: Any) -> None:
@@ -9966,34 +10345,52 @@ class DesktopMedSafeApp:
     def _build_assistant_tab(self, tab: Any) -> None:
         tab.grid_columnconfigure(0, weight=1)
         tab.grid_rowconfigure(0, weight=1)
-        scroll = ctk.CTkScrollableFrame(
-            tab,
-            fg_color="transparent",
+        shell = ctk.CTkFrame(tab, fg_color="transparent")
+        shell.grid(row=0, column=0, sticky="nsew", padx=14, pady=14)
+        shell.grid_columnconfigure(0, weight=1)
+        shell.grid_rowconfigure(0, weight=1)
+
+        body = ctk.CTkFrame(shell, fg_color="transparent")
+        body.grid(row=0, column=0, sticky="nsew")
+        body.grid_columnconfigure(0, weight=0, minsize=330)
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_rowconfigure(0, weight=1)
+        self.ids["assistant_body"] = body
+
+        context_panel = ctk.CTkScrollableFrame(
+            body,
+            fg_color=DESKTOP_SURFACE,
+            border_width=1,
+            border_color=DESKTOP_BORDER,
+            corner_radius=18,
             scrollbar_button_color="#314455",
             scrollbar_button_hover_color="#42586c",
         )
-        scroll.grid(row=0, column=0, sticky="nsew", padx=14, pady=14)
-        scroll.grid_columnconfigure(0, weight=1)
+        context_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 10), pady=0)
+        context_panel.grid_columnconfigure(0, weight=1)
+        self.ids["assistant_context_sidebar"] = context_panel
 
-        card = self._card(scroll)
-        card.grid(row=0, column=0, sticky="ew", pady=(0, 12))
-        card.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(card, text="Local Gemma Assistant", anchor="w", text_color=DESKTOP_TEXT, font=ctk.CTkFont(size=18, weight="bold")).grid(
-            row=0, column=0, sticky="w", padx=18, pady=(18, 8)
-        )
         ctk.CTkLabel(
-            card,
-            text="Switch between a practical local health assistant, a therapy-style support mode, and a recovery coach mode that uses the plan from the Recovery tab.",
+            context_panel,
+            text="Context",
+            anchor="w",
+            text_color=DESKTOP_TEXT,
+            font=ctk.CTkFont(size=18, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=16, pady=(16, 6))
+        ctk.CTkLabel(
+            context_panel,
+            text="Mode, prompt shortcuts, and local vault preview live here so the conversation can breathe.",
             anchor="w",
             justify="left",
-            wraplength=980,
+            wraplength=275,
             text_color=DESKTOP_MUTED,
-            font=ctk.CTkFont(size=13),
-        ).grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 12))
-        mode_row = ctk.CTkFrame(card, fg_color="transparent")
-        mode_row.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 10))
-        mode_row.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(mode_row, text="Assistant mode", anchor="w", text_color=DESKTOP_MUTED).grid(row=0, column=0, sticky="w", padx=(0, 12))
+            font=ctk.CTkFont(size=12),
+        ).grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 12))
+
+        mode_row = ctk.CTkFrame(context_panel, fg_color="transparent")
+        mode_row.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 10))
+        mode_row.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(mode_row, text="Mode", anchor="w", text_color=DESKTOP_MUTED).grid(row=0, column=0, sticky="w", pady=(0, 6))
         mode_menu = ctk.CTkOptionMenu(
             mode_row,
             values=["General", "Therapy", "Recovery Coach"],
@@ -10006,27 +10403,27 @@ class DesktopMedSafeApp:
             text_color=DESKTOP_TEXT,
             corner_radius=12,
         )
-        mode_menu.grid(row=0, column=1, sticky="w")
+        mode_menu.grid(row=1, column=0, sticky="ew")
         try:
             mode_menu.set(self.assistant_mode)
         except Exception:
             pass
         self.ids["assistant_mode_menu"] = mode_menu
         mode_hint = self._label(
-            card,
+            context_panel,
             text="General mode focuses on schedule, wellness, dental, and practical vault guidance.",
             muted=True,
-            wrap=980,
+            wrap=280,
         )
-        mode_hint.widget.grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 8))
+        mode_hint.widget.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 12))
         self._register("assistant_mode_hint", mode_hint)
-        quantum_panel = self._readonly_box(card, height=96)
-        quantum_panel.widget.grid(row=4, column=0, sticky="ew", padx=18, pady=(0, 10))
-        self._register("assistant_quantum_state", quantum_panel)
-        quick_prompts = ctk.CTkFrame(card, fg_color="transparent")
-        quick_prompts.grid(row=5, column=0, sticky="ew", padx=18, pady=(0, 10))
-        for col in range(4):
-            quick_prompts.grid_columnconfigure(col, weight=1)
+
+        ctk.CTkLabel(context_panel, text="Quick Prompts", anchor="w", text_color=DESKTOP_TEXT, font=ctk.CTkFont(size=14, weight="bold")).grid(
+            row=4, column=0, sticky="w", padx=16, pady=(0, 8)
+        )
+        quick_prompts = ctk.CTkFrame(context_panel, fg_color="transparent")
+        quick_prompts.grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 12))
+        quick_prompts.grid_columnconfigure((0, 1), weight=1)
         prompt_buttons = [
             ("Summarize Today", "Summarize my medication, dental, movement, and recovery plan for today. Start with what matters most."),
             ("What Next?", "What is the most useful next action based on my current MedSafe vault context?"),
@@ -10034,57 +10431,120 @@ class DesktopMedSafeApp:
             ("Draft Questions", "Draft clear questions I can bring to a clinician, dentist, therapist, sponsor, or support person based on my current context."),
         ]
         self.assistant_quick_prompt_buttons: Dict[str, Any] = {}
-        for col, (label, prompt_text) in enumerate(prompt_buttons):
+        for index, (label, prompt_text) in enumerate(prompt_buttons):
             button = self._button(
                 quick_prompts,
                 text=label,
                 command=lambda text=prompt_text, label=label: self.on_assistant_quick_prompt(text, label=label),
                 tone="secondary",
             )
-            button.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 6, 0 if col == 3 else 6))
+            button.grid(row=index // 2, column=index % 2, sticky="ew", padx=(0 if index % 2 == 0 else 5, 0), pady=(0, 8))
             self.assistant_quick_prompt_buttons[label] = button
+
         prompt_lens = self._label(
-            card,
+            context_panel,
             text="Prompt lens: direct local RAG context, schedule-aware, and safety-bounded.",
             muted=True,
-            wrap=980,
+            wrap=280,
         )
-        prompt_lens.widget.grid(row=6, column=0, sticky="ew", padx=18, pady=(0, 10))
+        prompt_lens.widget.grid(row=6, column=0, sticky="ew", padx=16, pady=(0, 10))
         self._register("assistant_prompt_lens", prompt_lens)
-        assistant_status = self._label(
-            card,
-            text="Local-only chat is ready. Press Enter to send and Shift+Enter for a new line.",
-            muted=True,
-            wrap=980,
+        quantum_panel = self._readonly_box(context_panel, height=210)
+        quantum_panel.widget.grid(row=7, column=0, sticky="ew", padx=16, pady=(0, 16))
+        self._register("assistant_quantum_state", quantum_panel)
+
+        chat_card = self._card(body)
+        chat_card.grid(row=0, column=1, sticky="nsew", pady=0)
+        chat_card.grid_columnconfigure(0, weight=1)
+        chat_card.grid_rowconfigure(2, weight=1)
+        self.ids["assistant_chat_card"] = chat_card
+
+        chat_header = ctk.CTkFrame(chat_card, fg_color="transparent")
+        chat_header.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 10))
+        chat_header.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            chat_header,
+            text="Conversation",
+            anchor="w",
+            text_color=DESKTOP_TEXT,
+            font=ctk.CTkFont(size=18, weight="bold"),
+        ).grid(row=0, column=0, sticky="w")
+        loading_badge = ctk.CTkLabel(
+            chat_header,
+            text="Ready",
+            fg_color="#20313e",
+            text_color=DESKTOP_MUTED,
+            corner_radius=16,
+            height=30,
+            width=150,
+            font=ctk.CTkFont(size=13, weight="bold"),
         )
-        assistant_status.widget.grid(row=7, column=0, sticky="ew", padx=18, pady=(0, 10))
-        self._register("assistant_status_line", assistant_status)
-        assistant_history = self._readonly_box(card, height=340)
-        assistant_history.widget.grid(row=8, column=0, sticky="nsew", padx=18, pady=(0, 12))
+        loading_badge.grid(row=0, column=1, sticky="e")
+        self.ids["assistant_loading_badge"] = loading_badge
+        loading_bar = ctk.CTkProgressBar(chat_card, progress_color=DESKTOP_ACCENT, fg_color="#21303c", height=8, corner_radius=8)
+        loading_bar.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 12))
+        loading_bar.set(0.0)
+        self.ids["assistant_loading_bar"] = loading_bar
+
+        assistant_history = self._readonly_box(chat_card, height=560)
+        assistant_history.widget.grid(row=2, column=0, sticky="nsew", padx=18, pady=(0, 14))
         self._register("assistant_history", assistant_history)
-        assistant_input = self._edit_box(card, height=126)
-        assistant_input.widget.grid(row=9, column=0, sticky="ew", padx=18, pady=(0, 12))
+
+        composer = ctk.CTkFrame(chat_card, fg_color="transparent")
+        composer.grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 16))
+        composer.grid_columnconfigure(0, weight=1)
+        composer.grid_columnconfigure(1, weight=0)
+        assistant_input = self._edit_box(composer, height=126)
+        assistant_input.widget.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
         self._register("assistant_input", assistant_input)
         self._bind_assistant_input_shortcuts(assistant_input)
         self._bind_assistant_input_live_context(assistant_input)
-        compose_hint = self._label(
-            card,
-            text="Markdown is supported here: headings, bullets, links, quotes, and fenced code blocks render in the conversation.",
+
+        assistant_status = self._label(
+            composer,
+            text="Local-only chat is ready. Press Enter to send and Shift+Enter for a new line.",
             muted=True,
-            wrap=980,
+            wrap=640,
         )
-        compose_hint.widget.grid(row=10, column=0, sticky="ew", padx=18, pady=(0, 10))
-        self._register("assistant_compose_hint", compose_hint)
-        buttons = ctk.CTkFrame(card, fg_color="transparent")
-        buttons.grid(row=11, column=0, sticky="ew", padx=18, pady=(0, 18))
-        buttons.grid_columnconfigure((0, 1), weight=1)
-        send_button = self._button(buttons, text="Send (Enter)", command=self.on_assistant_send)
-        send_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        assistant_status.widget.grid(row=1, column=0, columnspan=2, sticky="ew")
+        self._register("assistant_status_line", assistant_status)
+        buttons = ctk.CTkFrame(composer, fg_color="transparent")
+        buttons.grid(row=2, column=0, columnspan=2, sticky="e", pady=(8, 0))
+        context_toggle = self._button(
+            buttons,
+            text="Hide Context",
+            command=self.toggle_assistant_context_panel,
+            tone="neutral",
+        )
+        context_toggle.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self.ids["assistant_context_toggle_button"] = context_toggle
+        smaller_button = self._button(
+            buttons,
+            text="A-",
+            command=lambda: self.adjust_assistant_chat_text_size(-1),
+            tone="secondary",
+        )
+        smaller_button.grid(row=0, column=1, sticky="ew", padx=(0, 6))
+        larger_button = self._button(
+            buttons,
+            text="A+",
+            command=lambda: self.adjust_assistant_chat_text_size(1),
+            tone="secondary",
+        )
+        larger_button.grid(row=0, column=2, sticky="ew", padx=(0, 6))
+        chat_font_label = self._label(buttons, text="Text +2", muted=True, wrap=84)
+        chat_font_label.widget.grid(row=0, column=3, sticky="e", padx=(0, 10))
+        self._register("assistant_chat_font_label", chat_font_label)
+        send_button = self._button(buttons, text="Send", command=self.on_assistant_send)
+        send_button.grid(row=0, column=4, sticky="ew", padx=(0, 8))
         self.ids["assistant_send_button"] = send_button
-        clear_button = self._button(buttons, text="Clear Chat", command=self.on_assistant_clear, tone="danger")
-        clear_button.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        clear_button = self._button(buttons, text="Clear", command=self.on_assistant_clear, tone="danger")
+        clear_button.grid(row=0, column=5, sticky="ew")
         self.ids["assistant_clear_button"] = clear_button
+
         self.on_assistant_mode_change(self.assistant_mode)
+        self.refresh_assistant_chat_font()
+        self.set_assistant_context_visible(self.assistant_context_visible)
         self._set_assistant_ui_state()
 
     def _build_help_tab(self, tab: Any) -> None:
@@ -10192,13 +10652,17 @@ class DesktopMedSafeApp:
         if tabview is None:
             return
         clean_name = sanitize_text(tab_name, max_chars=80)
+        if clean_name == "Assistant":
+            clean_name = "Chat"
+        if clean_name == "Vision":
+            clean_name = "Pill Bottle Scanner"
         try:
             tabview.set(clean_name)
         except Exception:
             return
         if "workflow_hint_label" in self.ids:
             self.ids.workflow_hint_label.text = workflow_surface_hint(clean_name)
-        if clean_name == "Assistant":
+        if clean_name == "Chat":
             self.refresh_assistant_context_panel()
         self.set_status(f"Opened {clean_name}.")
 
@@ -10280,10 +10744,10 @@ class DesktopMedSafeApp:
             ("Review Today", lambda: self.navigate_to_tab("Dashboard"), "Open due, missed, timeline, checklist, and Care Compass."),
             ("Run Safety Scan", self.on_run_all_meds_safety_check, "Check the active regimen with local rules and model support."),
             ("Add Medication", self._command_new_medication, "Open the editor and start a fresh current regimen entry."),
-            ("Bottle Photo Import", lambda: self.navigate_to_tab("Vision"), "Open image-assisted medication import."),
+            ("Pill Bottle Scanner", lambda: self.navigate_to_tab("Pill Bottle Scanner"), "Open bottle-photo medication import."),
             ("Recovery Check-In", lambda: self.navigate_to_tab("Recovery"), "Open streaks, check-ins, resets, and coping plan."),
-            ("Ask Assistant", lambda: self.navigate_to_tab("Assistant"), "Open the local assistant conversation."),
-            ("Assistant: What Next?", self._command_assistant_what_next, "Open Assistant with a context-aware next-action prompt ready."),
+            ("Open Chat", lambda: self.navigate_to_tab("Chat"), "Open the local chat conversation."),
+            ("Chat: What Next?", self._command_assistant_what_next, "Open Chat with a context-aware next-action prompt ready."),
             ("Security Status", self._command_security_status, "Open Settings and show the current startup unlock and vault state."),
             ("Help & Flow Guide", lambda: self.navigate_to_tab("Help"), "Open A-K path simulation and feature help."),
             ("Settings & Security", lambda: self.navigate_to_tab("Settings"), "Open model, password, text, and runtime controls."),
@@ -10334,7 +10798,7 @@ class DesktopMedSafeApp:
         self.on_new_med()
 
     def _command_assistant_what_next(self) -> None:
-        self.navigate_to_tab("Assistant")
+        self.navigate_to_tab("Chat")
         self.on_assistant_quick_prompt(
             "What is the most useful next action based on my current MedSafe vault context?",
             label="What Next?",
@@ -10541,7 +11005,7 @@ class DesktopMedSafeApp:
         buttons_two.grid(row=6, column=0, sticky="ew", padx=18, pady=(0, 8))
         buttons_two.grid_columnconfigure((0, 1), weight=1)
         self._button(buttons_two, text="Cycle Backend", command=self.on_cycle_backend, tone="neutral").grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        self._button(buttons_two, text="Toggle Vision", command=self.on_toggle_native_image_input, tone="warning").grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        self._button(buttons_two, text="Toggle Image Input", command=self.on_toggle_native_image_input, tone="warning").grid(row=0, column=1, sticky="ew", padx=(6, 0))
         buttons_three = ctk.CTkFrame(card, fg_color="transparent")
         buttons_three.grid(row=7, column=0, sticky="ew", padx=18, pady=(0, 18))
         buttons_three.grid_columnconfigure((0, 1), weight=1)
@@ -11278,9 +11742,11 @@ class DesktopMedSafeApp:
         unlocked = self.vault.is_unlocked()
         setup_complete = bool(self.settings_data.get("setup_complete", False))
         checklist_undo = "enabled" if self.settings_data.get("allow_checklist_uncheck", False) else "off"
-        launch_lock = "required" if password_enabled and self.settings_data.get("startup_password_enabled", False) else "off"
+        launch_lock = "required" if password_enabled or self.settings_data.get("startup_password_enabled", False) else "off"
         if password_enabled:
             verdict = "Startup password is protecting future launches."
+        elif self.settings_data.get("startup_password_enabled", False):
+            verdict = "Startup password is requested; MedSafe will require repair before opening a future locked session."
         else:
             verdict = "Startup password is off. The vault is still encrypted on disk."
         return (
@@ -11316,7 +11782,7 @@ class DesktopMedSafeApp:
         self.ids.model_backend_label.text = f"Backend: {backend_note} | Native image input: {image_state}"
         self.ids.dashboard_model_state.text = (
             f"Model: {'ready' if self.paths and self.paths.encrypted_model_path.exists() else 'not downloaded'}"
-            f" | Vision {image_state} | Password {password_state}"
+            f" | Image input {image_state} | Password {password_state}"
         )
         if self.allow_checklist_uncheck_var is not None:
             try:
@@ -11691,6 +12157,58 @@ class DesktopMedSafeApp:
             return
         on_ready(chosen)
 
+    def set_assistant_context_visible(self, visible: bool) -> None:
+        self.assistant_context_visible = bool(visible)
+        panel = self.ids.get("assistant_context_sidebar")
+        chat_card = self.ids.get("assistant_chat_card")
+        toggle = self.ids.get("assistant_context_toggle_button")
+        if panel is not None:
+            try:
+                parent = getattr(panel, "master", None)
+                if parent is not None:
+                    parent.grid_columnconfigure(0, weight=0, minsize=330 if self.assistant_context_visible else 0)
+                    parent.grid_columnconfigure(1, weight=1)
+                if self.assistant_context_visible:
+                    panel.grid(row=0, column=0, sticky="nsew", padx=(0, 10), pady=0)
+                    if chat_card is not None:
+                        chat_card.grid(row=0, column=1, columnspan=1, sticky="nsew", pady=0)
+                else:
+                    panel.grid_remove()
+                    if chat_card is not None:
+                        chat_card.grid(row=0, column=0, columnspan=2, sticky="nsew", pady=0)
+            except Exception:
+                pass
+        if toggle is not None:
+            try:
+                toggle.configure(text="Hide Context" if self.assistant_context_visible else "Show Context")
+            except Exception:
+                pass
+
+    def toggle_assistant_context_panel(self) -> None:
+        self.set_assistant_context_visible(not bool(self.assistant_context_visible))
+        self.set_status("Chat context panel shown." if self.assistant_context_visible else "Chat context panel hidden.")
+
+    def refresh_assistant_chat_font(self) -> None:
+        box = getattr(self.ids.get("assistant_history"), "widget", None)
+        if box is not None:
+            self.configure_markdown_textbox(box, base_size=self.text_size_base_font_size() + self.assistant_chat_font_delta)
+        input_box = getattr(self.ids.get("assistant_input"), "widget", None)
+        if input_box is not None:
+            try:
+                input_box.configure(font=ctk.CTkFont(size=max(12, self.text_size_base_font_size() + self.assistant_chat_font_delta)))
+            except Exception:
+                pass
+        label = self.ids.get("assistant_chat_font_label")
+        if label is not None:
+            sign = "+" if self.assistant_chat_font_delta >= 0 else ""
+            label.text = f"Text {sign}{self.assistant_chat_font_delta}"
+        self.refresh_assistant_history()
+
+    def adjust_assistant_chat_text_size(self, delta: int) -> None:
+        self.assistant_chat_font_delta = max(-2, min(8, int(self.assistant_chat_font_delta) + int(delta)))
+        self.refresh_assistant_chat_font()
+        self.set_status("Chat text size updated.")
+
     def on_assistant_mode_change(self, value: str) -> None:
         self.assistant_mode = normalize_assistant_mode(value)
         palette = {
@@ -11750,7 +12268,7 @@ class DesktopMedSafeApp:
             self.ids.assistant_mode_hint.text_color = palette["hint"]
         self.refresh_assistant_quick_prompt_labels()
         self.refresh_assistant_context_panel()
-        self.set_status(f"Assistant mode set to {self.assistant_mode}.")
+        self.set_status(f"Chat mode set to {self.assistant_mode}.")
 
     def refresh_assistant_quick_prompt_labels(self) -> None:
         buttons = getattr(self, "assistant_quick_prompt_buttons", {})
@@ -11946,21 +12464,47 @@ class DesktopMedSafeApp:
 
     def _set_assistant_ui_state(self) -> None:
         pending = bool(self.assistant_request_pending)
+        streaming = bool(getattr(self, "assistant_reply_streaming", False))
+        busy = pending or streaming
         status_line = self.ids.get("assistant_status_line")
         if status_line is not None:
-            status_line.text = (
-                "Thinking with Gemma 4 locally. Finish this reply before sending another message."
-                if pending
-                else "Local-only chat is ready. Press Enter to send and Shift+Enter for a new line."
-            )
-            status_line.text_color = DESKTOP_WARNING if pending else DESKTOP_MUTED
+            if streaming:
+                status_line.text = "Streaming the reply into Chat..."
+            elif pending:
+                status_line.text = "Gemma is generating locally. The rest of MedSafe stays usable while this runs."
+            else:
+                status_line.text = "Local-only chat is ready. Press Enter to send and Shift+Enter for a new line."
+            status_line.text_color = DESKTOP_WARNING if busy else DESKTOP_MUTED
+
+        loading_badge = self.ids.get("assistant_loading_badge")
+        if loading_badge is not None:
+            try:
+                loading_badge.configure(
+                    text="Streaming..." if streaming else "Generating..." if pending else "Ready",
+                    fg_color=DESKTOP_ACCENT if streaming else DESKTOP_WARNING if pending else "#20313e",
+                    text_color="#08110f" if busy else DESKTOP_MUTED,
+                )
+            except Exception:
+                pass
+
+        loading_bar = self.ids.get("assistant_loading_bar")
+        if loading_bar is not None:
+            try:
+                if busy:
+                    loading_bar.configure(progress_color=DESKTOP_ACCENT if streaming else DESKTOP_WARNING)
+                    loading_bar.start()
+                else:
+                    loading_bar.stop()
+                    loading_bar.set(0.0)
+            except Exception:
+                pass
 
         send_button = self.ids.get("assistant_send_button")
         if send_button is not None:
             try:
                 send_button.configure(
-                    text="Working..." if pending else "Send (Enter)",
-                    state="disabled" if pending else "normal",
+                    text="Working..." if busy else "Send",
+                    state="disabled" if busy else "normal",
                 )
             except Exception:
                 pass
@@ -11969,8 +12513,8 @@ class DesktopMedSafeApp:
         if clear_button is not None:
             try:
                 clear_button.configure(
-                    text="Reply Running" if pending else "Clear Chat",
-                    state="disabled" if pending else "normal",
+                    text="Reply Running" if busy else "Clear",
+                    state="disabled" if busy else "normal",
                 )
             except Exception:
                 pass
@@ -11978,7 +12522,7 @@ class DesktopMedSafeApp:
         input_widget = self._assistant_input_widget()
         if input_widget is not None:
             try:
-                input_widget.configure(border_color=DESKTOP_WARNING if pending else DESKTOP_ACCENT)
+                input_widget.configure(border_color=DESKTOP_WARNING if busy else DESKTOP_ACCENT)
             except Exception:
                 pass
 
@@ -12035,7 +12579,7 @@ class DesktopMedSafeApp:
             {
                 "role": role,
                 "mode": normalize_assistant_mode(mode or self.assistant_mode),
-                "content": sanitize_text(content, max_chars=3000),
+                "content": sanitize_text(content, max_chars=10000),
                 "timestamp": time.time(),
             }
         )
@@ -12054,10 +12598,10 @@ class DesktopMedSafeApp:
             self._focus_assistant_input()
             return
         if not self.vault:
-            self.set_status("Assistant vault unavailable.")
+            self.set_status("Chat vault unavailable.")
             return
-        if self.assistant_request_pending:
-            self.set_status("Assistant is still working on the last message.")
+        if self.assistant_request_pending or self.assistant_reply_streaming:
+            self.set_status("Chat is still working on the last message.")
             self._focus_assistant_input()
             return
         self.ids.assistant_input.text = ""
@@ -12076,7 +12620,7 @@ class DesktopMedSafeApp:
         def launcher() -> None:
             try:
                 if not self.vault:
-                    raise RuntimeError("Assistant vault unavailable.")
+                    raise RuntimeError("Chat vault unavailable.")
                 key = self.vault.get_or_create_key()
                 ctx = mp.get_context("spawn")
                 result_queue = ctx.Queue()
@@ -12088,7 +12632,7 @@ class DesktopMedSafeApp:
                 process.start()
                 self.run_on_ui_thread(self._assistant_process_started, request_id, process, result_queue, active_mode)
             except Exception as exc:
-                self.run_on_ui_thread(self._assistant_done, request_id, f"Assistant unavailable: {exc}", active_mode)
+                self.run_on_ui_thread(self._assistant_done, request_id, f"Chat unavailable: {exc}", active_mode)
 
         threading.Thread(target=launcher, daemon=True).start()
 
@@ -12115,42 +12659,207 @@ class DesktopMedSafeApp:
         process = self.assistant_process
         result_queue = self.assistant_queue
         if process is None or result_queue is None:
-            self._assistant_done(request_id, "Assistant unavailable: assistant worker did not start.", mode)
+            self._assistant_done(request_id, "Chat unavailable: worker did not start.", mode)
             return
+        combined_delta = ""
+        payload: Dict[str, Any] = {}
+        has_payload = False
         try:
-            payload = result_queue.get_nowait()
+            while True:
+                item = result_queue.get_nowait()
+                if isinstance(item, dict) and "delta" in item:
+                    combined_delta += sanitize_stream_delta(item.get("delta"), max_chars=2000)
+                    if len(combined_delta) >= 6000:
+                        break
+                    continue
+                payload = item if isinstance(item, dict) else {"ok": False, "error": "worker returned an invalid reply."}
+                has_payload = True
+                break
         except queue.Empty:
+            pass
+        if combined_delta:
+            self._assistant_live_stream_delta(request_id, combined_delta, mode)
+        if not has_payload:
             try:
                 alive = process.is_alive()
             except Exception:
                 alive = False
-            if alive:
-                self.run_on_ui_thread(self._poll_assistant_process, request_id, mode, delay_ms=120)
+            if alive or combined_delta:
+                self.run_on_ui_thread(self._poll_assistant_process, request_id, mode, delay_ms=25 if combined_delta else 120)
             else:
                 self._cleanup_assistant_process(terminate=False)
-                self._assistant_done(request_id, "Assistant unavailable: assistant worker ended unexpectedly.", mode)
+                reply = "Chat unavailable: worker ended unexpectedly."
+                if self.assistant_reply_streaming and self.assistant_stream_message_index >= 0:
+                    current = sanitize_text(self.assistant_stream_text, max_chars=10000)
+                    self._finish_assistant_live_stream(
+                        request_id,
+                        f"{current}\n\n{reply}" if current else reply,
+                        mode,
+                    )
+                else:
+                    self._assistant_done(request_id, reply, mode)
             return
         self._cleanup_assistant_process(terminate=False)
         if payload.get("ok"):
-            reply = sanitize_text(payload.get("reply") or "", max_chars=3000) or "Assistant returned an empty reply."
+            reply = sanitize_text(payload.get("reply") or "", max_chars=10000) or "Chat returned an empty reply."
+            if payload.get("streamed"):
+                self._finish_assistant_live_stream(request_id, reply, mode)
+                return
         else:
-            reply = f"Assistant unavailable: {sanitize_text(payload.get('error') or 'assistant worker failed.', max_chars=240)}"
+            reply = f"Chat unavailable: {sanitize_text(payload.get('error') or 'worker failed.', max_chars=240)}"
+            if self.assistant_reply_streaming and self.assistant_stream_message_index >= 0:
+                current = sanitize_text(self.assistant_stream_text, max_chars=10000)
+                self._finish_assistant_live_stream(
+                    request_id,
+                    f"{current}\n\n{reply}" if current else reply,
+                    mode,
+                )
+                return
         self._assistant_done(request_id, reply, mode)
+
+    def _ensure_assistant_stream_message(self, request_id: int, mode: str) -> bool:
+        if request_id != self.assistant_request_id:
+            return False
+        history = list(self.data_cache.get("assistant_history") or [])
+        index = int(self.assistant_stream_message_index)
+        if (
+            self.assistant_reply_streaming
+            and self.assistant_stream_request_id == request_id
+            and 0 <= index < len(history)
+        ):
+            return True
+        history.append(
+            {
+                "role": "assistant",
+                "mode": normalize_assistant_mode(mode),
+                "content": "",
+                "timestamp": time.time(),
+            }
+        )
+        self.data_cache["assistant_history"] = history[-24:]
+        self.assistant_stream_message_index = len(self.data_cache["assistant_history"]) - 1
+        self.assistant_stream_text = ""
+        self.assistant_stream_index = 0
+        self.assistant_stream_request_id = request_id
+        self.assistant_reply_streaming = True
+        self.assistant_history_dirty = True
+        self._set_assistant_ui_state()
+        self.refresh_assistant_history()
+        return True
+
+    def _assistant_live_stream_delta(self, request_id: int, delta: str, mode: str) -> None:
+        if not sanitize_stream_delta(delta, max_chars=1):
+            return
+        if not self._ensure_assistant_stream_message(request_id, mode):
+            return
+        history = list(self.data_cache.get("assistant_history") or [])
+        index = int(self.assistant_stream_message_index)
+        if index < 0 or index >= len(history):
+            return
+        self.assistant_stream_text = sanitize_stream_delta(self.assistant_stream_text + delta, max_chars=10000)
+        self.assistant_stream_index = len(self.assistant_stream_text)
+        history[index]["content"] = self.assistant_stream_text
+        self.data_cache["assistant_history"] = history
+        self.assistant_history_dirty = True
+        self.refresh_assistant_history()
+
+    def _finish_assistant_live_stream(self, request_id: int, final_text: str, mode: str) -> None:
+        if request_id != self.assistant_request_id:
+            return
+        if not self._ensure_assistant_stream_message(request_id, mode):
+            return
+        history = list(self.data_cache.get("assistant_history") or [])
+        index = int(self.assistant_stream_message_index)
+        if index < 0 or index >= len(history):
+            return
+        final_reply = sanitize_text(final_text, max_chars=10000) or sanitize_text(self.assistant_stream_text, max_chars=10000)
+        history[index]["content"] = final_reply or "Chat returned an empty reply."
+        self.data_cache["assistant_history"] = history
+        self.assistant_request_pending = False
+        self.assistant_reply_streaming = False
+        self.assistant_stream_request_id = 0
+        self.assistant_stream_message_index = -1
+        self.assistant_stream_text = ""
+        self.assistant_stream_index = 0
+        self.assistant_history_dirty = True
+        self.refresh_assistant_history()
+        self.persist_data_async()
+        self._set_assistant_ui_state()
+        self.set_status("Chat reply ready.")
+        self._focus_assistant_input()
+
+    def _start_assistant_reply_stream(self, request_id: int, reply: str, mode: str) -> None:
+        if request_id != self.assistant_request_id:
+            return
+        history = list(self.data_cache.get("assistant_history") or [])
+        history.append(
+            {
+                "role": "assistant",
+                "mode": normalize_assistant_mode(mode),
+                "content": "",
+                "timestamp": time.time(),
+            }
+        )
+        self.data_cache["assistant_history"] = history[-24:]
+        self.assistant_stream_message_index = len(self.data_cache["assistant_history"]) - 1
+        self.assistant_stream_text = sanitize_text(reply, max_chars=10000)
+        self.assistant_stream_index = 0
+        self.assistant_stream_request_id = request_id
+        self.assistant_reply_streaming = True
+        self.assistant_history_dirty = True
+        self._set_assistant_ui_state()
+        self.refresh_assistant_history()
+        self.run_on_ui_thread(self._assistant_stream_tick, request_id, delay_ms=18)
+
+    def _assistant_stream_tick(self, request_id: int) -> None:
+        if request_id != self.assistant_request_id or not self.assistant_reply_streaming:
+            return
+        history = list(self.data_cache.get("assistant_history") or [])
+        index = int(self.assistant_stream_message_index)
+        if index < 0 or index >= len(history):
+            self.assistant_reply_streaming = False
+            self.assistant_stream_request_id = 0
+            self._set_assistant_ui_state()
+            return
+        total = len(self.assistant_stream_text)
+        if self.assistant_stream_index < total:
+            remaining = total - self.assistant_stream_index
+            chunk = 18 if remaining < 160 else 32 if remaining < 800 else 48
+            self.assistant_stream_index = min(total, self.assistant_stream_index + chunk)
+            history[index]["content"] = self.assistant_stream_text[: self.assistant_stream_index]
+            self.data_cache["assistant_history"] = history
+            self.refresh_assistant_history()
+            self.run_on_ui_thread(self._assistant_stream_tick, request_id, delay_ms=18)
+            return
+        history[index]["content"] = self.assistant_stream_text
+        self.data_cache["assistant_history"] = history
+        self.assistant_reply_streaming = False
+        self.assistant_stream_request_id = 0
+        self.assistant_stream_message_index = -1
+        self.assistant_stream_text = ""
+        self.assistant_stream_index = 0
+        self.assistant_history_dirty = True
+        self.refresh_assistant_history()
+        self.persist_data_async()
+        self._set_assistant_ui_state()
+        self.set_status("Chat reply ready.")
+        self._focus_assistant_input()
 
     def _assistant_done(self, request_id: int, reply: str, mode: str) -> None:
         if request_id != self.assistant_request_id:
             return
         self._cleanup_assistant_process(terminate=False)
         self.assistant_request_pending = False
-        self._set_assistant_ui_state()
-        self.append_assistant_message("assistant", reply, mode=mode, persist=False)
-        self.persist_data_async()
-        self.set_status("Assistant reply ready.")
-        self._focus_assistant_input()
+        self._start_assistant_reply_stream(request_id, reply, mode)
 
     def on_assistant_clear(self) -> None:
         self.assistant_request_id += 1
         self.assistant_request_pending = False
+        self.assistant_reply_streaming = False
+        self.assistant_stream_request_id = 0
+        self.assistant_stream_message_index = -1
+        self.assistant_stream_text = ""
+        self.assistant_stream_index = 0
         self._cleanup_assistant_process(terminate=True)
         self._set_assistant_ui_state()
         self.data_cache["assistant_history"] = []
@@ -12159,7 +12868,7 @@ class DesktopMedSafeApp:
         self.save_data()
         self.assistant_history_dirty = False
         self.refresh_assistant_history()
-        self.set_status("Assistant chat cleared.")
+        self.set_status("Chat cleared.")
         self._focus_assistant_input()
 
     def current_recovery_support_state(self) -> Dict[str, Any]:
@@ -13791,7 +14500,7 @@ def _desktop_sync_text_size_widgets(self: DesktopMedSafeApp) -> None:
             continue
     assistant_box = getattr(self.ids.get("assistant_history"), "widget", None)
     if assistant_box is not None:
-        self.configure_markdown_textbox(assistant_box)
+        self.configure_markdown_textbox(assistant_box, base_size=base + int(getattr(self, "assistant_chat_font_delta", 0)))
 
 
 def _desktop_configure_markdown_textbox(self: DesktopMedSafeApp, textbox: Any, *, base_size: Optional[int] = None) -> None:
@@ -14015,11 +14724,11 @@ def _desktop_refresh_assistant_history(self: DesktopMedSafeApp) -> None:
         box.configure(state="normal")
         self.clear_markdown_widgets(box)
         box.delete("1.0", tk.END)
-        self.configure_markdown_textbox(box)
+        self.configure_markdown_textbox(box, base_size=self.text_size_base_font_size() + int(getattr(self, "assistant_chat_font_delta", 0)))
         text_widget = box._textbox
     except Exception:
         self.ids.assistant_history.text = "No assistant messages yet." if not history else "\n\n".join(
-            markdown_to_plain_text(item.get("content") or "", max_chars=1200) for item in history[-12:]
+            markdown_to_plain_text(item.get("content") or "", max_chars=10000) for item in history[-12:]
         )
         return
     if not history:
@@ -14038,7 +14747,7 @@ def _desktop_refresh_assistant_history(self: DesktopMedSafeApp) -> None:
             if when:
                 text_widget.insert("end", f" | {when}", ("md_meta",))
             text_widget.insert("end", "\n")
-            self.insert_markdown_text(box, item.get("content") or "", max_chars=2000)
+            self.insert_markdown_text(box, item.get("content") or "", max_chars=10000)
             if index != len(visible_history) - 1:
                 text_widget.insert("end", "─" * 54 + "\n\n", ("md_hr",))
     try:
