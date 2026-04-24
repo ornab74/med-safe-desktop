@@ -1,6 +1,6 @@
-# MedSafe Desktop
+# Health Dash Desktop
 
-MedSafe Desktop is a local-first health workflow application for medication timing, bottle-photo review, dental routines, recovery journaling, gentle movement reminders, and offline model-assisted context review. The project is intentionally designed as a private desktop workspace rather than a cloud-first health dashboard. Its central idea is simple: sensitive day-to-day health logistics are often better managed in a tool that stays inspectable, editable, and local.
+Health Dash Desktop is a local-first health workflow application for medication timing, bottle-photo review, dental routines, recovery journaling, gentle movement reminders, and offline model-assisted context review. The project is intentionally designed as a private desktop workspace rather than a cloud-first health dashboard. Its central idea is simple: sensitive day-to-day health logistics are often better managed in a tool that stays inspectable, editable, and local.
 
 This README is intentionally long. It is both a practical operating manual and an extended technical paper for the project. It is written for users, maintainers, reviewers, and curious builders who want the full story rather than a minimal landing page.
 
@@ -66,7 +66,7 @@ This README is intentionally long. It is both a practical operating manual and a
 
 ## Executive Summary
 
-MedSafe Desktop is a desktop application built with `customtkinter` and a local encrypted vault. It is designed to help users manage everyday health-related routines without requiring their personal workflow data to leave the machine by default.
+Health Dash Desktop is a desktop application built with `customtkinter` and a local encrypted vault. It is designed to help users manage everyday health-related routines without requiring their personal workflow data to leave the machine by default.
 
 At a high level, the application provides:
 
@@ -97,7 +97,7 @@ Health logistics are often hard for reasons that have very little to do with raw
 
 Most software handles only one of these problems at a time. Medication apps often do not understand real-world timing buckets like breakfast or dinner. Task apps can remind, but they do not understand dose intervals or max-per-day boundaries. Notes apps can store text, but they do not offer due-state logic. Fitness trackers can count movement, but they are not designed for “gentle continuity” reminders. Cloud products can do many things, but privacy and inspectability are often secondary.
 
-MedSafe Desktop exists because there is room for a different kind of tool:
+Health Dash Desktop exists because there is room for a different kind of tool:
 
 - not a hospital system,
 - not a social health network,
@@ -135,7 +135,7 @@ This project assumes that many users want to review a day, a checklist, or a rou
 
 ## What The App Does
 
-MedSafe Desktop currently combines several operational domains in one workflow surface.
+Health Dash Desktop currently combines several operational domains in one workflow surface.
 
 ### Medication Management
 
@@ -375,9 +375,9 @@ flowchart LR
 
 | Platform | Status | Default storage root | Notes |
 | --- | --- | --- | --- |
-| Ubuntu / Linux | Supported | `${XDG_DATA_HOME:-~/.local/share}/medsafe` | Best current path for desktop testing |
-| Windows | Supported | `%LOCALAPPDATA%\\MedSafe` | Requires Python with Tcl/Tk |
-| macOS | Supported | `~/Library/Application Support/MedSafe` | Requires Tk-enabled Python |
+| Ubuntu / Linux | Supported | `${XDG_DATA_HOME:-~/.local/share}/Health Dash` | Best current path for desktop testing |
+| Windows | Supported | `%LOCALAPPDATA%\\Health Dash` | Requires Python with Tcl/Tk |
+| macOS | Supported | `~/Library/Application Support/Health Dash` | Requires Tk-enabled Python |
 
 ## Quick Start
 
@@ -475,7 +475,7 @@ python -u main.py
 
 #### Windows Notes
 
-- Data defaults to `%LOCALAPPDATA%\MedSafe`.
+- Data defaults to `%LOCALAPPDATA%\Health Dash`.
 - If the app launches but widgets do not appear correctly, test with a fresh Python installer that explicitly includes Tk.
 - The first-start setup screen appears before the main tabs if setup has not been completed yet.
 
@@ -508,7 +508,7 @@ python -u main.py
 
 #### macOS Notes
 
-- Data defaults to `~/Library/Application Support/MedSafe`.
+- Data defaults to `~/Library/Application Support/Health Dash`.
 - If `tkinter` is unavailable, switch to a Python build that includes Tk support.
 - If speech libraries differ across macOS versions, the rest of the app still works.
 
@@ -615,7 +615,7 @@ The focused medication safety check reviews one selected medication. The all-med
 
 The Pill Bottle Scanner tab is the bottle-photo workspace. It is meant to take local images and preserve the resulting review locally. It is intentionally scrollable so that image review text and import controls remain reachable even on smaller screens.
 
-The workflow validates image files before use. If native model image input is enabled and supported, the runtime can receive the image path directly. If not, MedSafe still attaches validated image metadata so the local prompt can preserve filename, type, size, hash, and security context without pretending to inspect pixels.
+The workflow validates image files before use. If native model image input is enabled and supported, the runtime can receive the image path directly. If not, Health Dash still attaches validated image metadata so the local prompt can preserve filename, type, size, hash, and security context without pretending to inspect pixels.
 
 ### The Dental Tab
 
@@ -785,7 +785,7 @@ Checklist undo is controlled from Settings. When enabled, a taken checklist row 
 
 ## Medication Safety Workflow
 
-Medication safety in MedSafe is deliberately layered.
+Medication safety in Health Dash is deliberately layered.
 
 ### Deterministic Baseline
 
@@ -818,7 +818,7 @@ An all-meds scan reviews the active regimen as a set. It is available from Dashb
 
 ### Local Model Role
 
-The local model may summarize schedule context and help make the review easier to read. It should not invent clinical facts, override stored bottle instructions, or replace professional advice. If the model cannot run, MedSafe falls back to deterministic schedule rules.
+The local model may summarize schedule context and help make the review easier to read. It should not invent clinical facts, override stored bottle instructions, or replace professional advice. If the model cannot run, Health Dash falls back to deterministic schedule rules.
 
 ## Bottle Photo Import
 
@@ -1001,7 +1001,7 @@ The security model is pragmatic rather than theatrical.
 - the sealed model,
 - the stored key material when wrapped by a startup password.
 
-The app also keeps temporary model and encryption work files in a local temp area and cleans stale MedSafe temp artifacts on startup.
+The app also keeps temporary model and encryption work files in a local temp area and cleans stale Health Dash temp artifacts on startup.
 
 ### What The Startup Password Does
 
@@ -1015,11 +1015,11 @@ Large model files are not encrypted in one giant monolithic payload because that
 
 Key rotation generates a fresh vault key, decrypts and re-encrypts the vault with it, and reseals the encrypted model if present. That means rotation is a real state transition, not a cosmetic toggle.
 
-The rotation flow keeps the original vault and key material available until the replacement succeeds. If rotation fails, MedSafe attempts to restore the previous vault/key state and reports the failure rather than silently leaving the user in a half-rotated state.
+The rotation flow keeps the original vault and key material available until the replacement succeeds. If rotation fails, Health Dash attempts to restore the previous vault/key state and reports the failure rather than silently leaving the user in a half-rotated state.
 
 ### Vault Read Protection
 
-If the encrypted vault cannot be read, MedSafe blocks saving instead of replacing unreadable encrypted data with defaults. This is a data-preservation guard: a broken unlock or corrupted read should not quietly overwrite the existing vault.
+If the encrypted vault cannot be read, Health Dash blocks saving instead of replacing unreadable encrypted data with defaults. This is a data-preservation guard: a broken unlock or corrupted read should not quietly overwrite the existing vault.
 
 ### Threat Model Scope
 
@@ -1038,15 +1038,15 @@ The application uses platform-appropriate storage roots.
 
 ### Linux
 
-`${XDG_DATA_HOME:-~/.local/share}/medsafe`
+`${XDG_DATA_HOME:-~/.local/share}/Health Dash`
 
 ### Windows
 
-`%LOCALAPPDATA%\MedSafe`
+`%LOCALAPPDATA%\Health Dash`
 
 ### macOS
 
-`~/Library/Application Support/MedSafe`
+`~/Library/Application Support/Health Dash`
 
 ### Typical Local Files
 
@@ -1057,7 +1057,7 @@ The application uses platform-appropriate storage roots.
 - media staging area,
 - temporary files.
 
-Temporary files use MedSafe-specific prefixes and stale temp artifacts are cleaned on startup. The app avoids keeping a plain model file after sealing unless an explicit cache remains and the user has not deleted it yet.
+Temporary files use Health Dash-specific prefixes and stale temp artifacts are cleaned on startup. The app avoids keeping a plain model file after sealing unless an explicit cache remains and the user has not deleted it yet.
 
 ## Dependency Locking
 
@@ -1228,7 +1228,7 @@ This section is intentionally long and formal. It is written as an engineering m
 
 ## Science Monograph Title
 
-**MedSafe Desktop: A Local-First Encrypted Human Factors Workbench For Medication Scheduling, Dental Routine Support, Recovery Journaling, And Gentle Movement Continuity**
+**Health Dash Desktop: A Local-First Encrypted Human Factors Workbench For Medication Scheduling, Dental Routine Support, Recovery Journaling, And Gentle Movement Continuity**
 
 ## Science Monograph Abstract
 
@@ -1240,7 +1240,7 @@ This project asks a very practical question:
 
 > Can a desktop app make routine health logistics easier without hiding the logic, overselling AI, or sending the whole workflow to the cloud?
 
-The answer pursued by MedSafe Desktop is:
+The answer pursued by Health Dash Desktop is:
 
 - keep the schedule math explicit,
 - let the model help where interpretation matters,
@@ -1299,7 +1299,7 @@ A user may know the bottle says “every 6 hours,” yet still wonder:
 - “Am I actually late, or is it just within a grace window?”
 - “What do I do with all the surrounding notes?”
 
-MedSafe Desktop is motivated by the belief that those questions are workflow questions first and AI questions second.
+Health Dash Desktop is motivated by the belief that those questions are workflow questions first and AI questions second.
 
 ## 3. Design Objectives
 
@@ -1552,7 +1552,7 @@ This mapping is not intended as universal medical truth. It is a usable default 
 
 ## 8. Checklist Reconstruction Theory
 
-One of the most important design choices in MedSafe Desktop is the use of an explicit daily checklist.
+One of the most important design choices in Health Dash Desktop is the use of an explicit daily checklist.
 
 Define the checklist set for a day $D$ as:
 
@@ -2029,7 +2029,7 @@ Several next directions are already visible.
 
 ## 25. Conclusion
 
-MedSafe Desktop is an attempt to build a calmer kind of health workflow software. The application is not impressive because it automates everything. Its value comes from making routine state visible, editable, and local. It tries to respect the user’s need for privacy, explanation, and continuity more than the industry’s default tendency toward alert volume and cloud abstraction.
+Health Dash Desktop is an attempt to build a calmer kind of health workflow software. The application is not impressive because it automates everything. Its value comes from making routine state visible, editable, and local. It tries to respect the user’s need for privacy, explanation, and continuity more than the industry’s default tendency toward alert volume and cloud abstraction.
 
 The project is still evolving, but its direction is clear:
 
@@ -2192,7 +2192,7 @@ These are illustrative shapes, not authoritative schemas for every future versio
 | Path | Purpose |
 | --- | --- |
 | `.enc_key` | local key or wrapped key material |
-| `medsafe_vault.json.aes` | encrypted structured vault |
+| `Health Dash_vault.json.aes` | encrypted structured vault |
 | `settings.json` | local settings |
 | `models/<model>.aes` | sealed model artifact |
 | `media/` | local staged images |
@@ -2263,4 +2263,4 @@ These are illustrative shapes, not authoritative schemas for every future versio
 
 ## Safety Note
 
-MedSafe Desktop is a local productivity and journaling tool. It can help organize timing, notes, and reminder state, but it does not replace instructions from a clinician, pharmacist, dentist, or surgeon. If the app, the bottle, and professional advice disagree, the bottle and professional advice should win. If symptoms are severe, urgent, or confusing, use real medical care rather than software inference.
+Health Dash Desktop is a local productivity and journaling tool. It can help organize timing, notes, and reminder state, but it does not replace instructions from a clinician, pharmacist, dentist, or surgeon. If the app, the bottle, and professional advice disagree, the bottle and professional advice should win. If symptoms are severe, urgent, or confusing, use real medical care rather than software inference.
