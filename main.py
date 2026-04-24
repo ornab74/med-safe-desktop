@@ -10192,6 +10192,7 @@ class DesktopMedSafeApp:
             button_hover_color="#0d6b63",
             dropdown_fg_color=DESKTOP_SURFACE_ALT,
             dropdown_hover_color="#223443",
+            dropdown_text_color=DESKTOP_TEXT,
             text_color=DESKTOP_TEXT,
             corner_radius=12,
         )
@@ -10636,6 +10637,7 @@ class DesktopMedSafeApp:
             button_hover_color="#0d6b63",
             dropdown_fg_color=DESKTOP_SURFACE_ALT,
             dropdown_hover_color="#223443",
+            dropdown_text_color=DESKTOP_TEXT,
             text_color=DESKTOP_TEXT,
             corner_radius=12,
         )
@@ -12590,6 +12592,7 @@ class DesktopMedSafeApp:
                     button_hover_color=palette["hover"],
                     dropdown_fg_color=palette["dropdown"],
                     dropdown_hover_color=palette["hover"],
+                    dropdown_text_color=palette["text"],
                     text_color=palette["text"],
                 )
                 mode_menu.set(self.assistant_mode)
