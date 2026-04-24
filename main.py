@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import math
 import multiprocessing as mp
@@ -8349,6 +8350,326 @@ DESKTOP_WARNING = "#efb54a"
 DESKTOP_DANGER = "#d9646d"
 
 
+BUTTON_ATLAS_FILENAME = "buttons.png"
+HEALTHDASH_LOGO_FILENAME = "logo.png"
+HEALTHDASH_LOGO_DIRNAME = "images"
+HEALTHDASH_LOGO_MAX_BYTES = 512 * 1024
+HEALTHDASH_LOGO_MAX_HEIGHT = 59
+HEALTHDASH_LOGO_MAX_WIDTH = 360
+HEALTHDASH_TOPBAR_FILENAME = "buttons_topbar.png"
+HEALTHDASH_TOPBAR_DIRNAME = "images"
+HEALTHDASH_TOPBAR_MAX_BYTES = 8 * 1024 * 1024
+HEALTHDASH_TOPBAR_MAX_DISPLAY_WIDTH = 4096
+HEALTHDASH_TOPBAR_MAX_DISPLAY_HEIGHT = 58
+# Compact topbar asset is a single 2048x75 strip with no logo.
+# These bounds match images/buttons_topbar.png so the image path loads
+# instead of falling back to the old uneven two-row button layout.
+HEALTHDASH_TOPBAR_CROP: Tuple[int, int, int, int] = (0, 0, 2048, 75)
+HEALTHDASH_TOPBAR_BUTTON_RECTS: Dict[str, Tuple[int, int, int, int]] = {
+    "Dashboard": (12, 12, 228, 72),
+    "Medications": (240, 12, 468, 72),
+    "Safety": (478, 12, 658, 72),
+    "Pill Bottle Scanner": (668, 12, 958, 72),
+    "Dental": (968, 12, 1148, 72),
+    "Exercise": (1158, 12, 1348, 72),
+    "Recovery": (1360, 12, 1556, 72),
+    "Chat": (1566, 12, 1706, 72),
+    "Help": (1718, 12, 1858, 72),
+    "Settings": (1870, 12, 2040, 72),
+}
+
+EMBEDDED_HEALTHDASH_LOGO_PNG_B64 = (
+    "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"
+)
+BUTTON_ATLAS_MAX_BYTES = 8 * 1024 * 1024
+BUTTON_ATLAS_BASE_SIZE = (1536, 1024)
+BUTTON_ATLAS_MIN_SIZE = (768, 512)
+BUTTON_ATLAS_MAX_SIZE = (3072, 2048)
+
+# Coordinates are measured against the generated HealthDash button sheet at 1536x1024.
+# The loader scales these rectangles if the local atlas is exported at 2x/0.5x.
+# Logo slice intentionally stops above the "BUTTON SYSTEM" subtitle.
+BUTTON_ATLAS_LOGO_SLICE: Tuple[int, int, int, int] = (24, 12, 448, 112)
+BUTTON_ATLAS_LOGO_MAX_HEIGHT = 44
+
+BUTTON_ATLAS_SLICES: Dict[str, Tuple[int, int, int, int]] = {
+    "button_primary": (46, 204, 188, 250),
+    "button_secondary": (46, 342, 188, 388),
+    "button_success": (46, 458, 162, 504),
+    "button_info": (175, 458, 287, 504),
+    "button_warning": (294, 458, 417, 504),
+    "button_danger": (449, 458, 556, 504),
+    "button_neutral": (572, 458, 679, 504),
+    "button_save": (46, 584, 201, 629),
+    "button_cancel": (214, 584, 348, 629),
+    "button_clear": (364, 584, 493, 629),
+    "button_apply": (505, 584, 634, 629),
+    "button_send": (46, 690, 197, 736),
+    "button_voice": (214, 690, 366, 736),
+    "button_attach": (383, 690, 561, 736),
+    "button_stop": (579, 690, 681, 736),
+    "button_log_dose": (46, 797, 217, 842),
+    "button_missed_dose": (228, 797, 380, 842),
+    "button_snooze": (396, 797, 519, 842),
+    "button_check_in": (536, 797, 660, 842),
+    "button_close": (46, 912, 182, 956),
+    "button_back": (200, 912, 338, 956),
+    "button_next": (355, 912, 493, 956),
+    "button_done": (510, 912, 650, 956),
+    "button_dashboard": (734, 143, 868, 188),
+    "button_medications": (879, 143, 1011, 188),
+    "button_safety": (1022, 143, 1119, 188),
+    "button_scanner": (1130, 143, 1299, 188),
+    "button_dental": (1310, 143, 1420, 188),
+    "button_exercise": (757, 204, 849, 249),
+    "button_recovery": (858, 204, 980, 249),
+    "button_chat": (989, 204, 1105, 249),
+    "button_help": (1150, 204, 1246, 249),
+    "button_settings": (1258, 204, 1389, 249),
+    "button_view_details": (732, 584, 877, 629),
+    "button_view_history": (918, 584, 1041, 629),
+    "button_export": (1054, 584, 1179, 629),
+    "button_print": (1193, 584, 1306, 629),
+}
+
+BUTTON_ATLAS_ICON_SLICES: Dict[str, Tuple[int, int, int, int]] = {
+    "dashboard": (756, 157, 778, 179),
+    "medications": (895, 156, 917, 178),
+    "safety": (1040, 156, 1062, 178),
+    "scanner": (1150, 156, 1173, 178),
+    "dental": (1365, 156, 1386, 179),
+    "exercise": (776, 217, 797, 239),
+    "recovery": (879, 217, 902, 239),
+    "chat": (1021, 217, 1045, 238),
+    "help": (1177, 217, 1199, 239),
+    "settings": (1325, 217, 1348, 239),
+    "add": (75, 219, 93, 238),
+    "success": (65, 471, 86, 492),
+    "info": (200, 471, 220, 491),
+    "warning": (322, 471, 342, 491),
+    "danger": (458, 471, 478, 493),
+    "save": (64, 614, 83, 632),
+    "cancel": (253, 611, 273, 631),
+    "clear": (405, 612, 424, 633),
+    "apply": (553, 611, 573, 632),
+    "send": (62, 705, 85, 727),
+    "voice": (247, 704, 266, 728),
+    "attach": (418, 704, 437, 728),
+    "stop": (584, 704, 599, 719),
+    "dose": (63, 810, 84, 831),
+    "missed": (249, 810, 270, 831),
+    "snooze": (427, 810, 448, 831),
+    "checkin": (558, 810, 581, 831),
+    "close": (84, 925, 103, 945),
+    "back": (246, 924, 267, 945),
+    "next": (406, 924, 426, 945),
+    "done": (550, 925, 571, 945),
+    "view": (777, 612, 800, 628),
+    "history": (948, 611, 970, 632),
+    "export": (1087, 609, 1110, 633),
+    "print": (1224, 611, 1247, 632),
+}
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()
+
+
+class SecureButtonAtlas:
+    """Small, dependency-free PNG atlas loader for the HealthDash button sheet.
+
+    This intentionally avoids PIL/Pillow. Tk's native PhotoImage decoder loads a
+    local PNG after strict path, header, size, and geometry checks. Every mapped
+    button/icon slice receives a deterministic SHA-256 identity derived from the
+    atlas bytes, geometry, and slice rectangle so the app can audit exactly what
+    was loaded without keeping duplicate raw image data in memory.
+    """
+
+    def __init__(self, app_paths: Optional[AppPaths] = None) -> None:
+        self.app_paths = app_paths
+        self.loaded = False
+        self.enabled = False
+        self.rejected_reason = "not loaded"
+        self.path: Optional[Path] = None
+        self.atlas_hash = ""
+        self.slice_hashes: Dict[str, str] = {}
+        self.button_images: Dict[str, Any] = {}
+        self.icon_images: Dict[str, Any] = {}
+        self.logo_image: Optional[Any] = None
+        self._logo_source_image: Optional[Any] = None
+        self._atlas_image: Optional[Any] = None
+
+    def candidate_paths(self) -> List[Path]:
+        roots: List[Path] = []
+        env_path = sanitize_text(os.environ.get("HEALTHDASH_BUTTON_ATLAS") or "", max_chars=600)
+        if env_path:
+            try:
+                roots.append(Path(env_path).expanduser().resolve().parent.parent)
+            except Exception:
+                pass
+        try:
+            script_dir = Path(__file__).resolve().parent
+        except Exception:
+            script_dir = Path.cwd()
+        # Search the script directory, the current working tree, and a few parents so
+        # running from a repo root, a package folder, or a copied script still finds
+        # the local img/buttons.png without accepting arbitrary file names.
+        for root in (script_dir, Path.cwd()):
+            try:
+                root = root.resolve()
+            except Exception:
+                pass
+            roots.append(root)
+            roots.extend(list(root.parents)[:3])
+        if self.app_paths is not None:
+            roots.append(self.app_paths.root)
+        seen = set()
+        candidates: List[Path] = []
+        if env_path:
+            p = Path(env_path).expanduser()
+            if p.name == BUTTON_ATLAS_FILENAME and p.parent.name == "img":
+                candidates.append(p)
+                seen.add(str(p))
+        for root in roots:
+            candidate = root / "img" / BUTTON_ATLAS_FILENAME
+            key = str(candidate)
+            if key not in seen:
+                seen.add(key)
+                candidates.append(candidate)
+        return candidates
+
+    def load(self) -> bool:
+        if self.loaded:
+            return self.enabled
+        self.loaded = True
+        rejection_notes: List[str] = []
+        for candidate in self.candidate_paths():
+            try:
+                if self._load_from(candidate):
+                    self.enabled = True
+                    self.rejected_reason = ""
+                    return True
+            except Exception as exc:
+                note = f"{candidate}: {sanitize_text(exc, max_chars=180)}"
+                if note not in rejection_notes:
+                    rejection_notes.append(note)
+                self.rejected_reason = "; ".join(rejection_notes[-3:])
+        if not self.rejected_reason:
+            self.rejected_reason = "img/buttons.png was not found near the app or repo root"
+        return False
+
+    def _load_from(self, path: Path) -> bool:
+        if not path.exists():
+            return False
+        resolved = path.resolve()
+        if resolved.name != BUTTON_ATLAS_FILENAME or resolved.parent.name != "img":
+            raise ValueError("button atlas must be named img/buttons.png")
+        if resolved.is_symlink() or not resolved.is_file():
+            raise ValueError("button atlas must be a regular non-symlink file")
+        stat = resolved.stat()
+        if stat.st_size <= 64 or stat.st_size > BUTTON_ATLAS_MAX_BYTES:
+            raise ValueError("button atlas size is outside the allowed range")
+        data = resolved.read_bytes()
+        if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ValueError("button atlas is not a PNG file")
+        atlas_hash = hashlib.sha256(data).hexdigest()
+        image = tk.PhotoImage(file=str(resolved))
+        width = int(image.width())
+        height = int(image.height())
+        min_w, min_h = BUTTON_ATLAS_MIN_SIZE
+        max_w, max_h = BUTTON_ATLAS_MAX_SIZE
+        if width < min_w or height < min_h or width > max_w or height > max_h:
+            raise ValueError("button atlas dimensions are outside the allowed range")
+        ratio = width / max(1, height)
+        if ratio < 1.35 or ratio > 1.70:
+            raise ValueError("button atlas aspect ratio is unexpected")
+        self.path = resolved
+        self.atlas_hash = atlas_hash
+        self._atlas_image = image
+        self._slice_all(width, height)
+        return True
+
+    def _scaled_rect(self, rect: Tuple[int, int, int, int], width: int, height: int) -> Tuple[int, int, int, int]:
+        base_w, base_h = BUTTON_ATLAS_BASE_SIZE
+        sx = width / base_w
+        sy = height / base_h
+        x1, y1, x2, y2 = rect
+        nx1 = max(0, min(width - 1, int(round(x1 * sx))))
+        ny1 = max(0, min(height - 1, int(round(y1 * sy))))
+        nx2 = max(nx1 + 1, min(width, int(round(x2 * sx))))
+        ny2 = max(ny1 + 1, min(height, int(round(y2 * sy))))
+        return nx1, ny1, nx2, ny2
+
+    def _copy_slice(self, name: str, rect: Tuple[int, int, int, int], width: int, height: int) -> Any:
+        if self._atlas_image is None:
+            raise ValueError("button atlas is not loaded")
+        x1, y1, x2, y2 = self._scaled_rect(rect, width, height)
+        out = tk.PhotoImage(width=x2 - x1, height=y2 - y1)
+        # Native Tk copy/crop; no external image library and no shelling out.
+        out.tk.call(out, "copy", self._atlas_image, "-from", x1, y1, x2, y2, "-to", 0, 0)
+        self.slice_hashes[name] = _sha256_text(f"{self.atlas_hash}:{name}:{x1},{y1},{x2},{y2}")
+        return out
+
+    def _slice_all(self, width: int, height: int) -> None:
+        self.button_images.clear()
+        self.icon_images.clear()
+        self.slice_hashes.clear()
+        self.logo_image = None
+        self._logo_source_image = None
+
+        raw_logo = self._copy_slice("logo_healthdash", BUTTON_ATLAS_LOGO_SLICE, width, height)
+        shrink = max(1, int(math.ceil(raw_logo.height() / float(BUTTON_ATLAS_LOGO_MAX_HEIGHT))))
+        self._logo_source_image = raw_logo
+        self.logo_image = raw_logo.subsample(shrink, shrink) if shrink > 1 else raw_logo
+        self.slice_hashes["logo_healthdash_display"] = _sha256_text(
+            f"{self.slice_hashes.get('logo_healthdash', '')}:display_subsample={shrink}"
+        )
+
+        for name, rect in BUTTON_ATLAS_SLICES.items():
+            self.button_images[name] = self._copy_slice(name, rect, width, height)
+        for name, rect in BUTTON_ATLAS_ICON_SLICES.items():
+            self.icon_images[name] = self._copy_slice(f"icon_{name}", rect, width, height)
+
+    def logo_for_header(self) -> Optional[Any]:
+        return self.logo_image
+
+    def audit_summary(self) -> str:
+        if not self.enabled:
+            return f"button atlas disabled: {self.rejected_reason}"
+        return f"button atlas loaded: {self.path} sha256={self.atlas_hash[:16]} slices={len(self.slice_hashes)}"
+
+    def icon_for_text(self, text: str, tone: str = "") -> Optional[Any]:
+        lowered = sanitize_text(text, max_chars=120).lower()
+        tone = sanitize_text(tone, max_chars=32).lower()
+        rules: Tuple[Tuple[str, str], ...] = (
+            ("dashboard", "dashboard"), ("medication", "medications"), ("safety", "safety"),
+            ("pill bottle", "scanner"), ("scanner", "scanner"), ("dental", "dental"),
+            ("exercise", "exercise"), ("recovery", "recovery"), ("chat", "chat"),
+            ("help", "help"), ("settings", "settings"), ("save", "save"),
+            ("cancel", "cancel"), ("clear", "clear"), ("apply", "apply"),
+            ("send", "send"), ("voice", "voice"), ("attach", "attach"),
+            ("stop", "stop"), ("log dose", "dose"), ("dose taken", "dose"),
+            ("missed", "missed"), ("snooze", "snooze"), ("check in", "checkin"),
+            ("check-in", "checkin"), ("close", "close"), ("back", "back"),
+            ("next", "next"), ("done", "done"), ("view", "view"),
+            ("history", "history"), ("export", "export"), ("print", "print"),
+            ("add", "add"), ("new", "add"), ("delete", "danger"),
+            ("remove", "danger"), ("archive", "danger"), ("danger", "danger"),
+            ("warning", "warning"), ("info", "info"), ("success", "success"),
+        )
+        for needle, key in rules:
+            if needle in lowered and key in self.icon_images:
+                return self.icon_images[key]
+        if tone == "danger":
+            return self.icon_images.get("danger")
+        if tone == "warning":
+            return self.icon_images.get("warning")
+        if tone == "accent":
+            return self.icon_images.get("success")
+        return None
+
+
+
 def _desktop_hex(color: Union[str, Tuple[float, float, float, float], List[float]]) -> str:
     if isinstance(color, str):
         return color
@@ -8530,8 +8851,10 @@ class DesktopListAdapter:
             command=lambda callback=item.on_release: callback(None),
             anchor="w",
             fg_color="transparent",
-            hover_color="#223443",
+            hover_color="#173a4a",
             text_color=DESKTOP_TEXT,
+            border_width=1,
+            border_color="#28506a",
             corner_radius=10,
             font=ctk.CTkFont(size=15, weight="bold"),
             height=36,
@@ -8578,6 +8901,12 @@ class DesktopMedSafeApp:
         self.assistant_request_pending = False
         self.assistant_request_id = 0
         self.assistant_history_dirty = False
+        self.button_atlas: Optional[SecureButtonAtlas] = None
+        self.button_skin_hashes: Dict[str, str] = {}
+        self.healthdash_logo_image: Optional[Any] = None
+        self.healthdash_logo_hash = ""
+        self.healthdash_logo_path: Optional[Path] = None
+        self.custom_nav_buttons: Dict[str, Any] = {}
         self.assistant_context_refresh_request_id = 0
         self.assistant_quick_prompt_buttons = {}
         self.assistant_context_visible = True
@@ -8612,7 +8941,7 @@ class DesktopMedSafeApp:
         ctk.set_default_color_theme("green")
 
         self.window = ctk.CTk()
-        self.window.title("MedSafe Desktop")
+        self.window.title("HealthDash")
         screen_width = max(960, int(self.window.winfo_screenwidth() or 1280))
         screen_height = max(720, int(self.window.winfo_screenheight() or 800))
         window_width = min(1440, max(960, screen_width - 80))
@@ -9216,7 +9545,7 @@ class DesktopMedSafeApp:
             "danger": "#b84e58",
             "warning": "#936513",
         }
-        return ctk.CTkButton(
+        button = ctk.CTkButton(
             parent,
             text=text,
             command=command,
@@ -9225,7 +9554,102 @@ class DesktopMedSafeApp:
             corner_radius=12,
             height=38,
             text_color=DESKTOP_TEXT,
+            border_width=1,
+            border_color="#22d7df" if tone == "accent" else DESKTOP_BORDER,
+            font=ctk.CTkFont(size=13, weight="bold"),
         )
+        return self._decorate_button(button, text=text, tone=tone)
+
+    def _load_button_atlas(self) -> bool:
+        if self.button_atlas is None:
+            self.button_atlas = SecureButtonAtlas(self.paths)
+        loaded = self.button_atlas.load()
+        if loaded:
+            self.button_skin_hashes = dict(self.button_atlas.slice_hashes)
+        return loaded
+
+    def _decorate_button(self, button: Any, *, text: str = "", tone: str = "secondary") -> Any:
+        clean_text = sanitize_text(text or "", max_chars=160)
+        tone = sanitize_text(tone or "secondary", max_chars=32).lower()
+        fg_map = {
+            "accent": "#078696",
+            "secondary": "#102b38",
+            "neutral": "#132b38",
+            "danger": "#431820",
+            "warning": "#3d2d11",
+        }
+        hover_map = {
+            "accent": "#11aaba",
+            "secondary": "#173a4a",
+            "neutral": "#1c3a4a",
+            "danger": "#672430",
+            "warning": "#5a4218",
+        }
+        try:
+            button.configure(
+                fg_color=fg_map.get(tone, "#102b38"),
+                hover_color=hover_map.get(tone, "#173a4a"),
+                text_color=DESKTOP_TEXT,
+                border_color="#1edce8" if tone == "accent" else "#28506a",
+                border_width=1,
+                corner_radius=10,
+            )
+        except Exception:
+            pass
+        try:
+            # Keep every button visible even when an atlas slice is missing or too
+            # wide for a compact navigation pill. The atlas supplies small icons;
+            # CTk still owns the button body for responsive sizing.
+            button.configure(text=clean_text, height=max(28, int(button.cget("height") or 28)))
+        except Exception:
+            pass
+        try:
+            if self._load_button_atlas() and self.button_atlas is not None:
+                image = self.button_atlas.icon_for_text(clean_text, tone)
+                if image is not None:
+                    current_width = 0
+                    try:
+                        current_width = int(button.cget("width") or 0)
+                    except Exception:
+                        current_width = 0
+                    if current_width == 0 or current_width >= 72 or len(clean_text) <= 8:
+                        button.configure(image=image, compound="left")
+                        # Keep an object reference on the widget as an extra guard for Tk image lifetime.
+                        button._healthdash_button_image = image
+        except Exception as exc:
+            button._healthdash_button_image_error = sanitize_text(exc, max_chars=160)
+        return button
+
+    def _skin_button_tree(self, parent: Any) -> None:
+        try:
+            children = list(parent.winfo_children())
+        except Exception:
+            return
+        for child in children:
+            class_name = child.__class__.__name__
+            if class_name == "CTkButton":
+                try:
+                    label = child.cget("text")
+                except Exception:
+                    label = ""
+                tone = "accent" if str(label).lower() in {"done", "save changes", "apply", "send message", "log dose taken", "check in"} else "secondary"
+                if any(token in str(label).lower() for token in ("delete", "remove", "danger", "archive")):
+                    tone = "danger"
+                elif any(token in str(label).lower() for token in ("warning", "snooze", "missed")):
+                    tone = "warning"
+                self._decorate_button(child, text=str(label), tone=tone)
+            elif class_name == "CTkCheckBox":
+                try:
+                    child.configure(
+                        fg_color="#15cddb",
+                        hover_color="#11aaba",
+                        border_color="#4ab8c2",
+                        checkmark_color="#06151c",
+                        text_color=DESKTOP_TEXT,
+                    )
+                except Exception:
+                    pass
+            self._skin_button_tree(child)
 
     def _reset_ids(self) -> None:
         self.root = SimpleNamespace(ids=DesktopIdMap())
@@ -9871,8 +10295,11 @@ class DesktopMedSafeApp:
             return
         self._clear_window_content()
         self.window.grid_rowconfigure(0, weight=0)
-        self.window.grid_rowconfigure(1, weight=1)
+        self.window.grid_rowconfigure(1, weight=0)
+        self.window.grid_rowconfigure(2, weight=1)
+        self._load_button_atlas()
         self._build_layout()
+        self._skin_button_tree(self.window)
         self.main_ui_started = True
         self.refresh_from_disk()
         if hasattr(self, "sync_text_size_widgets"):
@@ -9931,6 +10358,474 @@ class DesktopMedSafeApp:
         )
         self._button(frame, text="Close", command=self.on_close, tone="warning").grid(row=2, column=0, sticky="w", padx=24, pady=(0, 24))
 
+    def _candidate_logo_paths(self) -> List[Path]:
+        roots: List[Path] = []
+        env_path = sanitize_text(os.environ.get("HEALTHDASH_LOGO") or "", max_chars=600)
+        if env_path:
+            try:
+                roots.append(Path(env_path).expanduser().resolve().parent.parent)
+            except Exception:
+                pass
+        try:
+            script_dir = Path(__file__).resolve().parent
+        except Exception:
+            script_dir = Path.cwd()
+        for root in (script_dir, Path.cwd()):
+            try:
+                root = root.resolve()
+            except Exception:
+                pass
+            roots.append(root)
+            roots.extend(list(root.parents)[:3])
+        if self.paths is not None:
+            roots.append(self.paths.root)
+        candidates: List[Path] = []
+        seen = set()
+        if env_path:
+            p = Path(env_path).expanduser()
+            if p.name == HEALTHDASH_LOGO_FILENAME and p.parent.name == HEALTHDASH_LOGO_DIRNAME:
+                candidates.append(p)
+                seen.add(str(p))
+        for root in roots:
+            candidate = root / HEALTHDASH_LOGO_DIRNAME / HEALTHDASH_LOGO_FILENAME
+            key = str(candidate)
+            if key not in seen:
+                seen.add(key)
+                candidates.append(candidate)
+        return candidates
+
+
+    def _embedded_healthdash_logo_image(self) -> Optional[Any]:
+        """Return the built-in HealthDash logo as a trusted fallback.
+
+        This keeps the header branded even when images/logo.png is missing from
+        the local checkout. Tk decodes the embedded PNG directly; no PIL/Pillow,
+        no network, and no untrusted path is involved.
+        """
+        try:
+            image = tk.PhotoImage(data=EMBEDDED_HEALTHDASH_LOGO_PNG_B64)
+            width, height = int(image.width()), int(image.height())
+            display, ratio = self._scale_photo_image(image, HEALTHDASH_LOGO_MAX_WIDTH, HEALTHDASH_LOGO_MAX_HEIGHT, max_denominator=14)
+            if display is not image:
+                self.healthdash_logo_image_source = image
+            digest = hashlib.sha256(base64.b64decode(EMBEDDED_HEALTHDASH_LOGO_PNG_B64)).hexdigest()
+            self.healthdash_logo_image = display
+            self.healthdash_logo_hash = _sha256_text(f"{digest}:embedded:scale={ratio[0]}/{ratio[1]}:display={display.width()}x{display.height()}")
+            self.healthdash_logo_path = None
+            self.button_skin_hashes["healthdash_logo_embedded_png"] = digest
+            self.button_skin_hashes["healthdash_logo_embedded_display"] = self.healthdash_logo_hash
+            return display
+        except Exception as exc:
+            self.button_skin_hashes["healthdash_logo_embedded_error"] = _sha256_text(sanitize_text(exc, max_chars=300))
+            return None
+
+    def _write_embedded_healthdash_logo_if_missing(self) -> None:
+        """Create images/logo.png beside main.py when it is absent.
+
+        Existing files are not overwritten. Invalid external logos are still
+        rejected by _load_healthdash_logo, then the embedded trusted logo is used
+        in memory as a fallback.
+        """
+        try:
+            script_dir = Path(__file__).resolve().parent
+        except Exception:
+            script_dir = Path.cwd()
+        target = script_dir / HEALTHDASH_LOGO_DIRNAME / HEALTHDASH_LOGO_FILENAME
+        try:
+            if target.exists():
+                return
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(base64.b64decode(EMBEDDED_HEALTHDASH_LOGO_PNG_B64))
+            _set_owner_only_permissions(target)
+        except Exception as exc:
+            self.button_skin_hashes["healthdash_logo_write_error"] = _sha256_text(sanitize_text(exc, max_chars=300))
+
+    def _best_tk_scale_ratio(self, source_width: int, source_height: int, target_width: int, target_height: int, *, max_denominator: int = 16) -> Tuple[int, int]:
+        sw = max(1, int(source_width))
+        sh = max(1, int(source_height))
+        tw = max(1, int(target_width))
+        th = max(1, int(target_height))
+        target = min(float(tw) / float(sw), float(th) / float(sh))
+        target = max(0.20, min(1.25, target))
+        best_num, best_den = 1, 1
+        best_score = 999.0
+        for den in range(1, max_denominator + 1):
+            for num in range(1, max_denominator + 1):
+                ratio = num / den
+                out_w = sw * ratio
+                out_h = sh * ratio
+                if out_w > tw + 14 or out_h > th + 10:
+                    continue
+                score = abs(ratio - target) + (0.002 * den) + (0.001 * num)
+                if score < best_score:
+                    best_score = score
+                    best_num, best_den = num, den
+        return max(1, best_num), max(1, best_den)
+
+    def _scale_photo_image(self, image: Any, target_width: int, target_height: int, *, max_denominator: int = 16) -> Tuple[Any, Tuple[int, int]]:
+        width, height = int(image.width()), int(image.height())
+        num, den = self._best_tk_scale_ratio(width, height, target_width, target_height, max_denominator=max_denominator)
+        if num == 1 and den == 1:
+            return image, (num, den)
+        scaled = image.zoom(num, num) if num > 1 else image
+        scaled = scaled.subsample(den, den) if den > 1 else scaled
+        return scaled, (num, den)
+
+    def _load_healthdash_logo(self) -> Optional[Any]:
+        if self.healthdash_logo_image is not None:
+            return self.healthdash_logo_image
+        self._write_embedded_healthdash_logo_if_missing()
+        notes: List[str] = []
+        for candidate in self._candidate_logo_paths():
+            try:
+                if not candidate.exists():
+                    continue
+                resolved = candidate.resolve()
+                if resolved.name != HEALTHDASH_LOGO_FILENAME or resolved.parent.name != HEALTHDASH_LOGO_DIRNAME:
+                    raise ValueError("logo must be named images/logo.png")
+                if resolved.is_symlink() or not resolved.is_file():
+                    raise ValueError("logo must be a regular non-symlink file")
+                stat = resolved.stat()
+                if stat.st_size <= 64 or stat.st_size > HEALTHDASH_LOGO_MAX_BYTES:
+                    raise ValueError("logo size is outside the allowed range")
+                data = resolved.read_bytes()
+                if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+                    raise ValueError("logo must be a PNG")
+                digest = hashlib.sha256(data).hexdigest()
+                image = tk.PhotoImage(file=str(resolved))
+                width, height = int(image.width()), int(image.height())
+                if width < 160 or height < 28 or width > 1600 or height > 300:
+                    raise ValueError(f"logo dimensions rejected: {width}x{height}")
+                display, ratio = self._scale_photo_image(image, HEALTHDASH_LOGO_MAX_WIDTH, HEALTHDASH_LOGO_MAX_HEIGHT, max_denominator=14)
+                if display is not image:
+                    self.healthdash_logo_image_source = image
+                    display_hash = _sha256_text(f"{digest}:scale={ratio[0]}/{ratio[1]}:display={display.width()}x{display.height()}")
+                else:
+                    display_hash = _sha256_text(f"{digest}:display={width}x{height}")
+                self.healthdash_logo_image = display
+                self.healthdash_logo_hash = display_hash
+                self.healthdash_logo_path = resolved
+                self.button_skin_hashes["healthdash_logo_png"] = digest
+                self.button_skin_hashes["healthdash_logo_display"] = display_hash
+                return display
+            except Exception as exc:
+                notes.append(f"{candidate}: {sanitize_text(exc, max_chars=160)}")
+        if notes:
+            self.button_skin_hashes["healthdash_logo_rejected"] = _sha256_text("; ".join(notes[-4:]))
+        return self._embedded_healthdash_logo_image()
+
+    def _candidate_topbar_paths(self) -> List[Path]:
+        roots: List[Path] = []
+        env_path = sanitize_text(os.environ.get("HEALTHDASH_TOPBAR") or "", max_chars=600)
+        if env_path:
+            try:
+                roots.append(Path(env_path).expanduser().resolve().parent.parent)
+            except Exception:
+                pass
+        try:
+            script_dir = Path(__file__).resolve().parent
+        except Exception:
+            script_dir = Path.cwd()
+        for root in (script_dir, Path.cwd()):
+            try:
+                root = root.resolve()
+            except Exception:
+                pass
+            roots.append(root)
+            roots.extend(list(root.parents)[:3])
+        if self.paths is not None:
+            roots.append(self.paths.root)
+        candidates: List[Path] = []
+        seen = set()
+        if env_path:
+            p = Path(env_path).expanduser()
+            if p.name == HEALTHDASH_TOPBAR_FILENAME and p.parent.name == HEALTHDASH_TOPBAR_DIRNAME:
+                candidates.append(p)
+                seen.add(str(p))
+        for root in roots:
+            candidate = root / HEALTHDASH_TOPBAR_DIRNAME / HEALTHDASH_TOPBAR_FILENAME
+            key = str(candidate)
+            if key not in seen:
+                seen.add(key)
+                candidates.append(candidate)
+        return candidates
+
+    def _load_healthdash_topbar_image(self) -> bool:
+        if getattr(self, "healthdash_topbar_image", None) is not None:
+            return True
+        notes: List[str] = []
+        for candidate in self._candidate_topbar_paths():
+            try:
+                if not candidate.exists():
+                    continue
+                resolved = candidate.resolve()
+                if resolved.name != HEALTHDASH_TOPBAR_FILENAME or resolved.parent.name != HEALTHDASH_TOPBAR_DIRNAME:
+                    raise ValueError("topbar must be named images/buttons_topbar.png")
+                if resolved.is_symlink() or not resolved.is_file():
+                    raise ValueError("topbar image must be a regular non-symlink file")
+                stat = resolved.stat()
+                if stat.st_size <= 64 or stat.st_size > HEALTHDASH_TOPBAR_MAX_BYTES:
+                    raise ValueError("topbar image size is outside the allowed range")
+                data = resolved.read_bytes()
+                if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+                    raise ValueError("topbar image must be a PNG")
+                digest = hashlib.sha256(data).hexdigest()
+                source = tk.PhotoImage(file=str(resolved))
+                width, height = int(source.width()), int(source.height())
+                if width < 900 or height < 60 or width > 4096 or height > 1600:
+                    raise ValueError(f"topbar dimensions rejected: {width}x{height}")
+                x1, y1, x2, y2 = HEALTHDASH_TOPBAR_CROP
+                if x2 > width or y2 > height or x1 < 0 or y1 < 0:
+                    raise ValueError("topbar crop is outside the image")
+                cropped = tk.PhotoImage(width=x2 - x1, height=y2 - y1)
+                cropped.tk.call(cropped, "copy", source, "-from", x1, y1, x2, y2, "-to", 0, 0)
+                display, ratio = self._scale_photo_image(cropped, HEALTHDASH_TOPBAR_MAX_DISPLAY_WIDTH, HEALTHDASH_TOPBAR_MAX_DISPLAY_HEIGHT, max_denominator=14)
+                self.healthdash_topbar_source_image = source
+                self.healthdash_topbar_cropped_image = cropped
+                self.healthdash_topbar_image = display
+                self.healthdash_topbar_path = resolved
+                self.healthdash_topbar_hash = _sha256_text(
+                    f"{digest}:crop={x1},{y1},{x2},{y2}:scale={ratio[0]}/{ratio[1]}:display={display.width()}x{display.height()}"
+                )
+                self.healthdash_topbar_scale = ratio
+                self.button_skin_hashes["healthdash_topbar_png"] = digest
+                self.button_skin_hashes["healthdash_topbar_display"] = self.healthdash_topbar_hash
+                return True
+            except Exception as exc:
+                notes.append(f"{candidate}: {sanitize_text(exc, max_chars=160)}")
+        if notes:
+            self.button_skin_hashes["healthdash_topbar_rejected"] = _sha256_text("; ".join(notes[-4:]))
+        return False
+
+    def _topbar_display_rect(self, tab_name: str) -> Optional[Tuple[int, int, int, int]]:
+        rect = HEALTHDASH_TOPBAR_BUTTON_RECTS.get(tab_name)
+        if not rect:
+            return None
+        crop_x, crop_y, _crop_x2, _crop_y2 = HEALTHDASH_TOPBAR_CROP
+        num, den = getattr(self, "healthdash_topbar_scale", (1, 1)) or (1, 1)
+        num = max(1, int(num))
+        den = max(1, int(den))
+        x1, y1, x2, y2 = rect
+        return (
+            max(0, int(round((x1 - crop_x) * num / den))),
+            max(0, int(round((y1 - crop_y) * num / den))),
+            max(1, int(round((x2 - crop_x) * num / den))),
+            max(1, int(round((y2 - crop_y) * num / den))),
+        )
+
+    def _topbar_tab_at(self, event_x: int, event_y: int) -> Optional[str]:
+        for tab_name in HEALTHDASH_TOPBAR_BUTTON_RECTS:
+            rect = self._topbar_display_rect(tab_name)
+            if not rect:
+                continue
+            x1, y1, x2, y2 = rect
+            if x1 <= event_x <= x2 and y1 <= event_y <= y2:
+                return tab_name
+        return None
+
+    def _resize_healthdash_topbar_for_width(self, available_width: int) -> None:
+        cropped = getattr(self, "healthdash_topbar_cropped_image", None)
+        canvas = getattr(self, "healthdash_topbar_canvas", None)
+        if cropped is None or canvas is None:
+            return
+        try:
+            # Fill the nav container with one compact strip. Preserve the
+            # 2048x75 asset ratio so spacing stays even at any window size.
+            usable_w = max(640, int(available_width) - 18)
+            target_w = max(640, min(usable_w, HEALTHDASH_TOPBAR_MAX_DISPLAY_WIDTH))
+            aspect_h = int(round(target_w * 75 / 2048))
+            target_h = max(34, min(HEALTHDASH_TOPBAR_MAX_DISPLAY_HEIGHT, aspect_h))
+            display, ratio = self._scale_photo_image(cropped, target_w, target_h, max_denominator=18)
+            old_ratio = getattr(self, "healthdash_topbar_scale", None)
+            if old_ratio == ratio and getattr(self, "healthdash_topbar_image", None) is not None:
+                try:
+                    existing = getattr(self, "healthdash_topbar_image")
+                    canvas.configure(width=int(existing.width()), height=int(existing.height()))
+                except Exception:
+                    pass
+                return
+            self.healthdash_topbar_image = display
+            self.healthdash_topbar_scale = ratio
+            canvas.configure(width=int(display.width()), height=int(display.height()))
+            canvas.delete("topbar_image")
+            canvas.create_image(0, 0, image=display, anchor="nw", tags=("topbar_image",))
+            canvas.tag_lower("topbar_image")
+            self._refresh_main_nav_styles(getattr(self, "current_tab_name", "Dashboard"))
+        except Exception as exc:
+            self.button_skin_hashes["healthdash_topbar_resize_error"] = _sha256_text(sanitize_text(exc, max_chars=240))
+
+    def _build_image_main_nav(self, parent: Any, tab_names: Tuple[str, ...]) -> bool:
+        if not self._load_healthdash_topbar_image():
+            return False
+        image = getattr(self, "healthdash_topbar_image", None)
+        if image is None:
+            return False
+        self.custom_nav_buttons = {}
+        self.custom_nav_mode = "image"
+        canvas = tk.Canvas(
+            parent,
+            width=int(image.width()),
+            height=int(image.height()),
+            highlightthickness=0,
+            bd=0,
+            bg=DESKTOP_BG,
+        )
+        canvas.create_image(0, 0, image=image, anchor="nw", tags=("topbar_image",))
+        canvas.grid(row=0, column=0, sticky="ew", padx=(0, 0), pady=(3, 3))
+        self.healthdash_topbar_canvas = canvas
+        self.custom_nav_buttons = {name: canvas for name in tab_names}
+
+        def handle_click(event: Any) -> None:
+            tab_name = self._topbar_tab_at(int(event.x), int(event.y))
+            if tab_name:
+                self._select_main_tab(tab_name)
+
+        def handle_motion(event: Any) -> None:
+            canvas.configure(cursor="hand2" if self._topbar_tab_at(int(event.x), int(event.y)) else "")
+
+        def handle_configure(event: Any) -> None:
+            self._resize_healthdash_topbar_for_width(int(event.width))
+
+        parent.bind("<Configure>", handle_configure, add="+")
+        canvas.bind("<Button-1>", handle_click)
+        canvas.bind("<Motion>", handle_motion)
+        self._refresh_main_nav_styles("Dashboard")
+        return True
+
+    def _build_main_nav(self, parent: Any, tabview: Any, tab_names: Tuple[str, ...]) -> None:
+        self.custom_nav_buttons = {}
+        self.custom_nav_mode = "buttons"
+        try:
+            parent.grid_columnconfigure(0, weight=1)
+            parent.grid_columnconfigure(1, weight=0)
+        except Exception:
+            pass
+        if self._build_image_main_nav(parent, tab_names):
+            return
+        try:
+            for col in range(len(tab_names)):
+                parent.grid_columnconfigure(col, weight=1)
+        except Exception:
+            pass
+        compact_widths = {
+            "Dashboard": 122,
+            "Medications": 142,
+            "Safety": 112,
+            "Pill Bottle Scanner": 172,
+            "Dental": 108,
+            "Exercise": 112,
+            "Recovery": 122,
+            "Chat": 104,
+            "Help": 104,
+            "Settings": 112,
+        }
+        for index, tab_name in enumerate(tab_names):
+            row, col = 0, index
+            button = self._button(
+                parent,
+                text=tab_name,
+                command=lambda name=tab_name: self._select_main_tab(name),
+                tone="secondary",
+            )
+            try:
+                button.configure(
+                    width=compact_widths.get(tab_name, 120),
+                    height=30,
+                    corner_radius=7,
+                    font=ctk.CTkFont(size=10, weight="bold"),
+                    anchor="center",
+                    border_width=1,
+                )
+            except Exception:
+                pass
+            button.grid(row=row, column=col, sticky="ew", padx=(2 if col else 0, 2), pady=2)
+            self.custom_nav_buttons[tab_name] = button
+        self._refresh_main_nav_styles("Dashboard")
+
+    def _select_main_tab(self, tab_name: str) -> None:
+        self.current_tab_name = tab_name
+        try:
+            tabs = self.ids.get("main_tabs") if hasattr(self.ids, "get") else self.ids["main_tabs"]
+            tabs.set(tab_name)
+        except Exception:
+            try:
+                self.ids.main_tabs.set(tab_name)
+            except Exception:
+                pass
+        self._refresh_main_nav_styles(tab_name)
+
+    def _refresh_main_nav_styles(self, active_tab: str) -> None:
+        if getattr(self, "custom_nav_mode", "buttons") == "image":
+            canvas = getattr(self, "healthdash_topbar_canvas", None)
+            if canvas is not None:
+                try:
+                    # The image topbar is already visually clear; do not draw an
+                    # extra active underline/outline because it can look offset
+                    # after responsive image scaling.
+                    canvas.delete("active_nav_outline")
+                except Exception:
+                    pass
+            return
+        for name, button in list(self.custom_nav_buttons.items()):
+            selected = name == active_tab
+            try:
+                button.configure(
+                    fg_color="#078696" if selected else "#102b38",
+                    hover_color="#11aaba" if selected else "#173a4a",
+                    border_color="#25f1ff" if selected else "#28506a",
+                    text_color="#ecffff" if selected else DESKTOP_TEXT,
+                    border_width=1,
+                    corner_radius=7,
+                    height=30,
+                )
+            except Exception:
+                pass
+
+    def _hide_builtin_tab_buttons(self, tabview: Any) -> None:
+        for attr in ("_segmented_button", "_segmented_button_grid"):
+            try:
+                widget = getattr(tabview, attr, None)
+                if widget is not None and hasattr(widget, "grid_forget"):
+                    widget.grid_forget()
+            except Exception:
+                pass
+        try:
+            tabview.configure(segmented_button_fg_color=DESKTOP_SURFACE)
+        except Exception:
+            pass
+
+    def _header_logo_widget(self, parent: Any) -> Any:
+        try:
+            logo = self._load_healthdash_logo()
+            if logo is None and self._load_button_atlas() and self.button_atlas is not None:
+                logo = self.button_atlas.logo_for_header()
+            if logo is not None:
+                label = tk.Label(parent, image=logo, text="", bg=DESKTOP_SURFACE, bd=0, highlightthickness=0)
+                label._healthdash_logo_image = logo
+                try:
+                    label.configure(cursor="arrow")
+                except Exception:
+                    pass
+                return label
+        except Exception as exc:
+            self.button_skin_hashes["logo_load_error"] = _sha256_text(sanitize_text(exc, max_chars=300))
+        fallback = ctk.CTkFrame(parent, fg_color="transparent")
+        ctk.CTkLabel(
+            fallback,
+            text="HealthDash",
+            anchor="w",
+            text_color="#7ffcff",
+            font=ctk.CTkFont(size=26, weight="bold"),
+        ).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(
+            fallback,
+            text="Track • Heal • Recover",
+            anchor="w",
+            text_color=DESKTOP_MUTED,
+            font=ctk.CTkFont(size=11, weight="bold"),
+        ).grid(row=1, column=0, sticky="w", pady=(0, 2))
+        return fallback
+
     def _build_layout(self) -> None:
         if self.window is None:
             return
@@ -9940,22 +10835,25 @@ class DesktopMedSafeApp:
         header.grid_columnconfigure(0, weight=1)
 
         title_block = ctk.CTkFrame(header, fg_color="transparent")
-        title_block.grid(row=0, column=0, sticky="ew", padx=18, pady=(8, 10))
+        title_block.grid(row=0, column=0, sticky="ew", padx=18, pady=(6, 6))
         title_block.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(
-            title_block,
-            text="MedSafe Desktop",
-            anchor="w",
-            text_color=DESKTOP_TEXT,
-            font=ctk.CTkFont(size=28, weight="bold"),
-        ).grid(row=0, column=0, sticky="w")
+        self._header_logo_widget(title_block).grid(row=0, column=0, sticky="w")
 
         try:
             self.window.bind("<Control-k>", lambda _event: (self.show_command_palette(), "break")[1])
             self.window.bind("<Control-K>", lambda _event: (self.show_command_palette(), "break")[1])
         except Exception:
             pass
+
+        nav_bar = ctk.CTkFrame(
+            self.window,
+            fg_color=DESKTOP_BG,
+            border_width=1,
+            border_color=DESKTOP_BORDER,
+            corner_radius=14,
+        )
+        nav_bar.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 6))
 
         tabview = ctk.CTkTabview(
             self.window,
@@ -9971,7 +10869,7 @@ class DesktopMedSafeApp:
             text_color=DESKTOP_TEXT,
             text_color_disabled=DESKTOP_MUTED,
         )
-        tabview.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 18))
+        tabview.grid(row=2, column=0, sticky="nsew", padx=18, pady=(0, 18))
         try:
             tabview.configure(
                 segmented_button_fg_color=DESKTOP_SURFACE_ALT,
@@ -9987,8 +10885,11 @@ class DesktopMedSafeApp:
 
         self.ids["main_tabs"] = tabview
 
-        for tab_name in ("Dashboard", "Medications", "Safety", "Pill Bottle Scanner", "Dental", "Exercise", "Recovery", "Chat", "Help", "Settings"):
+        tab_names = ("Dashboard", "Medications", "Safety", "Pill Bottle Scanner", "Dental", "Exercise", "Recovery", "Chat", "Help", "Settings")
+        for tab_name in tab_names:
             tabview.add(tab_name)
+        self._hide_builtin_tab_buttons(tabview)
+        self._build_main_nav(nav_bar, tabview, tab_names)
 
         self._build_dashboard_tab(tabview.tab("Dashboard"))
         self._build_medications_tab(tabview.tab("Medications"))
