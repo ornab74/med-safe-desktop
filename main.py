@@ -238,19 +238,26 @@ DEFAULT_SETTINGS = {
     "startup_password_enabled": False,
     "allow_checklist_uncheck": False,
     "text_size": "Default",
+    "assistant_chat_font_delta": 2,
 }
-TEXT_SIZE_OPTIONS: Tuple[str, ...] = ("Small", "Default", "Large", "Extra Large")
+TEXT_SIZE_OPTIONS: Tuple[str, ...] = ("Tiny", "Compact", "Small", "Default", "Large", "Extra Large", "Huge")
 TEXT_SIZE_SCALE_MAP: Dict[str, float] = {
+    "Tiny": 0.72,
+    "Compact": 0.82,
     "Small": 0.92,
     "Default": 1.00,
     "Large": 1.12,
     "Extra Large": 1.24,
+    "Huge": 1.38,
 }
 TEXT_SIZE_BASE_FONT_MAP: Dict[str, int] = {
+    "Tiny": 9,
+    "Compact": 10,
     "Small": 12,
     "Default": 13,
     "Large": 15,
     "Extra Large": 17,
+    "Huge": 19,
 }
 HELP_FLOW_STEPS: Tuple[Tuple[str, str, str, str], ...] = (
     ("A", "Dashboard", "Triage Today", "See due, missed, upcoming, and the best next action."),
@@ -278,6 +285,20 @@ HELP_FEATURE_GUIDE: Tuple[Tuple[str, str], ...] = (
 )
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 JSON_BLOCK_RE = re.compile(r"\{.*\}", re.S)
+ASSISTANT_CONTEXT_TOKEN_LIMIT = 4000
+ASSISTANT_CONTEXT_TARGET_TOKENS = 3400
+ASSISTANT_CONTEXT_RECENT_TURNS = 8
+ASSISTANT_CONTEXT_COMPACT_TRIGGER_TOKENS = 3000
+ASSISTANT_CONTEXT_MAX_MESSAGES = 28
+ASSISTANT_SUMMARY_MAX_CHARS = 2600
+ASSISTANT_COMPACTION_PROMPT = """
+MedSafe rolling chat compaction prompt v3:
+Compress older local chat turns into a durable memory packet that fits a small 4k-token model.
+Preserve only information needed for future answers. Do not invent. Do not keep private scratchpad text.
+Organize the summary into: stable user preferences, medication/schedule facts mentioned in chat, dental/recovery/movement context, decisions already made, warnings or safety boundaries, unresolved questions, and tone/style preferences.
+Prefer exact medication names, dose numbers, dates, intervals, and user corrections. Drop greetings, duplicate reassurance, filler, and obsolete drafts.
+Keep the summary compact, neutral, and action-oriented. Mark uncertainty explicitly.
+""".strip()
 ACTION_BLOCK_RE = re.compile(r"\[action\]\s*([A-Za-z]+)\s*\[/action\]", re.I | re.S)
 MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 
@@ -1103,7 +1124,7 @@ def build_assistant_quantum_context(
         [
             f"assistant_mode={active_mode}",
             build_schedule_context(data, selected_med_id),
-            build_recent_assistant_context(list(data.get("assistant_history") or [])),
+            build_recent_assistant_context(list(data.get("assistant_history") or []), data.get("assistant_context_memory") or {}, token_budget=700),
             f"user_prompt={sanitize_text(prompt, max_chars=1500)}",
         ]
     )
@@ -1346,6 +1367,7 @@ def vault_defaults() -> Dict[str, Any]:
         "meds": [],
         "med_archives": [],
         "assistant_history": [],
+        "assistant_context_memory": assistant_context_memory_defaults(),
         "dose_safety_review": dose_safety_review_defaults(),
         "safety_reviews": safety_reviews_defaults(),
         "vision_imports": [],
@@ -1389,6 +1411,8 @@ def ensure_vault_shape(raw: Any) -> Dict[str, Any]:
                 "timestamp": safe_float(item.get("timestamp") or time.time()),
             }
         )
+
+    assistant_context_memory = normalize_assistant_context_memory(raw.get("assistant_context_memory") or {})
 
     dose_safety_raw = raw.get("dose_safety_review") if isinstance(raw.get("dose_safety_review"), dict) else {}
     dose_safety_review = dose_safety_review_defaults()
@@ -1607,7 +1631,8 @@ def ensure_vault_shape(raw: Any) -> Dict[str, Any]:
 
     base["meds"] = meds
     base["med_archives"] = med_archives[-240:]
-    base["assistant_history"] = assistant_history[-24:]
+    base["assistant_context_memory"] = assistant_context_memory
+    base["assistant_history"] = assistant_history[-ASSISTANT_CONTEXT_MAX_MESSAGES:]
     base["dose_safety_review"] = dose_safety_review
     base["safety_reviews"] = safety_reviews
     base["vision_imports"] = imports[-16:]
@@ -1809,6 +1834,10 @@ def load_settings(paths: Optional[AppPaths] = None) -> Dict[str, Any]:
     settings["startup_password_enabled"] = bool(settings.get("startup_password_enabled", False))
     settings["allow_checklist_uncheck"] = bool(settings.get("allow_checklist_uncheck", False))
     settings["text_size"] = normalize_setting_choice(settings.get("text_size"), TEXT_SIZE_OPTIONS, "Default")
+    try:
+        settings["assistant_chat_font_delta"] = max(-6, min(10, int(settings.get("assistant_chat_font_delta", 2))))
+    except Exception:
+        settings["assistant_chat_font_delta"] = 2
     return settings
 
 
@@ -3064,6 +3093,76 @@ def build_med_history_text(med: Optional[Dict[str, Any]]) -> str:
     for record in reversed(records[-8:]):
         lines.append(f"{format_timestamp(safe_float(record.get('timestamp')))} • {safe_float(record.get('dose_mg')):g} mg")
     return "\n".join(lines)
+
+
+
+
+def build_recent_activity_text(data: Dict[str, Any], *, limit: int = 24) -> str:
+    rows: List[Tuple[float, str]] = []
+
+    for med in all_stored_medications(data):
+        med_name = sanitize_text(med.get("name") or "Medication", max_chars=120)
+        for record in medication_history_records(med):
+            ts = safe_float(record.get("timestamp"))
+            dose = safe_float(record.get("dose_mg"))
+            if ts > 0:
+                rows.append((ts, f"{format_timestamp(ts)} • Medication • {med_name} • {dose:g} mg"))
+        archived_ts = safe_float(med.get("archived_ts") or 0.0)
+        if archived_ts > 0:
+            rows.append((archived_ts, f"{format_timestamp(archived_ts)} • Medication completed • {med_name}"))
+
+    hygiene = dict(data.get("dental_hygiene") or dental_hygiene_defaults())
+    for label, ts_key in (("Brushed", "last_brush_ts"), ("Flossed", "last_floss_ts"), ("Rinsed", "last_rinse_ts")):
+        ts = safe_float(hygiene.get(ts_key) or 0.0)
+        if ts > 0:
+            rows.append((ts, f"{format_timestamp(ts)} • Dental • {label}"))
+    for item in list(hygiene.get("history") or []):
+        ts = safe_float(item.get("timestamp") or 0.0)
+        if ts > 0:
+            rating = sanitize_text(item.get("rating") or "Hygiene review", max_chars=80)
+            score = safe_float(item.get("score") or 0.0)
+            score_text = f" • {score:.0f}/100" if score > 0 else ""
+            rows.append((ts, f"{format_timestamp(ts)} • Dental scan • {rating}{score_text}"))
+
+    dental_recovery = dict(data.get("dental_recovery") or dental_recovery_defaults())
+    for item in list(dental_recovery.get("daily_logs") or []):
+        ts = safe_float(item.get("timestamp") or 0.0)
+        if ts > 0:
+            status = sanitize_text(item.get("status") or "Recovery photo review", max_chars=80)
+            day = max(0, int(safe_float(item.get("day_number") or 0)))
+            day_text = f" day {day}" if day else ""
+            rows.append((ts, f"{format_timestamp(ts)} • Dental recovery{day_text} • {status}"))
+
+    exercise = dict(data.get("exercise") or exercise_defaults())
+    for item in list(exercise.get("history") or []):
+        ts = safe_float(item.get("timestamp") or 0.0)
+        if ts > 0:
+            habit = sanitize_text(item.get("habit") or "movement", max_chars=40).title()
+            minutes = safe_float(item.get("minutes") or 0.0)
+            rows.append((ts, f"{format_timestamp(ts)} • Exercise • {habit} • {minutes:g} min"))
+
+    recovery = dict(data.get("recovery_support") or recovery_support_defaults())
+    for item in list(recovery.get("history") or []):
+        ts = safe_float(item.get("timestamp") or 0.0)
+        if ts > 0:
+            item_type = sanitize_text(item.get("type") or "checkin", max_chars=40).replace("_", " ").title()
+            label = sanitize_text(item.get("label") or item_type, max_chars=80)
+            streak = safe_float(item.get("streak_days") or -1)
+            streak_text = f" • {int(streak)} days clean" if streak >= 0 else ""
+            rows.append((ts, f"{format_timestamp(ts)} • Recovery • {label}{streak_text}"))
+
+    for item in list(data.get("vision_imports") or []):
+        ts = safe_float(item.get("timestamp") or 0.0)
+        if ts > 0:
+            med_id = sanitize_text(item.get("med_id") or "", max_chars=32)
+            med = next((m for m in all_stored_medications(data) if str(m.get("id")) == med_id), None)
+            med_name = sanitize_text(med.get("name") if med else "Bottle import", max_chars=120)
+            rows.append((ts, f"{format_timestamp(ts)} • Vision scan • {med_name}"))
+
+    if not rows:
+        return "No activity logged yet. Medication doses, dental actions, exercise, recovery check-ins, and vision scans will appear here."
+    rows.sort(key=lambda item: item[0], reverse=True)
+    return "\n".join(text for _ts, text in rows[:max(1, limit)])
 
 
 def build_medication_schedule_text(
@@ -4670,22 +4769,196 @@ def build_schedule_context(data: Dict[str, Any], selected_med_id: Optional[str])
     return "\n".join(lines)
 
 
-def build_recent_assistant_context(history: List[Dict[str, Any]]) -> str:
+def estimate_context_tokens(value: Any) -> int:
+    """Fast local token estimate for the small on-device context window."""
+    text = sanitize_text(value, max_chars=120000)
+    if not text:
+        return 0
+    # A conservative mixed heuristic: words catch prose, chars catch dense JSON/paths.
+    word_count = len(re.findall(r"\S+", text))
+    char_count = len(text)
+    return max(1, int(max(word_count * 1.35, char_count / 3.8)))
+
+
+def assistant_context_memory_defaults() -> Dict[str, Any]:
+    return {
+        "summary": "",
+        "summary_updated_ts": 0.0,
+        "compaction_count": 0,
+        "last_compacted_message_count": 0,
+        "window_token_limit": ASSISTANT_CONTEXT_TOKEN_LIMIT,
+        "target_tokens": ASSISTANT_CONTEXT_TARGET_TOKENS,
+        "recent_turns": ASSISTANT_CONTEXT_RECENT_TURNS,
+    }
+
+
+def normalize_assistant_context_memory(raw: Any) -> Dict[str, Any]:
+    base = assistant_context_memory_defaults()
+    if not isinstance(raw, dict):
+        return base
+    base["summary"] = sanitize_text(raw.get("summary") or "", max_chars=ASSISTANT_SUMMARY_MAX_CHARS)
+    base["summary_updated_ts"] = safe_float(raw.get("summary_updated_ts") or 0.0)
+    base["compaction_count"] = max(0, int(safe_float(raw.get("compaction_count") or 0)))
+    base["last_compacted_message_count"] = max(0, int(safe_float(raw.get("last_compacted_message_count") or 0)))
+    base["window_token_limit"] = max(1200, int(safe_float(raw.get("window_token_limit") or ASSISTANT_CONTEXT_TOKEN_LIMIT)))
+    base["target_tokens"] = max(1000, min(base["window_token_limit"], int(safe_float(raw.get("target_tokens") or ASSISTANT_CONTEXT_TARGET_TOKENS))))
+    base["recent_turns"] = max(4, min(14, int(safe_float(raw.get("recent_turns") or ASSISTANT_CONTEXT_RECENT_TURNS))))
+    return base
+
+
+def format_chat_turn_for_context(item: Dict[str, Any], *, max_chars: int = 420) -> str:
+    role = "User" if item.get("role") == "user" else "Assistant"
+    mode = normalize_assistant_mode(item.get("mode") or "General")
+    mode_suffix = "" if mode == "General" else f" [{mode}]"
+    timestamp = safe_float(item.get("timestamp") or 0.0)
+    when = format_timestamp(timestamp) if timestamp else "unknown time"
+    return f"{role}{mode_suffix} ({when}): {sanitize_text(item.get('content') or '', max_chars=max_chars)}"
+
+
+def build_deterministic_compaction_summary(
+    prior_summary: str,
+    old_messages: List[Dict[str, Any]],
+    *,
+    max_chars: int = ASSISTANT_SUMMARY_MAX_CHARS,
+) -> str:
+    """Local compactor for old chat turns; avoids spending an extra model call."""
+    prior = sanitize_text(prior_summary, max_chars=max_chars)
+    if not old_messages:
+        return prior
+    user_lines: List[str] = []
+    assistant_lines: List[str] = []
+    decisions: List[str] = []
+    safety: List[str] = []
+    prefs: List[str] = []
+    keywords = (
+        "med", "dose", "mg", "interval", "schedule", "missed", "dental", "tooth", "gum", "brush", "floss",
+        "recovery", "craving", "relapse", "streak", "exercise", "walk", "stretch", "preference", "setting",
+        "text size", "compact", "summary", "context", "token", "persistent",
+    )
+    safety_keywords = ("unsafe", "warning", "urgent", "overdose", "self-harm", "suicide", "emergency", "call", "limit", "too soon")
+    pref_keywords = ("like", "prefer", "don't", "remove", "keep", "setting", "text size", "spacing", "compact")
+    for item in old_messages:
+        content = sanitize_text(item.get("content") or "", max_chars=900)
+        if not content:
+            continue
+        lowered = content.lower()
+        line = format_chat_turn_for_context(item, max_chars=360)
+        if item.get("role") == "user":
+            if any(token in lowered for token in keywords):
+                user_lines.append(line)
+            if any(token in lowered for token in pref_keywords):
+                prefs.append(line)
+        else:
+            if any(token in lowered for token in ("done", "changed", "updated", "saved", "removed", "added", "set", "compact")):
+                decisions.append(line)
+            elif any(token in lowered for token in keywords):
+                assistant_lines.append(line)
+        if any(token in lowered for token in safety_keywords):
+            safety.append(line)
+
+    sections: List[str] = []
+    if prior:
+        sections.append("Existing rolling memory:\n" + prior)
+    sections.append("Compaction policy:\n" + ASSISTANT_COMPACTION_PROMPT)
+    if prefs:
+        sections.append("User preferences and UI/app instructions preserved:\n" + "\n".join(prefs[-8:]))
+    if user_lines:
+        sections.append("Important older user context:\n" + "\n".join(user_lines[-10:]))
+    if decisions:
+        sections.append("Decisions/changes already made:\n" + "\n".join(decisions[-10:]))
+    if assistant_lines:
+        sections.append("Useful older assistant context:\n" + "\n".join(assistant_lines[-6:]))
+    if safety:
+        sections.append("Safety boundaries or warnings to preserve:\n" + "\n".join(safety[-6:]))
+    summary = "\n\n".join(sections).strip()
+    if len(summary) > max_chars:
+        summary = summary[-max_chars:].lstrip()
+        first_break = summary.find("\n")
+        if first_break > 0:
+            summary = summary[first_break + 1 :].lstrip()
+        summary = "[Older rolling memory trimmed to fit window.]\n" + summary
+    return sanitize_text(summary, max_chars=max_chars)
+
+
+def compact_assistant_history_if_needed(data: Dict[str, Any], *, force: bool = False) -> Tuple[Dict[str, Any], bool]:
+    history = list(data.get("assistant_history") or [])
+    memory = normalize_assistant_context_memory(data.get("assistant_context_memory") or {})
     if not history:
+        data["assistant_context_memory"] = memory
+        return data, False
+    history_tokens = estimate_context_tokens("\n".join(format_chat_turn_for_context(item, max_chars=900) for item in history))
+    trigger = force or len(history) > ASSISTANT_CONTEXT_MAX_MESSAGES or history_tokens > ASSISTANT_CONTEXT_COMPACT_TRIGGER_TOKENS
+    if not trigger:
+        data["assistant_context_memory"] = memory
+        return data, False
+    recent_count = int(memory.get("recent_turns") or ASSISTANT_CONTEXT_RECENT_TURNS)
+    recent_count = max(4, min(14, recent_count))
+    if len(history) <= recent_count:
+        data["assistant_context_memory"] = memory
+        return data, False
+    old_messages = history[:-recent_count]
+    recent_messages = history[-recent_count:]
+    memory["summary"] = build_deterministic_compaction_summary(memory.get("summary") or "", old_messages)
+    memory["summary_updated_ts"] = time.time()
+    memory["compaction_count"] = int(memory.get("compaction_count") or 0) + 1
+    memory["last_compacted_message_count"] = len(old_messages)
+    memory["recent_turns"] = recent_count
+    data["assistant_context_memory"] = memory
+    data["assistant_history"] = recent_messages
+    return data, True
+
+
+def build_recent_assistant_context(history: List[Dict[str, Any]], memory: Optional[Dict[str, Any]] = None, *, token_budget: int = 900) -> str:
+    memory = normalize_assistant_context_memory(memory or {})
+    lines: List[str] = []
+    summary = sanitize_text(memory.get("summary") or "", max_chars=ASSISTANT_SUMMARY_MAX_CHARS)
+    if summary:
+        lines.append("Rolling compacted chat memory:")
+        lines.append(summary)
+    if history:
+        lines.append("Recent sliding-window chat turns:")
+        # Add newest turns first within budget, then reverse for natural order.
+        picked: List[str] = []
+        used = estimate_context_tokens("\n".join(lines))
+        for item in reversed(history):
+            line = format_chat_turn_for_context(item, max_chars=320)
+            cost = estimate_context_tokens(line)
+            if picked and used + cost > max(220, token_budget):
+                break
+            picked.append(line)
+            used += cost
+        lines.extend(reversed(picked))
+    if not lines:
         return "No prior assistant messages."
-    lines = ["Recent local chat memory:"]
-    for item in history[-6:]:
-        role = "User" if item.get("role") == "user" else "Assistant"
-        mode = normalize_assistant_mode(item.get("mode") or "General")
-        mode_suffix = "" if mode == "General" else f" [{mode}]"
-        lines.append(f"{role}{mode_suffix}: {sanitize_text(item.get('content') or '', max_chars=280)}")
     return "\n".join(lines)
 
+
+def build_context_window_report(data: Dict[str, Any], prompt: str = "") -> str:
+    history = list(data.get("assistant_history") or [])
+    memory = normalize_assistant_context_memory(data.get("assistant_context_memory") or {})
+    chat_context = build_recent_assistant_context(history, memory, token_budget=1200)
+    schedule_context = build_schedule_context(data, None)
+    prompt_tokens = estimate_context_tokens(prompt)
+    chat_tokens = estimate_context_tokens(chat_context)
+    schedule_tokens = estimate_context_tokens(schedule_context)
+    total = prompt_tokens + chat_tokens + schedule_tokens
+    limit = int(memory.get("window_token_limit") or ASSISTANT_CONTEXT_TOKEN_LIMIT)
+    return "\n".join(
+        [
+            f"Context window: ~{total}/{limit} tokens used before model overhead.",
+            f"Vault/schedule context: ~{schedule_tokens} tokens",
+            f"Rolling chat memory: ~{estimate_context_tokens(memory.get('summary') or '')} tokens",
+            f"Recent chat window: {len(history)} messages, ~{chat_tokens} tokens",
+            f"Compactions run: {int(memory.get('compaction_count') or 0)}",
+            f"Last compacted: {format_timestamp(safe_float(memory.get('summary_updated_ts') or 0.0)) if memory.get('summary_updated_ts') else 'Not yet'}",
+            "Window policy: keep latest turns verbatim, compact older turns, reserve room for the next reply.",
+        ]
+    )
 
 def workflow_surface_hint(tab_name: str) -> str:
     clean = sanitize_text(tab_name, max_chars=80)
     hints = {
-        "Dashboard": "Dashboard: start with Care Compass, then reconcile due or missed rows before changing the regimen.",
+        "Dashboard": "",
         "Medications": "Medications: select an entry to edit, or start a new one and confirm dose, interval, max daily amount, and timing.",
         "Safety": "Safety: run an all-meds scan after regimen changes, then review any caution before logging.",
         "Pill Bottle Scanner": "Pill Bottle Scanner: import bottle photos as draft context, then manually confirm the label details before saving.",
@@ -4801,13 +5074,30 @@ def run_assistant_request(
         + "\nThe provided _quantum:state, RGB, and psutil values are private local context-routing metadata only. "
         "Use them to choose emphasis, ordering, caution tone, and retrieval focus; never present them as medical evidence, diagnosis, certainty, or a reason to act."
     )
+    data, _compacted = compact_assistant_history_if_needed(dict(data), force=False)
+    memory = normalize_assistant_context_memory(data.get("assistant_context_memory") or {})
+    prompt_block = f"User request: {sanitize_text(prompt, max_chars=1200)}"
+    fixed_tokens = estimate_context_tokens(prompt_block + "\n" + final_instruction + "\n" + quantum_context.get("assistant_prompt_block", ""))
+    target_tokens = int(memory.get("target_tokens") or ASSISTANT_CONTEXT_TARGET_TOKENS)
+    remaining = max(700, target_tokens - fixed_tokens)
+    schedule_budget = max(450, int(remaining * 0.58))
+    chat_budget = max(300, remaining - schedule_budget)
+    schedule_context = build_schedule_context(data, selected_med_id)
+    if estimate_context_tokens(schedule_context) > schedule_budget:
+        schedule_context = sanitize_text(schedule_context, max_chars=max(1800, schedule_budget * 4)) + "\n[Schedule context trimmed to protect the 4k-token window.]"
+    recent_context = build_recent_assistant_context(
+        list(data.get("assistant_history") or []),
+        memory,
+        token_budget=chat_budget,
+    )
     user_text = "\n\n".join(
         [
             f"Assistant mode: {active_mode}",
-            build_schedule_context(data, selected_med_id),
-            build_recent_assistant_context(list(data.get("assistant_history") or [])),
+            f"Context budget: target~{target_tokens} tokens, schedule_budget~{schedule_budget}, chat_budget~{chat_budget}. Sliding-window compaction is active.",
+            schedule_context,
+            recent_context,
             quantum_context.get("assistant_prompt_block", ""),
-            f"User request: {sanitize_text(prompt, max_chars=1500)}",
+            prompt_block,
             final_instruction,
         ]
     )
@@ -5659,7 +5949,7 @@ MDScreen:
 
         MDLabel:
             id: status_label
-            text: "Encrypted local scheduler ready."
+            text: ""
             theme_text_color: "Custom"
             text_color: 0.78, 0.88, 0.85, 1
             halign: "center"
@@ -7726,7 +8016,7 @@ class MedSafeApp(MDApp):
     def append_assistant_message(self, role: str, content: str) -> None:
         history = list(self.data_cache.get("assistant_history") or [])
         history.append({"role": role, "content": sanitize_text(content, max_chars=3000), "timestamp": time.time()})
-        self.data_cache["assistant_history"] = history[-24:]
+        self.data_cache["assistant_history"] = history[-ASSISTANT_CONTEXT_MAX_MESSAGES:]
         self.save_data()
         self.refresh_assistant_history()
 
@@ -8305,6 +8595,7 @@ class DesktopMedSafeApp:
         self.setup_download_model_var: Optional[tk.BooleanVar] = None
         self.startup_password_lock_var: Optional[tk.BooleanVar] = None
         self.allow_checklist_uncheck_var: Optional[tk.BooleanVar] = None
+        self.recovery_enabled_var: Optional[tk.BooleanVar] = None
         self.checklist_target_date_text = date.today().isoformat()
         self.startup_temp_cleanup_message = ""
         self.regimen_check_review: Dict[str, Any] = {}
@@ -8345,6 +8636,7 @@ class DesktopMedSafeApp:
             )
         self.vault = EncryptedVault(self.paths)
         self.settings_data = load_settings(self.paths)
+        self.assistant_chat_font_delta = max(-6, min(10, int(self.settings_data.get("assistant_chat_font_delta", 2))))
         self.apply_text_size_setting(self.settings_data.get("text_size"))
         if self.vault:
             self.vault.clear_cached_key()
@@ -9539,7 +9831,6 @@ class DesktopMedSafeApp:
             self._save_security_settings()
             self._close_unlock_popup()
             self._enter_main_app()
-            self.set_status("Vault unlocked for this session.")
         except Exception:
             self.ids.unlock_password.text = ""
             self._set_start_screen_status("unlock_status_label", "That password did not unlock the encrypted vault. Please try again.")
@@ -9645,12 +9936,11 @@ class DesktopMedSafeApp:
             return
 
         header = self._card(self.window)
-        header.grid(row=0, column=0, sticky="ew", padx=18, pady=(18, 10))
+        header.grid(row=0, column=0, sticky="ew", padx=18, pady=(8, 4))
         header.grid_columnconfigure(0, weight=1)
-        header.grid_columnconfigure(1, weight=0)
 
         title_block = ctk.CTkFrame(header, fg_color="transparent")
-        title_block.grid(row=0, column=0, sticky="ew", padx=18, pady=18)
+        title_block.grid(row=0, column=0, sticky="ew", padx=18, pady=(8, 10))
         title_block.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
@@ -9660,50 +9950,6 @@ class DesktopMedSafeApp:
             text_color=DESKTOP_TEXT,
             font=ctk.CTkFont(size=28, weight="bold"),
         ).grid(row=0, column=0, sticky="w")
-
-        ctk.CTkLabel(
-            title_block,
-            text=f"Encrypted local vault: {self.paths.root if self.paths else default_storage_root()}",
-            anchor="w",
-            text_color=DESKTOP_MUTED,
-            font=ctk.CTkFont(size=13),
-        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
-
-        status_label = ctk.CTkLabel(
-            title_block,
-            text="Encrypted local scheduler ready.",
-            anchor="w",
-            justify="left",
-            wraplength=860,
-            text_color=DESKTOP_MUTED,
-            font=ctk.CTkFont(size=13),
-        )
-        status_label.grid(row=2, column=0, sticky="ew", pady=(10, 0))
-        self._register("status_label", DesktopLabelAdapter(status_label))
-        workflow_hint = ctk.CTkLabel(
-            title_block,
-            text=workflow_surface_hint("Dashboard"),
-            anchor="w",
-            justify="left",
-            wraplength=860,
-            text_color=DESKTOP_TEXT,
-            font=ctk.CTkFont(size=13, weight="bold"),
-        )
-        workflow_hint.grid(row=3, column=0, sticky="ew", pady=(8, 0))
-        self._register("workflow_hint_label", DesktopLabelAdapter(workflow_hint))
-
-        header_side = ctk.CTkFrame(header, fg_color="transparent")
-        header_side.grid(row=0, column=1, rowspan=2, sticky="ne", padx=18, pady=18)
-        self._button(header_side, text="Refresh Vault", command=self.refresh_from_disk, tone="neutral").grid(
-            row=0, column=0, sticky="e"
-        )
-        ctk.CTkLabel(
-            header_side,
-            text="Ctrl+K opens commands",
-            anchor="e",
-            text_color=DESKTOP_MUTED,
-            font=ctk.CTkFont(size=12),
-        ).grid(row=1, column=0, sticky="e", pady=(8, 0))
 
         try:
             self.window.bind("<Control-k>", lambda _event: (self.show_command_palette(), "break")[1])
@@ -9793,7 +10039,7 @@ class DesktopMedSafeApp:
         for row, (left_id, left_title, right_id, right_title) in enumerate(
             (
                 ("care_compass_meds", "Meds", "care_compass_safety", "Safety"),
-                ("care_compass_routines", "Routines", "care_compass_privacy", "Privacy"),
+                ("care_compass_routines", "Routines", "care_compass_days_clean", "Days Clean"),
             ),
             start=2,
         ):
@@ -9817,9 +10063,7 @@ class DesktopMedSafeApp:
                 value_label = self._label(tile, text="Ready", bold=True, wrap=220)
                 value_label.widget.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 10))
                 self._register(widget_id, value_label)
-        self._button(compass_card, text="Act On Best Step", command=self.on_dashboard_best_action, tone="warning").grid(
-            row=4, column=0, columnspan=2, sticky="ew", padx=18, pady=(4, 18)
-        )
+        # Removed dashboard action button; the checklist and activity feed are the primary actions now.
 
         risk_card = self._card(left)
         risk_card.grid(row=1, column=0, sticky="nsew", pady=7)
@@ -9911,16 +10155,13 @@ class DesktopMedSafeApp:
         nudge_box = self._readonly_box(nudge_card, height=150)
         nudge_box.widget.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 12))
         self._register("dashboard_nudge", nudge_box)
-        dashboard_flow = self._readonly_box(nudge_card, height=88)
-        dashboard_flow.widget.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 12))
-        self._register("dashboard_flow_path", dashboard_flow)
-        self._button(nudge_card, text="Open Help & Flow Guide", command=lambda: self.navigate_to_tab("Help"), tone="neutral").grid(
-            row=3, column=0, sticky="ew", padx=18, pady=(0, 18)
-        )
+        # Removed best-path simulation box from the dashboard nudge card.
 
         right = ctk.CTkFrame(scroll, fg_color="transparent")
         right.grid(row=0, column=1, sticky="nsew", padx=(7, 14), pady=14)
         right.grid_columnconfigure(0, weight=1)
+        right.grid_rowconfigure(2, weight=2)
+        right.grid_rowconfigure(3, weight=1)
 
         timeline_card = self._card(right)
         timeline_card.grid(row=0, column=0, sticky="nsew", pady=(0, 7))
@@ -9971,12 +10212,7 @@ class DesktopMedSafeApp:
         selected_summary = self._readonly_box(selection_card, height=135)
         selected_summary.widget.grid(row=3, column=0, sticky="nsew", padx=18, pady=(0, 12))
         self._register("selected_med_summary", selected_summary)
-        ctk.CTkLabel(selection_card, text="Dose Plan", anchor="w", text_color=DESKTOP_MUTED).grid(
-            row=4, column=0, sticky="w", padx=18
-        )
-        selected_schedule = self._readonly_box(selection_card, height=160)
-        selected_schedule.widget.grid(row=5, column=0, sticky="nsew", padx=18, pady=(6, 18))
-        self._register("selected_med_schedule", selected_schedule)
+        # Dashboard dose-plan preview removed to keep the daily checklist higher on screen.
 
         checklist_card = self._card(right)
         checklist_card.grid(row=2, column=0, sticky="nsew", pady=7)
@@ -10027,10 +10263,10 @@ class DesktopMedSafeApp:
         history_card = self._card(right)
         history_card.grid(row=3, column=0, sticky="nsew", pady=(7, 0))
         history_card.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(history_card, text="Recent Dose History", anchor="w", text_color=DESKTOP_TEXT, font=ctk.CTkFont(size=18, weight="bold")).grid(
+        ctk.CTkLabel(history_card, text="Recent Activity", anchor="w", text_color=DESKTOP_TEXT, font=ctk.CTkFont(size=18, weight="bold")).grid(
             row=0, column=0, sticky="w", padx=18, pady=(18, 10)
         )
-        history_box = self._readonly_box(history_card, height=145)
+        history_box = self._readonly_box(history_card, height=260)
         history_box.widget.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 18))
         self._register("selected_med_history", history_box)
 
@@ -10038,18 +10274,18 @@ class DesktopMedSafeApp:
         tab.grid_columnconfigure(0, weight=1)
         tab.grid_rowconfigure(0, weight=1)
 
-        scroll = ctk.CTkScrollableFrame(
-            tab,
-            fg_color="transparent",
-            scrollbar_button_color="#314455",
-            scrollbar_button_hover_color="#42586c",
-        )
-        scroll.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
-        scroll.grid_columnconfigure(0, weight=1)
-        scroll.grid_columnconfigure(1, weight=2)
+        # Use a fixed two-column shell instead of putting the whole tab inside one
+        # giant scroll area. Each pane owns its own scrollbar, so the medication
+        # editor stretches to the available screen height and the action buttons
+        # stay reachable without wasting blank space at the bottom.
+        shell = ctk.CTkFrame(tab, fg_color="transparent")
+        shell.grid(row=0, column=0, sticky="nsew", padx=14, pady=14)
+        shell.grid_columnconfigure(0, weight=1)
+        shell.grid_columnconfigure(1, weight=2)
+        shell.grid_rowconfigure(0, weight=1)
 
-        list_card = self._card(scroll)
-        list_card.grid(row=0, column=0, sticky="nsew", padx=(14, 7), pady=14)
+        list_card = self._card(shell)
+        list_card.grid(row=0, column=0, sticky="nsew", padx=(0, 7), pady=0)
         list_card.grid_rowconfigure(2, weight=1)
         list_card.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(list_card, text="Medication List", anchor="w", text_color=DESKTOP_TEXT, font=ctk.CTkFont(size=18, weight="bold")).grid(
@@ -10074,7 +10310,7 @@ class DesktopMedSafeApp:
         self._register("med_list", DesktopListAdapter(med_list_frame))
 
         form_card = ctk.CTkScrollableFrame(
-            scroll,
+            shell,
             fg_color=DESKTOP_SURFACE,
             border_width=1,
             border_color=DESKTOP_BORDER,
@@ -10082,7 +10318,7 @@ class DesktopMedSafeApp:
             scrollbar_button_color="#314455",
             scrollbar_button_hover_color="#42586c",
         )
-        form_card.grid(row=0, column=1, sticky="nsew", padx=(7, 14), pady=14)
+        form_card.grid(row=0, column=1, sticky="nsew", padx=(7, 0), pady=0)
         form_card.grid_columnconfigure((0, 1, 2), weight=1)
 
         form_selection = self._label(form_card, text="Creating a new medication", bold=True, wrap=720)
@@ -10450,8 +10686,23 @@ class DesktopMedSafeApp:
         prompt_lens.widget.grid(row=6, column=0, sticky="ew", padx=16, pady=(0, 10))
         self._register("assistant_prompt_lens", prompt_lens)
         quantum_panel = self._readonly_box(context_panel, height=210)
-        quantum_panel.widget.grid(row=7, column=0, sticky="ew", padx=16, pady=(0, 16))
+        quantum_panel.widget.grid(row=7, column=0, sticky="ew", padx=16, pady=(0, 10))
         self._register("assistant_quantum_state", quantum_panel)
+
+        ctk.CTkLabel(context_panel, text="Context Window", anchor="w", text_color=DESKTOP_TEXT, font=ctk.CTkFont(size=14, weight="bold")).grid(
+            row=8, column=0, sticky="w", padx=16, pady=(0, 8)
+        )
+        context_report = self._readonly_box(context_panel, height=142)
+        context_report.widget.grid(row=9, column=0, sticky="ew", padx=16, pady=(0, 10))
+        self._register("assistant_context_window_report", context_report)
+        compact_button = self._button(
+            context_panel,
+            text="Compact Memory Now",
+            command=self.on_assistant_compact_memory,
+            tone="secondary",
+        )
+        compact_button.grid(row=10, column=0, sticky="ew", padx=16, pady=(0, 16))
+        self.ids["assistant_compact_button"] = compact_button
 
         chat_card = self._card(body)
         chat_card.grid(row=0, column=1, sticky="nsew", pady=0)
@@ -11134,6 +11385,49 @@ class DesktopMedSafeApp:
             text_color=DESKTOP_MUTED,
             font=ctk.CTkFont(size=12),
         ).grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 14))
+
+        recovery_preferences = ctk.CTkFrame(
+            security,
+            fg_color=DESKTOP_SURFACE_ALT,
+            border_width=1,
+            border_color=DESKTOP_BORDER,
+            corner_radius=14,
+        )
+        recovery_preferences.grid(row=6, column=0, sticky="ew", padx=18, pady=(0, 18))
+        recovery_preferences.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            recovery_preferences,
+            text="Recovery Support",
+            anchor="w",
+            text_color=DESKTOP_TEXT,
+            font=ctk.CTkFont(size=16, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=16, pady=(14, 6))
+        recovery_state_for_toggle = self.current_recovery_support_state()
+        self.recovery_enabled_var = tk.BooleanVar(value=bool(recovery_state_for_toggle.get("enabled", False)))
+        recovery_toggle = ctk.CTkCheckBox(
+            recovery_preferences,
+            text="Enable recovery support and Days Clean dashboard tile",
+            variable=self.recovery_enabled_var,
+            onvalue=True,
+            offvalue=False,
+            command=self.on_toggle_recovery_support,
+            fg_color=DESKTOP_ACCENT,
+            hover_color="#0d6b63",
+            border_color=DESKTOP_BORDER,
+            text_color=DESKTOP_TEXT,
+            font=ctk.CTkFont(size=14, weight="bold"),
+        )
+        recovery_toggle.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 8))
+        self.ids["recovery_enabled_toggle"] = recovery_toggle
+        ctk.CTkLabel(
+            recovery_preferences,
+            text="Turn this off when recovery tracking is not part of your app use. Existing recovery notes stay encrypted but the dashboard will not promote the streak tile.",
+            anchor="w",
+            justify="left",
+            wraplength=920,
+            text_color=DESKTOP_MUTED,
+            font=ctk.CTkFont(size=12),
+        ).grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 14))
         accessibility_preferences = ctk.CTkFrame(
             security,
             fg_color=DESKTOP_SURFACE_ALT,
@@ -11141,7 +11435,7 @@ class DesktopMedSafeApp:
             border_color=DESKTOP_BORDER,
             corner_radius=14,
         )
-        accessibility_preferences.grid(row=6, column=0, sticky="ew", padx=18, pady=(0, 18))
+        accessibility_preferences.grid(row=7, column=0, sticky="ew", padx=18, pady=(0, 18))
         accessibility_preferences.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(
             accessibility_preferences,
@@ -11185,7 +11479,9 @@ class DesktopMedSafeApp:
         ).grid(row=2, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 14))
 
     def set_status(self, text: str) -> None:
-        self.ids.status_label.text = sanitize_text(text, max_chars=220)
+        status_label = self.ids.get("status_label") if hasattr(self.ids, "get") else None
+        if status_label is not None:
+            status_label.text = sanitize_text(text, max_chars=220)
 
     def show_dialog(self, title: str, text: str) -> None:
         if self.window is None:
@@ -11515,8 +11811,9 @@ class DesktopMedSafeApp:
         self.ids.today_timeline.text = build_timeline_text(meds, now)
         self.ids.dashboard_selection.text = selection_text
         self.ids.selected_med_summary.text = summary_text
-        self.ids.selected_med_schedule.text = schedule_text
-        self.ids.selected_med_history.text = build_med_history_text(selected)
+        if "selected_med_schedule" in self.ids:
+            self.ids.selected_med_schedule.text = schedule_text
+        self.ids.selected_med_history.text = build_recent_activity_text(self.data_cache)
         self.ids.dashboard_nudge.text = build_dashboard_nudge_text(
             selected,
             self.current_recovery_support_state(),
@@ -11789,11 +12086,30 @@ class DesktopMedSafeApp:
                 self.allow_checklist_uncheck_var.set(bool(settings.get("allow_checklist_uncheck", False)))
             except Exception:
                 pass
+        if self.recovery_enabled_var is not None:
+            try:
+                self.recovery_enabled_var.set(bool(self.current_recovery_support_state().get("enabled", False)))
+            except Exception:
+                pass
         if self.startup_password_lock_var is not None:
             try:
                 self.startup_password_lock_var.set(bool(self.vault and self.vault.is_key_protected()))
             except Exception:
                 pass
+
+    def on_toggle_recovery_support(self) -> None:
+        state = self.current_recovery_support_state()
+        enabled = bool(self.recovery_enabled_var.get()) if self.recovery_enabled_var is not None else False
+        state["enabled"] = enabled
+        self.data_cache["recovery_support"] = state
+        self.save_data()
+        self.refresh_dashboard()
+        self.refresh_recovery_support_ui()
+        self.set_status(
+            "Recovery support enabled. Days Clean appears after the first recovery check-in."
+            if enabled
+            else "Recovery support disabled. Existing encrypted recovery history was kept."
+        )
 
     def on_toggle_checklist_uncheck(self) -> None:
         enabled = bool(self.allow_checklist_uncheck_var.get()) if self.allow_checklist_uncheck_var is not None else False
@@ -12186,7 +12502,27 @@ class DesktopMedSafeApp:
 
     def toggle_assistant_context_panel(self) -> None:
         self.set_assistant_context_visible(not bool(self.assistant_context_visible))
-        self.set_status("Chat context panel shown." if self.assistant_context_visible else "Chat context panel hidden.")
+        self.set_status("")
+
+    def refresh_assistant_context_window_report(self) -> None:
+        adapter = self.ids.get("assistant_context_window_report")
+        if adapter is None:
+            return
+        prompt = ""
+        try:
+            prompt = self.ids.assistant_input.text
+        except Exception:
+            prompt = ""
+        adapter.text = build_context_window_report(self.data_cache, prompt)
+
+    def on_assistant_compact_memory(self) -> None:
+        self.data_cache, compacted = compact_assistant_history_if_needed(self.data_cache, force=True)
+        self.save_data()
+        self.assistant_history_dirty = False
+        self.refresh_assistant_history()
+        self.refresh_assistant_context_panel()
+        self.refresh_assistant_context_window_report()
+        self.set_status("Chat memory compacted." if compacted else "Chat memory already fits the window.")
 
     def refresh_assistant_chat_font(self) -> None:
         box = getattr(self.ids.get("assistant_history"), "widget", None)
@@ -12195,7 +12531,7 @@ class DesktopMedSafeApp:
         input_box = getattr(self.ids.get("assistant_input"), "widget", None)
         if input_box is not None:
             try:
-                input_box.configure(font=ctk.CTkFont(size=max(12, self.text_size_base_font_size() + self.assistant_chat_font_delta)))
+                input_box.configure(font=ctk.CTkFont(size=max(9, self.text_size_base_font_size() + self.assistant_chat_font_delta)))
             except Exception:
                 pass
         label = self.ids.get("assistant_chat_font_label")
@@ -12205,7 +12541,15 @@ class DesktopMedSafeApp:
         self.refresh_assistant_history()
 
     def adjust_assistant_chat_text_size(self, delta: int) -> None:
-        self.assistant_chat_font_delta = max(-2, min(8, int(self.assistant_chat_font_delta) + int(delta)))
+        self.assistant_chat_font_delta = max(-6, min(10, int(self.assistant_chat_font_delta) + int(delta)))
+        if self.paths is not None:
+            try:
+                save_settings({"assistant_chat_font_delta": self.assistant_chat_font_delta}, self.paths)
+                self.settings_data = load_settings(self.paths)
+            except Exception:
+                self.settings_data["assistant_chat_font_delta"] = self.assistant_chat_font_delta
+        else:
+            self.settings_data["assistant_chat_font_delta"] = self.assistant_chat_font_delta
         self.refresh_assistant_chat_font()
         self.set_status("Chat text size updated.")
 
@@ -12344,6 +12688,7 @@ class DesktopMedSafeApp:
                     "Prompt lens: direct local context with conservative safety boundaries. "
                     f"Prompt: {health['clarity']} | targets={health['targets']} | {health['suggestion']}"
                 )
+            self.refresh_assistant_context_window_report()
             return
         health = assistant_prompt_health(current_prompt, self.assistant_mode)
         context_bits = []
@@ -12376,6 +12721,7 @@ class DesktopMedSafeApp:
             self.ids.assistant_prompt_lens.text = (
                 f"{lens} Prompt: {health['clarity']} | style={health['stance']} | focus={health['targets']} | {health['suggestion']}"
             )
+        self.refresh_assistant_context_window_report()
 
     def on_assistant_quick_prompt(self, prompt: str, *, label: str = "") -> None:
         clean = sanitize_text(prompt, max_chars=1000)
@@ -12583,7 +12929,8 @@ class DesktopMedSafeApp:
                 "timestamp": time.time(),
             }
         )
-        self.data_cache["assistant_history"] = history[-24:]
+        self.data_cache["assistant_history"] = history[-ASSISTANT_CONTEXT_MAX_MESSAGES:]
+        self.data_cache, _compacted = compact_assistant_history_if_needed(self.data_cache, force=False)
         if persist:
             self.save_data()
             self.assistant_history_dirty = False
@@ -12736,7 +13083,7 @@ class DesktopMedSafeApp:
                 "timestamp": time.time(),
             }
         )
-        self.data_cache["assistant_history"] = history[-24:]
+        self.data_cache["assistant_history"] = history[-ASSISTANT_CONTEXT_MAX_MESSAGES:]
         self.assistant_stream_message_index = len(self.data_cache["assistant_history"]) - 1
         self.assistant_stream_text = ""
         self.assistant_stream_index = 0
@@ -12800,7 +13147,7 @@ class DesktopMedSafeApp:
                 "timestamp": time.time(),
             }
         )
-        self.data_cache["assistant_history"] = history[-24:]
+        self.data_cache["assistant_history"] = history[-ASSISTANT_CONTEXT_MAX_MESSAGES:]
         self.assistant_stream_message_index = len(self.data_cache["assistant_history"]) - 1
         self.assistant_stream_text = sanitize_text(reply, max_chars=10000)
         self.assistant_stream_index = 0
@@ -13857,8 +14204,15 @@ def _desktop_refresh_dashboard(self: DesktopMedSafeApp) -> None:
         self.ids.care_compass_safety.text_color = DESKTOP_WARNING if safety_action in {"Caution", "Assessing"} else DESKTOP_DANGER if safety_action in {"Unsafe", "High"} else DESKTOP_SUCCESS
         self.ids.care_compass_routines.text = f"{routine_due_count} due"
         self.ids.care_compass_routines.text_color = DESKTOP_WARNING if routine_due_count else DESKTOP_SUCCESS
-        self.ids.care_compass_privacy.text = "Locked next boot" if password_enabled else "Local vault"
-        self.ids.care_compass_privacy.text_color = DESKTOP_ACCENT if password_enabled else DESKTOP_MUTED
+        if "care_compass_days_clean" in self.ids:
+            checked_in = safe_float(recovery_state.get("latest_checkin_ts") or 0.0) > 0.0
+            if bool(recovery_state.get("enabled")) and checked_in:
+                days_clean = recovery_clean_days(recovery_state, today)
+                self.ids.care_compass_days_clean.text = f"{days_clean} day{'s' if days_clean != 1 else ''}"
+                self.ids.care_compass_days_clean.text_color = DESKTOP_SUCCESS
+            else:
+                self.ids.care_compass_days_clean.text = "Recovery off"
+                self.ids.care_compass_days_clean.text_color = DESKTOP_MUTED
     self.ids.dashboard_risk_title.text = safety_title
     self.ids.dashboard_risk_caption.text = safety_message
     self.ids.today_due_count.text = f"Due now: {len(due_now)} | Missed: {len(overdue)}"
@@ -13870,8 +14224,9 @@ def _desktop_refresh_dashboard(self: DesktopMedSafeApp) -> None:
     self.ids.today_timeline.text = build_timeline_text(meds, now)
     self.ids.dashboard_selection.text = selection_text
     self.ids.selected_med_summary.text = summary_text
-    self.ids.selected_med_schedule.text = schedule_text
-    self.ids.selected_med_history.text = build_med_history_text(selected)
+    if "selected_med_schedule" in self.ids:
+        self.ids.selected_med_schedule.text = schedule_text
+    self.ids.selected_med_history.text = build_recent_activity_text(self.data_cache)
     if "dashboard_focus_hint" in self.ids:
         if selected and medication_is_archived(selected):
             self.ids.dashboard_focus_hint.text = (
@@ -13904,16 +14259,6 @@ def _desktop_refresh_dashboard(self: DesktopMedSafeApp) -> None:
         self.current_recovery_support_state(),
         now,
     )
-    if "dashboard_flow_path" in self.ids:
-        flow_snapshot, _flow_report = build_flow_simulation_report(
-            self.data_cache,
-            self.settings_data,
-            selected_med_id=self.selected_med_id or "",
-            now_ts=now,
-            model_ready=model_ready,
-            password_enabled=password_enabled,
-        )
-        self.ids.dashboard_flow_path.text = flow_snapshot
     self.set_field_text("daily_checklist_date", target_day.isoformat())
     if target_day == today:
         checklist_label = "Viewing Today"
@@ -14491,11 +14836,11 @@ def _desktop_sync_text_size_widgets(self: DesktopMedSafeApp) -> None:
             if class_name == "CTkTextbox":
                 widget.configure(font=ctk.CTkFont(size=base))
             elif class_name == "CTkEntry":
-                widget.configure(font=ctk.CTkFont(size=max(12, base)))
+                widget.configure(font=ctk.CTkFont(size=max(9, base)))
             elif class_name == "CTkOptionMenu":
-                widget.configure(font=ctk.CTkFont(size=max(12, base)))
+                widget.configure(font=ctk.CTkFont(size=max(9, base)))
             elif class_name == "CTkButton":
-                widget.configure(font=ctk.CTkFont(size=max(12, base), weight="bold"))
+                widget.configure(font=ctk.CTkFont(size=max(9, base), weight="bold"))
         except Exception:
             continue
     assistant_box = getattr(self.ids.get("assistant_history"), "widget", None)
@@ -14508,9 +14853,9 @@ def _desktop_configure_markdown_textbox(self: DesktopMedSafeApp, textbox: Any, *
         text_widget = textbox._textbox
     except Exception:
         return
-    size = max(11, min(24, int(base_size or self.text_size_base_font_size())))
-    meta_size = max(9, size - 2)
-    code_size = max(10, size - 1)
+    size = max(9, min(26, int(base_size or self.text_size_base_font_size())))
+    meta_size = max(8, size - 2)
+    code_size = max(8, size - 1)
     text_widget.configure(
         font=("DejaVu Sans", size),
         foreground=DESKTOP_TEXT,
