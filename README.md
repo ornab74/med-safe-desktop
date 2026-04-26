@@ -5,8 +5,6 @@ Health Dash Desktop is a local-first health workflow application for medication 
 This README is intentionally long. It is both a practical operating manual and an extended technical paper for the project. It is written for users, maintainers, reviewers, and curious builders who want the full story rather than a minimal landing page.
 
 ## Visual Overview
-
-## Demo Screenshots
 <img width="944" height="1123" alt="Screenshot 2026-04-26 6 35 48 PM" src="https://github.com/user-attachments/assets/2ca37efe-c2fc-44bf-9425-0d42ebce99d2" />
 <img width="944" height="1123" alt="Screenshot 2026-04-26 6 36 16 PM" src="https://github.com/user-attachments/assets/52c5adba-db62-40da-b34f-a4ba08cff042" />
 
