@@ -7,26 +7,9 @@ This README is intentionally long. It is both a practical operating manual and a
 ## Visual Overview
 
 ## Demo Screenshots
+<img width="944" height="1123" alt="Screenshot 2026-04-26 6 35 48 PM" src="https://github.com/user-attachments/assets/2ca37efe-c2fc-44bf-9425-0d42ebce99d2" />
+<img width="944" height="1123" alt="Screenshot 2026-04-26 6 36 16 PM" src="https://github.com/user-attachments/assets/52c5adba-db62-40da-b34f-a4ba08cff042" />
 
-![Demo 1](demo1.png)
-
-![Demo 2](demo2.png)
-
-![Demo 3](demo3.png)
-
-![Demo 4](demo4.png)
-
-![Demo 5](demo5.png)
-
-![Demo 6](demo6.png)
-
-![Demo 7](demo7.png)
-
-![Demo 8](demo8.png)
-
-![Demo 9](demo9.png)
-
-![Demo 10](demo10.png)
 
 ## Table Of Contents
 
